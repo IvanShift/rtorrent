@@ -9,6 +9,7 @@
 #include <torrent/utils/log.h>
 
 #include "globals.h"
+#include "core/retrackers_migration_pending.h"
 #include "session/download_storer.h"
 #include "utils/lockfile.h"
 
@@ -71,6 +72,7 @@ SessionManager::save_resume_download(core::Download* download) {
 
   if (m_path.empty())
     return;
+  if (retrackers_migration_late_save(download)) return;
 
   {
     std::unique_lock<std::mutex> lock(m_pending_builds_mutex);
@@ -98,6 +100,7 @@ SessionManager::save_full_download(core::Download* download) {
 
   if (m_path.empty())
     return;
+  if (retrackers_migration_late_save(download)) return;
 
   DownloadStorer storer(download);
 
@@ -131,6 +134,33 @@ SessionManager::save_full_download(core::Download* download) {
   }
 
   callback_save_request();
+}
+
+void
+SessionManager::drain_download_saves(core::Download* download) {
+  assert(torrent::this_thread::thread() == torrent::main_thread::thread());
+  std::unique_lock<std::mutex> lock(m_mutex);
+  if (!m_active)
+    throw torrent::internal_error("SessionManager::drain_download_saves() called while not active.");
+  remove_completely_unsafe(download, lock);
+}
+
+void
+SessionManager::save_full_download_durable(core::Download* download) {
+  assert(torrent::this_thread::thread() == torrent::main_thread::thread());
+  if (m_path.empty()) throw torrent::storage_error("stop claim: session path is empty");
+  if (retrackers_migration_late_save(download)) return;
+  {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    remove_completely_unsafe(download, lock); // Cancel stale queued data and wait for in-flight saves.
+  }
+  DownloadStorer storer(download);
+  storer.build_full_streams();
+  auto torrent_stream = storer.torrent_stream();
+  auto rtorrent_stream = storer.rtorrent_stream();
+  auto libtorrent_stream = storer.libtorrent_stream();
+  DownloadStorer::save_and_move_streams(storer.build_path(m_path), true,
+                                        torrent_stream.get(), rtorrent_stream.get(), libtorrent_stream.get());
 }
 
 void

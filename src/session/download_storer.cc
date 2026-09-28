@@ -15,6 +15,8 @@
 
 #include "globals.h"
 #include "core/download.h"
+#include "core/retrackers_migration_limits.h"
+#include "rpc/parse_commands.h"
 #include "utils/directory.h"
 
 // O_DIRECTORY makes the open refuse anything that is not a directory. A
@@ -41,6 +43,10 @@ DownloadStorer::build_streams(bool skip_static) {
   rtorrent_base.insert_key("chunks_wanted",    download->data()->wanted_chunks());
   rtorrent_base.insert_key("total_uploaded",   m_download->info()->up_rate()->total());
   rtorrent_base.insert_key("total_downloaded", m_download->info()->down_rate()->total());
+
+  auto& limits = rtorrent_base.insert_key("retrackers_limits", torrent::Object::create_map());
+  for (const char* key : core::retrackers_migration_limits)
+    limits.insert_key(key, rpc::call_command_value(key, rpc::make_target(m_download)));
 
   // Don't save for completed torrents when we've cleared the uncertain_pieces.
   torrent::resume_save_progress(*download, resume_base);

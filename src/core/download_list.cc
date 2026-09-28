@@ -1,4 +1,5 @@
 #include "config.h"
+#include "stop_intent.h"
 
 #include <algorithm>
 #include <cstring>
@@ -26,6 +27,8 @@
 #include "core/dht_manager.h"
 #include "core/download.h"
 #include "core/download_list.h"
+#include "core/retrackers_migration_creation.h"
+#include "core/retrackers_migration_pending.h"
 #include "session/session_manager.h"
 #include "ui/root.h"
 
@@ -198,6 +201,14 @@ DownloadList::erase(iterator itr) {
   if ((*itr)->is_erasing())
     return std::next(itr);
 
+  stop_intent::require_unleased(itr->get());
+  const std::string erase_hash = torrent::utils::transform_to_hex_str((*itr)->info()->hash());
+  if (retrackers_migration_original_claim_active(erase_hash) &&
+      rr_native_capture_erase_hash != erase_hash &&
+      !(RetrackersMigrationCreation::abort_erase_permitted(itr->get()) &&
+        retrackers_migration_uncommitted_candidate(erase_hash)))
+    throw torrent::input_error("RR original claim blocks direct erase.");
+  retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
 
   lt_log_print_info(torrent::LOG_TORRENT_INFO, (*itr)->info(), "download_list", "Erasing download.");
@@ -236,6 +247,11 @@ DownloadList::open(Download* download) {
 void
 DownloadList::open_throw(Download* download) {
   check_contains(download);
+  if (retrackers_migration_candidate_activity_held(
+      torrent::utils::transform_to_hex_str(download->info()->hash())))
+    throw torrent::input_error("RR candidate open held until durable release.");
+  if (!stop_intent::owner_open() && !stop_intent::terminal_activity_allowed(download))
+    stop_intent::require_unleased(download);
 
   lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Opening download.");
 
@@ -382,6 +398,16 @@ DownloadList::close_throw(Download* download) {
 void
 DownloadList::resume(Download* download, int flags) {
   check_contains(download);
+  if (retrackers_migration_candidate_activity_held(
+      torrent::utils::transform_to_hex_str(download->info()->hash()))) {
+    lt_log_print(torrent::LOG_TORRENT_ERROR, "RR candidate resume held until durable release");
+    return;
+  }
+  if (!stop_intent::owner_restoring() && !stop_intent::terminal_activity_allowed(download) &&
+      !stop_intent::held(download).empty()) {
+    lt_log_print(torrent::LOG_TORRENT_ERROR, "Stop claim held native resume");
+    return;
+  }
 
   lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Resuming download: flags:%0x.", flags);
 

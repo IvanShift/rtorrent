@@ -39,6 +39,8 @@ public:
 
   bool                get_session() const   { return m_session; }
   void                set_session(bool v)   { m_session = v; }
+  void                set_retrackers_rollback_hash(const std::string& hash) { m_retrackersRollbackHash = hash; }
+  bool                retrackers_rollback_succeeded() const { return m_retrackersRollbackSucceeded; }
 
   bool                get_start() const     { return m_start; }
   void                set_start(bool v)     { m_start = v; }
@@ -57,6 +59,7 @@ private:
   void                receive_commit();
   void                receive_success();
   void                receive_failed(const std::string& msg);
+  bool                has_retrackers_apply_command() const;
 
   void                log_created(Download* download, torrent::Object* rtorrent);
 
@@ -71,6 +74,9 @@ private:
 
   std::string         m_uri;
   bool                m_session{};
+  std::string         m_retrackersRollbackHash;
+  std::string         m_retrackersRawSha256;
+  bool                m_retrackersRollbackSucceeded{};
   bool                m_start{};
   bool                m_printLog{true};
   bool                m_isFile{};

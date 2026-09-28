@@ -1,10 +1,17 @@
 #include "config.h"
+#include "stop_intent.h"
 
 #include "download_factory.h"
+#include "incarnation.h"
+#include "retrackers_migration_limits.h"
+#include "retrackers_migration_creation.h"
+#include "retrackers_migration_pending.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <openssl/sha.h>
 #include <sstream>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -109,6 +116,13 @@ DownloadFactory::commit() {
   torrent::this_thread::scheduler()->wait_for(&m_task_commit, 0ms);
 }
 
+bool
+DownloadFactory::has_retrackers_apply_command() const {
+  return std::any_of(m_commands.begin(), m_commands.end(), [](const std::string& command) {
+    return command.rfind("d.retrackers.apply=", 0) == 0;
+  });
+}
+
 void
 DownloadFactory::receive_load() {
   if (m_stream)
@@ -143,10 +157,31 @@ DownloadFactory::receive_load() {
     return receive_failed("Could not open file");
 
   m_object = new torrent::Object;
-  stream >> *m_object;
-
-  if (!stream.good())
-    return receive_failed("Reading torrent file failed");
+  if (has_retrackers_apply_command()) {
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    if (size <= 0 || size > 64 * 1024 * 1024)
+      return receive_failed("RR candidate staged metainfo size invalid");
+    stream.seekg(0);
+    std::string bytes(static_cast<size_t>(size), '\0');
+    if (!stream.read(bytes.data(), bytes.size()))
+      return receive_failed("RR candidate staged metainfo read failed");
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size(), digest);
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char value : digest) {
+      m_retrackersRawSha256 += hex[value >> 4];
+      m_retrackersRawSha256 += hex[value & 15];
+    }
+    std::stringstream captured(bytes);
+    captured >> *m_object;
+    if (!captured.good())
+      return receive_failed("RR candidate staged metainfo parse failed");
+  } else {
+    stream >> *m_object;
+    if (!stream.good())
+      return receive_failed("Reading torrent file failed");
+  }
 
   m_isFile = true;
 
@@ -247,6 +282,14 @@ DownloadFactory::receive_success() {
 
   rtorrent->insert_key("key", download->tracker_controller().key());
 
+  // Session loads keep the daemon identity; new objects always receive a fresh one.
+  if (!m_session || !rtorrent->has_key_string("incarnation") ||
+      !valid_incarnation(rtorrent->get_key_string("incarnation"))) {
+    if (m_session && rtorrent->has_key("incarnation"))
+      m_manager->push_log_std("Invalid session incarnation; assigning a new ID: " + m_uri);
+    rtorrent->insert_key("incarnation", fresh_incarnation());
+  }
+
   initialize_rtorrent(download, rtorrent);
 
   if (!rtorrent->has_key_string("custom1")) rtorrent->insert_key("custom1", std::string());
@@ -272,6 +315,31 @@ DownloadFactory::receive_success() {
       rpc::call_command("d.peers_max.set", rpc::call_command("throttle.max_peers.seed"), rpc::make_target(download));
   }
 
+  if (m_session && rtorrent->has_key("retrackers_limits")) {
+    int64_t values[6] = {};
+    bool valid = rtorrent->has_key_map("retrackers_limits");
+    if (valid) {
+      const auto& limits = rtorrent->get_key("retrackers_limits");
+      size_t i = 0;
+      for (const char* key : retrackers_migration_limits) {
+        if (!limits.has_key_value(key)) { valid = false; break; }
+        const auto value = limits.get_key_value(key);
+        if (value < -1 || value > 2147483647) { valid = false; break; }
+        values[i++] = value;
+      }
+    }
+    if (!valid) {
+      const std::string msg = "RR session sidecar " + m_uri + ".rtorrent: retrackers_limits invalid; download held.";
+      download->set_hash_failed(true);
+      download->set_message(msg);
+      m_manager->push_log_std(msg);
+    } else {
+      size_t i = 0;
+      for (const char* key : retrackers_migration_limits)
+        rpc::call_command((std::string(key) + ".set").c_str(), values[i++], rpc::make_target(download));
+    }
+  }
+
   // Skip forcing trackers to scrape when rtorrent starts
   if (m_initLoad && rpc::call_command_value("trackers.delay_scrape"))
     download->set_resume_flags(torrent::Download::start_skip_tracker);
@@ -285,19 +353,23 @@ DownloadFactory::receive_success() {
                             rpc::call_command_value("system.file.split_size"),
                             rpc::call_command_string("system.file.split_suffix"));
 
-  if (rtorrent->has_key_string("directory")) {
-    rpc::call_command("d.directory_base.set", rtorrent->get_key("directory"), rpc::make_target(download));
+  {
+    // Restoring a saved directory is allowed while a move claim keeps the download closed.
+    stop_intent::ScopedRestorePath restore(m_session);
+    if (rtorrent->has_key_string("directory")) {
+      rpc::call_command("d.directory_base.set", rtorrent->get_key("directory"), rpc::make_target(download));
 
-  } else if (download->download()->info()->is_meta_download()) {
-    auto& metadata_path = control->core()->magnet_path();
+    } else if (download->download()->info()->is_meta_download()) {
+      auto& metadata_path = control->core()->magnet_path();
 
-    if (!metadata_path.empty())
-      rpc::call_command("d.directory.set", metadata_path, rpc::make_target(download));
-    else
-      rpc::call_command("d.directory.set", session_thread::session_path(), rpc::make_target(download));
+      if (!metadata_path.empty())
+        rpc::call_command("d.directory.set", metadata_path, rpc::make_target(download));
+      else
+        rpc::call_command("d.directory.set", session_thread::session_path(), rpc::make_target(download));
 
-  } else {
-    rpc::call_command("d.directory.set", m_variables["directory"], rpc::make_target(download));
+    } else {
+      rpc::call_command("d.directory.set", m_variables["directory"], rpc::make_target(download));
+    }
   }
 
   if (!m_session && m_variables["tied_to_file"].as_value())
@@ -322,6 +394,36 @@ DownloadFactory::receive_success() {
     download->set_message(msg);
   }
 
+  const std::string rr_hash = torrent::utils::transform_to_hex_str(download->info()->hash());
+  const std::string rr_target_source = retrackers_migration_target_source(rr_hash);
+  const bool rr_has_apply = has_retrackers_apply_command();
+  if ((retrackers_migration_source_reserved(rr_hash) && m_retrackersRollbackHash != rr_hash) ||
+      !rr_target_source.empty()) {
+    const bool committed_session = !rr_target_source.empty() && m_session &&
+        retrackers_migration_committed(rr_target_source, rr_hash) && !download->is_hash_failed();
+    const bool restored_session = m_session && rr_target_source == rr_hash &&
+        retrackers_migration_restored_source(rr_hash) && !download->is_hash_failed();
+    const bool prepared_session = m_session && !download->is_hash_failed() &&
+        retrackers_migration_prepared_session(download, rr_hash);
+    const bool pending_candidate = !rr_target_source.empty() && !m_session && rr_has_apply &&
+        retrackers_migration_pending(rr_target_source);
+    const bool daemon_rollback = m_session && m_retrackersRollbackHash == rr_hash &&
+        !download->is_hash_failed();
+    const std::string expected_digest = pending_candidate ?
+        retrackers_migration_candidate_digest(rr_target_source) : std::string();
+    const bool candidate_digest_matches = expected_digest.empty() ||
+        expected_digest == m_retrackersRawSha256;
+    if ((!committed_session && !restored_session && !prepared_session &&
+          !pending_candidate && !daemon_rollback) ||
+        !candidate_digest_matches) {
+      m_manager->push_log_std("RR migration pending: unproven load refused: " + torrent::utils::transform_to_hex_str(download->info()->hash()));
+      torrent::download_remove(*download->download());
+      delete download;
+      m_slot_finished();
+      return;
+    }
+  }
+
   // The action of inserting might cause the torrent to be
   // opened/started or such. Figure out a nicer way of handling this.
   if (m_manager->download_list()->insert(download) == m_manager->download_list()->end()) {
@@ -335,12 +437,25 @@ DownloadFactory::receive_success() {
   // Save the info-hash just in case the commands decide to delete it.
   torrent::HashString infohash = download->info()->hash();
 
+  RetrackersMigrationCreation rr_creation(download);
   try {
+    if (!rr_target_source.empty() && !m_session) {
+      RetrackersMigrationCreation::mark_apply(download);
+      if (m_start) throw torrent::input_error("RR migration candidate must load stopped.");
+    }
+    if (!m_retrackersRollbackHash.empty()) {
+      RetrackersMigrationCreation::mark_apply(download);
+      if (torrent::utils::transform_to_hex_str(download->info()->hash()) != m_retrackersRollbackHash ||
+          download->is_hash_failed())
+        throw torrent::input_error("RR rollback session snapshot is invalid.");
+    }
     if (torrent::log_groups[torrent::LOG_TORRENT_DEBUG].valid())
       log_created(download, rtorrent);
 
     for (const auto& command : m_commands)
       rpc::parse_command_multiple_std(command, rpc::make_target(download));
+    if (!rr_target_source.empty() && !m_session && !rr_creation.applied())
+      throw torrent::input_error("RR migration apply did not finish.");
 
     if (m_manager->download_list()->find(infohash) == m_manager->download_list()->end())
       throw torrent::input_error("The newly created download was removed.");
@@ -348,8 +463,29 @@ DownloadFactory::receive_success() {
     if (!m_session)
        rpc::call_command("d.state.set", (int64_t)m_start, rpc::make_target(download));
 
-    rpc::commands.call_catch(m_session ? "event.download.inserted_session" : "event.download.inserted_new",
-                             rpc::make_target(download), torrent::Object(), "Download event action failed: ");
+    bool session_event_ready = true;
+    if (m_session) {
+      session_event_ready = retrackers_migration_repair_prepared_loaded(download);
+      if (session_event_ready) {
+        try {
+          const auto claim = stop_intent::lease(download);
+          if (claim.phase == 'T' || (claim.phase == 'D' && claim.mode == 'O'))
+            rpc::call_command("d.replay_stop_close_claim", claim.job, rpc::make_target(download));
+        } catch (const std::exception& e) {
+          session_event_ready = false;
+          lt_log_print(torrent::LOG_ERROR, "Stop claim terminal replay held startup: %s", e.what());
+        }
+      }
+    }
+    // An inserted-session callback may erase its target. Finish native replay first.
+    if (session_event_ready) {
+      stop_intent::ScopedSuppress suppress;
+      // v1 candidate acknowledgement is owned by the ordinary inserted_new hook.
+      if (rr_target_source.empty() ||
+          (!m_session && !retrackers_migration_candidate_digest(rr_target_source).empty()))
+        rpc::commands.call_catch(m_session ? "event.download.inserted_session" : "event.download.inserted_new",
+                                 rpc::make_target(download), torrent::Object(), "Download event action failed: ");
+    }
 
   } catch (torrent::input_error& e) {
     std::string msg = "Command on torrent creation failed: " + std::string(e.what());
@@ -357,14 +493,32 @@ DownloadFactory::receive_success() {
     if (m_printLog)
       m_manager->push_log_std(msg);
 
-    if (m_manager->download_list()->find(infohash) != m_manager->download_list()->end()) {
-      // Should stop it, mark it bad. Perhaps even delete it?
-      download->set_hash_failed(true);
-      download->set_message(msg);
-      //     m_manager->download_list()->erase(m_manager->download_list()->find(infohash.data()));
+    auto existing = m_manager->download_list()->find(infohash);
+    if (existing != m_manager->download_list()->end() && existing->get() == download) {
+      if (rr_creation.attempted()) {
+        m_manager->push_log_std("RR migration candidate aborted: " + msg);
+        // Keep the input metainfo available for a later recovery attempt.
+        rpc::call_command("d.tied_to_file.set", std::string(), rpc::make_target(download));
+        if (!m_session && !rr_target_source.empty() &&
+            retrackers_migration_uncommitted_candidate(
+                torrent::utils::transform_to_hex_str(infohash))) {
+          RetrackersMigrationCreation::ScopedAbortErase abort(download);
+          m_manager->download_list()->erase_ptr(download);
+        } else {
+          m_manager->download_list()->erase_ptr(download);
+        }
+      } else {
+        download->set_hash_failed(true);
+        download->set_message(msg);
+      }
     }
   }
 
+  if (!m_retrackersRollbackHash.empty()) {
+    auto existing = m_manager->download_list()->find(infohash);
+    m_retrackersRollbackSucceeded = existing != m_manager->download_list()->end() &&
+        existing->get() == download && !download->is_hash_failed();
+  }
   m_slot_finished();
 }
 
@@ -417,6 +571,25 @@ DownloadFactory::initialize_rtorrent(Download* download, torrent::Object* rtorre
              !rtorrent->has_key_value("state_counter") || (uint64_t)rtorrent->get_key_value("state_counter") > (1 << 20)) {
     rtorrent->insert_key("state_changed", cached_seconds);
     rtorrent->insert_key("state_counter", int64_t());
+  }
+
+  // A saved active session older than the last durable Stop must not autostart.
+  if (m_session) {
+    try {
+      const auto hash = rpc::call_command_string("d.hash", rpc::make_target(download));
+      const auto durable = stop_intent::counter(rpc::call_command_string("session.path"), hash, false);
+      const auto saved = rtorrent->has_key_value("stop_generation") ?
+        rtorrent->get_key_value("stop_generation") : int64_t(0);
+      if (saved < 0 || static_cast<uint64_t>(saved) != durable ||
+          !stop_intent::startup_hold_token(rpc::call_command_string("session.path"), hash).empty()) {
+        rtorrent->insert_key("state", int64_t(0));
+        rtorrent->insert_key("stop_generation", static_cast<int64_t>(durable));
+        lt_log_print(torrent::LOG_ERROR, "Stop intent recovery held session startup for %s", hash.c_str());
+      }
+    } catch (const std::exception& e) {
+      rtorrent->insert_key("state", int64_t(0));
+      lt_log_print(torrent::LOG_ERROR, "Stop intent recovery held session startup: %s", e.what());
+    }
   }
 
   rtorrent->insert_preserve_copy("complete", (int64_t)0);

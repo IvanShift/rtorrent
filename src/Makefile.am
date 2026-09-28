@@ -15,7 +15,11 @@ libsub_root_a_SOURCES = \
 	core/download_list.h \
 	core/http_queue.cc \
 	core/http_queue.h \
+	core/incarnation.h \
 	core/manager.cc \
+	core/retrackers_migration_creation.h \
+	core/retrackers_migration_limits.h \
+	core/retrackers_migration_pending.h \
 	core/manager.h \
 	core/view.cc \
 	core/view.h \
@@ -204,7 +208,8 @@ libsub_root_a_SOURCES = \
 	setup.cc \
 	setup.h \
 	signal_handler.cc \
-	signal_handler.h
+	signal_handler.h \
+	stop_intent.h
 
 
 if NO_NCURSES

@@ -60,8 +60,10 @@ public:
   void                set_use_lock(bool use_lock);
 
   void                save_full_download(core::Download* download);
+  void                save_full_download_durable(core::Download* download);
   void                save_resume_download(core::Download* download);
   void                remove_download(core::Download* download);
+  void                drain_download_saves(core::Download* download);
 
 protected:
   friend class ::Control;

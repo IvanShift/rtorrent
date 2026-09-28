@@ -1,4 +1,5 @@
 #include "config.h"
+#include "stop_intent.h"
 
 #include "core/manager.h"
 
@@ -407,6 +408,8 @@ Manager::receive_hashing_changed() {
     if (!tryQuick && foundHashing)
       continue;
 
+    if (!stop_intent::held(itr->get()).empty() &&
+        !stop_intent::terminal_activity_allowed(itr->get())) continue;
     try {
       m_download_list->open_throw(itr->get());
 

@@ -51,6 +51,9 @@ void handle_sigbus(int signum, siginfo_t* sa, void* ptr);
 void do_panic(int signum);
 void print_help();
 void initialize_commands();
+void retrackers_migration_recover_startup();
+void retrackers_migration_repair_released_startup();
+void retrackers_migration_repair_committed_startup();
 
 void
 initialize_rpc_slots() {
@@ -476,7 +479,10 @@ main(int argc, char** argv) {
     control->dht_manager()->set_auto_if_untouched_and_has_session();
     control->dht_manager()->load_dht_cache();
 
+    retrackers_migration_repair_released_startup();
+    retrackers_migration_repair_committed_startup();
     load_session_torrents(session_thread::manager()->path());
+    retrackers_migration_recover_startup();
     load_arg_torrents(argv + firstArg, argv + argc);
 
     // Make sure we update the display before any scheduled tasks can run, so that loading of

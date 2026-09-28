@@ -19,6 +19,7 @@
 #include "globals.h"
 #include "control.h"
 #include "command_helpers.h"
+#include "stop_intent.h"
 
 typedef void (core::ViewManager::*view_event_slot)(const std::string&, const torrent::Object&);
 
@@ -607,6 +608,9 @@ cmd_view_filter_download(core::Download* download, const torrent::Object::string
 
 torrent::Object
 cmd_view_set_visible(core::Download* download, const torrent::Object::string_type& args) {
+  const bool stopping = args == "stopped" && !stop_intent::suppressed();
+  if (stopping) stop_intent::record(download);
+  stop_intent::ScopedSuppress suppress(stopping);
   (*control->view_manager()->find_throw(args))->set_visible(download);
 
   return torrent::Object();
