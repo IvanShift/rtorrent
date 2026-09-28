@@ -2608,6 +2608,13 @@ torrent::Object rr_release_owner(core::Download* owner,
       rr_complete_same_hash_release(owner, old_hash, state.tx, incarnation);
     return std::string("released");
   }
+  if (committed) {
+    const auto sidecar = rr_committed_map(rr_migration_read_bytes(
+        old_hash + ".committed.torrent.rtorrent", 64 * 1024 * 1024));
+    if (!sidecar.has_key_string("incarnation") ||
+        sidecar.get_key_string("incarnation") != incarnation)
+      throw torrent::input_error("RR release committed incarnation changed.");
+  }
   const std::string marker = committed ? rr_committed_marker(state) : state.claim;
   if (retrieve_d_custom(owner, "retrackers-recovery").as_string() != marker ||
       retrieve_d_custom(owner, "retrackers-recovery-ack").as_string() != marker)
@@ -3072,8 +3079,23 @@ std::string rr_finalize_owner(core::Download* owner,
 bool rr_prepared_repair_loaded(core::Download* owner) {
   const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
   try {
-    if (!rr_journal_exists(hash + ".prepared.receipt")) return true;
-    if (rr_release_hold.count(hash) || rr_owner_hold_hashes.count(hash)) return false;
+    const bool prepared = rr_journal_exists(hash + ".prepared.receipt");
+    if (rr_committed_hold.count(hash) || rr_release_hold.count(hash) ||
+        rr_owner_hold_hashes.count(hash)) return false;
+    if (!prepared &&
+        (!rr_migration_committed_receipt(hash, hash) || rr_release_present(hash)))
+      return true;
+    if (!prepared) {
+      // The worker ledger is volatile; a cold load must release a durable same-hash commit.
+      const auto state = rr_migration_read(hash);
+      if (!rr_capsule_v2(state))
+        throw torrent::input_error("RR committed loaded owner lacks v2 authority.");
+      torrent::Object::list_type args;
+      args.emplace_back(state.tx);
+      args.emplace_back(rpc::call_command_string("d.incarnation", rpc::make_target(owner)));
+      rr_release_committed(owner, args);
+      return true;
+    }
     std::string tx, incarnation;
     if (!rr_prepared_read(hash, &tx, &incarnation) ||
         rpc::call_command_string("d.incarnation", rpc::make_target(owner)) != incarnation)
@@ -3095,7 +3117,7 @@ bool rr_prepared_repair_loaded(core::Download* owner) {
     return true;
   } catch (const torrent::input_error& e) {
     rr_owner_hold_hashes.insert(hash);
-    control->core()->push_log_std("RR prepared finalization held: " + hash + ": " + e.what());
+    control->core()->push_log_std("RR session migration replay held: " + hash + ": " + e.what());
     return false;
   }
 }
