@@ -714,7 +714,8 @@ struct RrOriginalClaim {
 
 std::string rr_original_v2_marker(const RrOriginalClaim& claim);
 bool rr_original_claim_read(const std::string& hash, RrOriginalClaim* claim);
-bool rr_journal_exists(const std::string& name);
+bool rr_journal_exists(const std::string& name,
+                       const char* error_message = "RR journal presence cannot be checked.");
 uint64_t rr_late_save_to_prefix(core::Download* download, const std::string& prefix,
                                 const std::string& hash, const std::string& incarnation);
 
@@ -956,7 +957,7 @@ bool rr_quiesced_read(const RrMigrationCapsule& state, uint64_t* generation) {
   const std::string prefix = "quiesced:" + state.hash + ":" + state.tx + ":" +
       state.source_incarnation + ":" + std::to_string(state.stop_generation) + ":";
   if (!rr_capsule_v2(state) || bytes.compare(0, prefix.size(), prefix) != 0 ||
-      bytes.empty() || bytes.back() != '\n')
+      bytes.back() != '\n')
     throw torrent::input_error("RR quiesced receipt identity changed.");
   const std::string decimal = bytes.substr(prefix.size(), bytes.size() - prefix.size() - 1);
   if (state.stop_generation >= static_cast<int64_t>(INT64_MAX) ||
@@ -992,14 +993,8 @@ std::string rr_migration_receipt(const std::string& hash) {
 }
 
 bool rr_migration_receipt_present(const std::string& hash) {
-  const int dir = rr_migration_dir();
-  struct stat st;
-  const int found = ::fstatat(dir, (hash + ".receipt").c_str(), &st, AT_SYMLINK_NOFOLLOW);
-  const int lookup_error = errno;
-  ::close(dir);
-  if (found == 0) return true;
-  if (lookup_error == ENOENT) return false;
-  throw torrent::input_error("RR migration receipt presence cannot be checked.");
+  return rr_journal_exists(hash + ".receipt",
+                           "RR migration receipt presence cannot be checked.");
 }
 
 bool rr_migration_rollback_receipt(const std::string& hash) {
@@ -1425,15 +1420,7 @@ torrent::Object rr_migration_apply(core::Download* candidate,
 std::string rr_committed_digest(const std::vector<std::pair<std::string, std::string>>& files) {
   torrent::Object payload = torrent::Object::create_list();
   for (const auto& file : files) payload.as_list().push_back(file.second);
-  const std::string sha = torrent::object_sha1(&payload);
-  static constexpr char hex[] = "0123456789ABCDEF";
-  std::string result;
-  result.reserve(sha.size() * 2);
-  for (unsigned char value : sha) {
-    result += hex[value >> 4];
-    result += hex[value & 15];
-  }
-  return result;
+  return torrent::utils::transform_to_hex_str(torrent::object_sha1(&payload));
 }
 
 torrent::Object rr_migration_commit(core::Download* candidate,
@@ -1587,12 +1574,7 @@ void rr_committed_fallback_source(const std::string& old_hash) {
   if (!metainfo.has_key_map("info"))
     throw torrent::input_error("RR committed fallback metainfo invalid.");
   const std::string info_sha = torrent::object_sha1(&metainfo.get_key("info"));
-  static constexpr char hex[] = "0123456789ABCDEF";
-  std::string actual_hash;
-  for (unsigned char value : info_sha) {
-    actual_hash += hex[value >> 4];
-    actual_hash += hex[value & 15];
-  }
+  const std::string actual_hash = torrent::utils::transform_to_hex_str(info_sha);
   if (actual_hash != old_hash)
     throw torrent::input_error("RR committed fallback source hash mismatch.");
   const auto sidecar = rr_committed_map(rr_migration_read_bytes(
@@ -1701,12 +1683,7 @@ bool rr_committed_reseed_from_ordinary(const std::string& old_hash,
     const auto metainfo = rr_committed_map(ordinary[0].second);
     if (!metainfo.has_key_map("info")) { ::close(session); return false; }
     const std::string info_sha = torrent::object_sha1(&metainfo.get_key("info"));
-    static constexpr char hex[] = "0123456789ABCDEF";
-    std::string actual_hash;
-    for (unsigned char value : info_sha) {
-      actual_hash += hex[value >> 4];
-      actual_hash += hex[value & 15];
-    }
+    const std::string actual_hash = torrent::utils::transform_to_hex_str(info_sha);
     if (actual_hash != new_hash ||
         !rr_committed_current_valid(session, new_hash, state, ordinary)) {
       ::close(session);
@@ -1750,7 +1727,7 @@ bool rr_late_read_receipt(const std::string& old_hash, RrLateReceipt* result) {
   if (found < 0 && lookup_error == ENOENT) return false;
   if (found < 0) throw torrent::input_error("RR late receipt presence cannot be checked.");
   const std::string bytes = rr_migration_read_bytes(old_hash + ".late.receipt", 256);
-  if (bytes.empty() || bytes.back() != '\n')
+  if (bytes.back() != '\n')
     throw torrent::input_error("RR late receipt malformed.");
   std::vector<std::string> fields;
   size_t begin = 0;
@@ -1807,12 +1784,7 @@ std::vector<std::pair<std::string, std::string>> rr_late_select(
       const auto metainfo = rr_committed_map(copy[0].second);
       if (!metainfo.has_key_map("info")) continue;
       const auto info_sha = torrent::object_sha1(&metainfo.get_key("info"));
-      static constexpr char hex[] = "0123456789ABCDEF";
-      std::string actual_hash;
-      for (unsigned char value : info_sha) {
-        actual_hash += hex[value >> 4];
-        actual_hash += hex[value & 15];
-      }
+      const std::string actual_hash = torrent::utils::transform_to_hex_str(info_sha);
       const auto sidecar = rr_committed_map(copy[1].second);
       if (actual_hash != new_hash || !sidecar.has_key_string("incarnation") ||
           sidecar.get_key_string("incarnation") != receipt.incarnation ||
@@ -1865,7 +1837,7 @@ std::map<std::string, std::pair<std::string, std::string>> rr_released_owners;
 std::set<std::string> rr_retired_hold_hashes;
 std::set<std::string> rr_owner_hold_hashes;
 
-bool rr_journal_exists(const std::string& name) {
+bool rr_journal_exists(const std::string& name, const char* error_message) {
   const int dir = rr_migration_dir();
   struct stat st;
   const int found = ::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW);
@@ -1873,7 +1845,7 @@ bool rr_journal_exists(const std::string& name) {
   ::close(dir);
   if (found == 0) return true;
   if (error == ENOENT) return false;
-  throw torrent::input_error("RR journal presence cannot be checked.");
+  throw torrent::input_error(error_message);
 }
 
 bool rr_owner_read(const std::string& hash, std::string* incarnation, bool* retired) {
@@ -1910,14 +1882,8 @@ void rr_owner_publish(const std::string& hash, const std::string& incarnation, b
 }
 
 bool rr_retired_present(const std::string& old_hash) {
-  const int dir = rr_migration_dir();
-  struct stat st;
-  const int found = ::fstatat(dir, (old_hash + ".retired.receipt").c_str(), &st, AT_SYMLINK_NOFOLLOW);
-  const int error = errno;
-  ::close(dir);
-  if (found == 0) return true;
-  if (error == ENOENT) return false;
-  throw torrent::input_error("RR retired receipt presence cannot be checked.");
+  return rr_journal_exists(old_hash + ".retired.receipt",
+                           "RR retired receipt presence cannot be checked.");
 }
 
 void rr_late_prune(const std::string& prefix, uint64_t latest) {
@@ -2001,7 +1967,7 @@ std::string rr_original_v2_marker(const RrOriginalClaim& claim) {
 bool rr_original_claim_read(const std::string& hash, RrOriginalClaim* claim) {
   if (!rr_journal_exists(hash + ".preclaim.receipt")) return false;
   const std::string bytes = rr_migration_read_bytes(hash + ".preclaim.receipt", 320);
-  if (bytes.empty() || bytes.back() != '\n')
+  if (bytes.back() != '\n')
     throw torrent::input_error("RR original preclaim receipt malformed.");
   std::vector<std::string> fields;
   size_t begin = 0;
@@ -2076,29 +2042,16 @@ std::vector<std::pair<std::string, std::string>> rr_original_read_triple(
       sidecar.get_key_string("incarnation") != incarnation)
     throw torrent::input_error("RR original triple incarnation changed.");
   const auto sha = torrent::object_sha1(&metainfo.get_key("info"));
-  static constexpr char hex[] = "0123456789ABCDEF";
-  std::string actual_hash;
-  for (unsigned char value : sha) { actual_hash += hex[value >> 4]; actual_hash += hex[value & 15]; }
+  const std::string actual_hash = torrent::utils::transform_to_hex_str(sha);
   if (actual_hash != hash)
     throw torrent::input_error("RR original triple hash changed.");
   return files;
 }
 
 std::string rr_original_mint_tx() {
-  unsigned char bytes[16];
-  const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  if (fd < 0) throw torrent::input_error("RR original transaction random source unavailable.");
-  size_t offset = 0;
-  while (offset < sizeof(bytes)) {
-    const ssize_t n = ::read(fd, bytes + offset, sizeof(bytes) - offset);
-    if (n <= 0) { ::close(fd); throw torrent::input_error("RR original transaction random read failed."); }
-    offset += n;
-  }
-  ::close(fd);
-  static constexpr char hex[] = "0123456789abcdef";
-  std::string tx;
-  for (unsigned char value : bytes) { tx += hex[value >> 4]; tx += hex[value & 15]; }
-  return tx;
+  return core::random_hex16<torrent::input_error>(
+      "RR original transaction random source unavailable.",
+      "RR original transaction random read failed.");
 }
 
 torrent::Object rr_begin_original(core::Download* owner,
@@ -2416,12 +2369,7 @@ void rr_release_repair(const std::string& hash) {
   if (!metainfo.has_key_map("info"))
     throw torrent::input_error("RR released source metainfo invalid.");
   const auto info_sha = torrent::object_sha1(&metainfo.get_key("info"));
-  static constexpr char hex[] = "0123456789ABCDEF";
-  std::string actual_hash;
-  for (unsigned char value : info_sha) {
-    actual_hash += hex[value >> 4];
-    actual_hash += hex[value & 15];
-  }
+  const std::string actual_hash = torrent::utils::transform_to_hex_str(info_sha);
   if (actual_hash != owner_hash || !sidecar.has_key_string("incarnation") ||
       sidecar.get_key_string("incarnation") != incarnation ||
       !sidecar.has_key_map("custom") ||

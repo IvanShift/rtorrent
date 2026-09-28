@@ -16,6 +16,7 @@
 #include "core/manager.h"
 #include "globals.h"
 #include "core/download.h"
+#include "core/incarnation.h"
 #include "core/retrackers_migration_pending.h"
 #include "rpc/parse_commands.h"
 
@@ -389,21 +390,8 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
       local_id.size() != 40 || local_id.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
     throw torrent::input_error("stop claim: invalid job or local identity");
   try {
-    unsigned char random[16];
-    Fd source(::open("/dev/urandom", O_RDONLY | O_CLOEXEC));
-    size_t offset = 0;
-    while (offset < sizeof(random)) {
-      const ssize_t received = ::read(source.get(), random + offset, sizeof(random) - offset);
-      if (received < 0 && errno == EINTR) continue;
-      if (received <= 0) throw std::runtime_error("cannot generate stop claim nonce");
-      offset += static_cast<size_t>(received);
-    }
-    constexpr char hex[] = "0123456789abcdef";
-    std::string token(32, '0');
-    for (size_t i = 0; i < sizeof(random); ++i) {
-      token[2 * i] = hex[random[i] >> 4];
-      token[2 * i + 1] = hex[random[i] & 15];
-    }
+    std::string token = core::random_hex16<std::runtime_error>(
+        nullptr, "cannot generate stop claim nonce");
     token += ":" + stop_token.substr(stop_token.size() - 16);
     Lease claim{token, job, local_id, state, open, active};
     const std::string payload = token + "\n" + job + "\n" +
