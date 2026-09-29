@@ -408,9 +408,9 @@ Manager::receive_hashing_changed() {
     if (!tryQuick && foundHashing)
       continue;
 
-    if (!stop_intent::held(itr->get()).empty() &&
-        !stop_intent::terminal_activity_allowed(itr->get())) continue;
     try {
+      if (!stop_intent::held(itr->get()).empty() &&
+          !stop_intent::terminal_activity_allowed(itr->get())) continue;
       m_download_list->open_throw(itr->get());
 
       // Since the bitfield is allocated on loading of resume load or

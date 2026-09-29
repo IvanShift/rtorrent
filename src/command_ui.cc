@@ -608,6 +608,7 @@ cmd_view_filter_download(core::Download* download, const torrent::Object::string
 
 torrent::Object
 cmd_view_set_visible(core::Download* download, const torrent::Object::string_type& args) {
+  if (args == "started" && !stop_intent::suppressed()) stop_intent::require_unleased(download);
   const bool stopping = args == "stopped" && !stop_intent::suppressed();
   if (stopping) stop_intent::record(download);
   stop_intent::ScopedSuppress suppress(stopping);
@@ -618,6 +619,7 @@ cmd_view_set_visible(core::Download* download, const torrent::Object::string_typ
 
 torrent::Object
 cmd_view_set_not_visible(core::Download* download, const torrent::Object::string_type& args) {
+  if (args == "stopped" && !stop_intent::suppressed()) stop_intent::require_unleased(download);
   (*control->view_manager()->find_throw(args))->set_not_visible(download);
 
   return torrent::Object();

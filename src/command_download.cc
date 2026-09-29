@@ -3208,10 +3208,10 @@ void rr_original_repair_preload() {
 }
 
 void rr_repair_released_startup_impl() {
+  if (rpc::call_command_string("session.path").empty()) return;
   rr_original_repair_preload();
   rr_finalize_repair_startup();
   rr_owner_repair_startup();
-  if (rpc::call_command_string("session.path").empty()) return;
   const int fd = rr_migration_dir();
   DIR* directory = ::fdopendir(fd);
   if (!directory) { ::close(fd); throw torrent::input_error("RR released receipt scan failed."); }
