@@ -242,6 +242,13 @@ DownloadFactory::receive_success() {
     return;
   }
 
+  const std::string rr_hash = torrent::utils::transform_to_hex_str(download->info()->hash());
+  const auto refuse_load = [this, download]() {
+    torrent::download_remove(*download->download());
+    delete download;
+    m_slot_finished();
+  };
+
   if (session_invalid) {
     download->set_hash_failed(true);
     download->set_message(session_invalid_message);
@@ -353,7 +360,7 @@ DownloadFactory::receive_success() {
                             rpc::call_command_value("system.file.split_size"),
                             rpc::call_command_string("system.file.split_suffix"));
 
-  {
+  try {
     // Restoring a saved directory is allowed while a move claim keeps the download closed.
     stop_intent::ScopedRestorePath restore(m_session);
     if (rtorrent->has_key_string("directory")) {
@@ -370,6 +377,12 @@ DownloadFactory::receive_success() {
     } else {
       rpc::call_command("d.directory.set", m_variables["directory"], rpc::make_target(download));
     }
+  } catch (const torrent::input_error& e) {
+    const std::string msg = "RR load initialization refused: " + rr_hash + ": " + e.what();
+    lt_log_print(torrent::LOG_ERROR, "%s", msg.c_str());
+    m_manager->push_log_std(msg);
+    refuse_load();
+    return;
   }
 
   if (!m_session && m_variables["tied_to_file"].as_value())
@@ -394,14 +407,8 @@ DownloadFactory::receive_success() {
     download->set_message(msg);
   }
 
-  const std::string rr_hash = torrent::utils::transform_to_hex_str(download->info()->hash());
   std::string rr_target_source;
   bool rr_unproven = false;
-  const auto refuse_load = [this, download]() {
-    torrent::download_remove(*download->download());
-    delete download;
-    m_slot_finished();
-  };
   try {
     rr_target_source = retrackers_migration_target_source(rr_hash);
     const bool rr_has_apply = has_retrackers_apply_command();

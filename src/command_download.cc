@@ -42,6 +42,7 @@
 #include "core/retrackers_migration_limits.h"
 #include "core/retrackers_migration_creation.h"
 #include "core/retrackers_migration_pending.h"
+#include "core/session_path.h"
 #include "core/manager.h"
 #include "rpc/parse.h"
 #include "session/session_manager.h"
@@ -764,26 +765,36 @@ std::string rr_candidate_ready_marker(const RrMigrationCapsule& state) {
                      "v1:candidate-ready:") + state.tx;
 }
 
-// Prototype journal is daemon-owned and keyed only by the daemon's info hash.
-// An outstanding journal needs explicit reconciliation before a production API can use it.
-int rr_migration_dir() {
+// Both the journal and ordinary session files must resolve through trusted ancestors.
+int rr_session_dir() {
   const std::string path = rpc::call_command_string("session.path");
   if (path.empty())
     throw torrent::input_error("RR migration requires a session directory.");
-  const int session = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0)
-    throw torrent::input_error("RR migration cannot open session directory.");
-  const int made = ::mkdirat(session, ".retrackers-migration", 0700);
-  if (made < 0 && errno != EEXIST) {
-    ::close(session);
-    throw torrent::input_error("RR migration cannot create journal directory.");
+  try { return core::open_trusted_session_directory(path); }
+  catch (const std::runtime_error& e) {
+    throw torrent::input_error(std::string("RR migration session path refused: ") + e.what());
   }
-  if (made == 0 && ::fsync(session) < 0) {
-    ::close(session);
-    throw torrent::input_error("RR migration journal parent fsync failed; source retained.");
+}
+
+// Prototype journal is daemon-owned and keyed only by the daemon's info hash.
+// An outstanding journal needs explicit reconciliation before a production API can use it.
+int rr_migration_dir(bool create = true) {
+  const int session = rr_session_dir();
+  if (create) {
+    const int made = ::mkdirat(session, ".retrackers-migration", 0700);
+    if (made < 0 && errno != EEXIST) {
+      ::close(session);
+      throw torrent::input_error("RR migration cannot create journal directory.");
+    }
+    if (made == 0 && ::fsync(session) < 0) {
+      ::close(session);
+      throw torrent::input_error("RR migration journal parent fsync failed; source retained.");
+    }
   }
   const int dir = ::openat(session, ".retrackers-migration", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  const int open_error = errno;
   ::close(session);
+  if (!create && dir < 0 && open_error == ENOENT) return -1;
   struct stat st;
   if (dir < 0 || ::fstat(dir, &st) < 0 || st.st_uid != ::geteuid() ||
       (st.st_mode & 0777) != 0700) {
@@ -1024,10 +1035,7 @@ bool rr_migration_any_commit_receipt(const std::string& hash) {
 }
 
 void rr_migration_finish_rollback(const std::string& hash) {
-  const std::string path = rpc::call_command_string("session.path");
-  const int session = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0)
-    throw torrent::input_error("RR rollback cannot open session directory.");
+  const int session = rr_session_dir();
   try {
     for (const char* suffix : {"", ".rtorrent", ".libtorrent_resume"}) {
       const std::string bytes = rr_migration_read_bytes(
@@ -1279,9 +1287,7 @@ torrent::Object rr_migration_capture(core::Download* source,
   if (expected_new_hash != hash &&
       control->core()->download_list()->find_hex_ptr(expected_new_hash.c_str()))
     throw torrent::input_error("RR capture expected successor already occupied.");
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR capture session directory unavailable.");
+  const int session = rr_session_dir();
   struct stat successor_session;
   const int successor_found = ::fstatat(session, (expected_new_hash + ".torrent").c_str(),
                                          &successor_session, AT_SYMLINK_NOFOLLOW);
@@ -1502,9 +1508,7 @@ torrent::Object rr_migration_commit(core::Download* candidate,
       throw torrent::input_error("RR commit authority directory fsync failed.");
   } catch (...) { ::close(authority); throw; }
   ::close(authority);
-  const std::string path = rpc::call_command_string("session.path");
-  const int session = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR commit session directory unavailable.");
+  const int session = rr_session_dir();
   try {
     for (const auto& file_bytes : files)
       rr_migration_write_file(session, new_hash + file_bytes.first.substr(9), file_bytes.second);
@@ -1674,9 +1678,7 @@ bool rr_committed_reseed_from_ordinary(const std::string& old_hash,
   if (state.expected_new_hash != new_hash ||
       retrackers_migration_target_source(new_hash) != old_hash)
     return false;
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR committed ordinary session directory unavailable.");
+  const int session = rr_session_dir();
   std::vector<std::pair<std::string, std::string>> ordinary;
   try {
     for (const char* suffix : {".torrent", ".torrent.rtorrent", ".torrent.libtorrent_resume"})
@@ -1757,10 +1759,7 @@ std::vector<std::pair<std::string, std::string>> rr_late_copy(
   std::vector<std::pair<std::string, std::string>> files;
   const std::string prefix = old_hash + ".late." + std::to_string(sequence) + "." + slot;
   const int session = slot == 'o' ?
-      ::open(rpc::call_command_string("session.path").c_str(),
-             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
-  if (slot == 'o' && session < 0)
-    throw torrent::input_error("RR late ordinary session directory unavailable.");
+      rr_session_dir() : -1;
   try {
     for (const char* suffix : {".torrent", ".torrent.rtorrent", ".torrent.libtorrent_resume"}) {
       const std::string bytes = slot == 'o' ?
@@ -1811,9 +1810,7 @@ bool rr_late_repair(const std::string& old_hash, const std::string& new_hash) {
   if (receipt.new_hash != new_hash || receipt.incarnation == state.source_incarnation)
     throw torrent::input_error("RR late receipt owner mismatch.");
   auto files = rr_late_select(old_hash, new_hash, receipt, false);
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR late session directory unavailable.");
+  const int session = rr_session_dir();
   try {
     for (const auto& file : files)
       rr_migration_write_file(session, new_hash + file.first, file.second);
@@ -2132,9 +2129,7 @@ torrent::Object rr_begin_original(core::Download* owner,
   custom.insert_key("retrackers-recovery", marker);
   custom.insert_key("retrackers-recovery-ack", marker);
   session_thread::manager()->save_full_download_durable(owner);
-  const int session = ::open(session_thread::manager()->path().c_str(),
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR original begin session readback unavailable.");
+  const int session = rr_session_dir();
   try {
     const auto saved = rr_committed_map(rr_session_read(session, hash + ".torrent.rtorrent"));
     if (!saved.has_key_string("incarnation") || saved.get_key_string("incarnation") != incarnation ||
@@ -2280,9 +2275,7 @@ void rr_original_release_repair(const std::string& hash) {
     files[1].second = rr_bencode(sidecar);
     rr_original_publish_released(claim, files, selected_baseline);
   }
-  const int session = ::open(session_thread::manager()->path().c_str(),
-                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR original release session unavailable.");
+  const int session = rr_session_dir();
   try {
     std::string ordinary_incarnation;
     try {
@@ -2399,9 +2392,7 @@ void rr_release_repair(const std::string& hash) {
   ::close(reservation);
   if (target_found < 0 && target_error != ENOENT)
     throw torrent::input_error("RR released reservation cannot be checked.");
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR released session directory unavailable.");
+  const int session = rr_session_dir();
   try {
     bool ordinary_valid = false;
     if (target_found < 0) {
@@ -2774,9 +2765,7 @@ void rr_retired_repair(const std::string& old_hash) {
   if (!core::valid_incarnation(incarnation) ||
       rr_migration_read_bytes(old_hash + ".retired.receipt", 160) != expected)
     throw torrent::input_error("RR retired owner receipt invalid.");
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) throw torrent::input_error("RR retired session directory unavailable.");
+  const int session = rr_session_dir();
   try {
     struct stat st;
     if (::fstatat(session, (owner_hash + ".torrent").c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -2935,9 +2924,7 @@ void rr_owner_repair_startup() {
       std::string incarnation;
       bool retired = false;
       if (!rr_owner_read(hash, &incarnation, &retired)) continue;
-      const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (session < 0) throw torrent::input_error("RR owner session directory unavailable.");
+      const int session = rr_session_dir();
       try {
         bool ordinary_exists = false;
         struct stat st;
@@ -3408,9 +3395,7 @@ void retrackers_migration_repair_committed_startup() {
           std::string("committed:").size() + 40 + 1 + 40 + 1, 40);
       if (rr_committed_digest(authority) != expected_digest)
         throw torrent::input_error("RR committed authority digest mismatch.");
-      const std::string path = rpc::call_command_string("session.path");
-      const int session = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-      if (session < 0) throw torrent::input_error("RR committed session directory unavailable.");
+      const int session = rr_session_dir();
       try {
         if (!rr_committed_current_valid(session, new_hash, state, authority)) {
           for (const auto& file_bytes : authority)
@@ -3536,9 +3521,7 @@ bool retrackers_migration_committed(const std::string& old_hash,
 
 bool retrackers_migration_restored_source(const std::string& hash) {
   if (!rr_migration_rollback_receipt(hash)) return false;
-  const int session = ::open(rpc::call_command_string("session.path").c_str(),
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) return false;
+  const int session = rr_session_dir();
   bool matches = true;
   try {
     for (const char* suffix : {".torrent", ".torrent.rtorrent", ".torrent.libtorrent_resume"})
@@ -3555,17 +3538,17 @@ std::string retrackers_migration_candidate_digest(const std::string& hash) {
 }
 
 bool retrackers_migration_pending(const std::string& hash) {
-  const std::string path = rpc::call_command_string("session.path");
-  if (path.empty()) return false;
-  const int session = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (session < 0) return false;
-  const int dir = ::openat(session, ".retrackers-migration", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  ::close(session);
+  if (rpc::call_command_string("session.path").empty()) return false;
+  const int dir = rr_migration_dir(false);
   if (dir < 0) return false;
   struct stat st;
-  const bool pending = ::fstatat(dir, (hash + ".rollback.torrent").c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0;
+  const int found = ::fstatat(dir, (hash + ".rollback.torrent").c_str(),
+                               &st, AT_SYMLINK_NOFOLLOW);
+  const int lookup_error = errno;
   ::close(dir);
-  return pending && !rr_migration_receipt_present(hash);
+  if (found < 0 && lookup_error != ENOENT)
+    throw torrent::input_error("RR pending snapshot presence cannot be checked.");
+  return found == 0 && !rr_migration_receipt_present(hash);
 }
 
 std::string
