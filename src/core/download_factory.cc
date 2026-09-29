@@ -395,33 +395,47 @@ DownloadFactory::receive_success() {
   }
 
   const std::string rr_hash = torrent::utils::transform_to_hex_str(download->info()->hash());
-  const std::string rr_target_source = retrackers_migration_target_source(rr_hash);
-  const bool rr_has_apply = has_retrackers_apply_command();
-  if ((retrackers_migration_source_reserved(rr_hash) && m_retrackersRollbackHash != rr_hash) ||
-      !rr_target_source.empty()) {
-    const bool committed_session = !rr_target_source.empty() && m_session &&
-        retrackers_migration_committed(rr_target_source, rr_hash) && !download->is_hash_failed();
-    const bool restored_session = m_session && rr_target_source == rr_hash &&
-        retrackers_migration_restored_source(rr_hash) && !download->is_hash_failed();
-    const bool prepared_session = m_session && !download->is_hash_failed() &&
-        retrackers_migration_prepared_session(download, rr_hash);
-    const bool pending_candidate = !rr_target_source.empty() && !m_session && rr_has_apply &&
-        retrackers_migration_pending(rr_target_source);
-    const bool daemon_rollback = m_session && m_retrackersRollbackHash == rr_hash &&
-        !download->is_hash_failed();
-    const std::string expected_digest = pending_candidate ?
-        retrackers_migration_candidate_digest(rr_target_source) : std::string();
-    const bool candidate_digest_matches = expected_digest.empty() ||
-        expected_digest == m_retrackersRawSha256;
-    if ((!committed_session && !restored_session && !prepared_session &&
-          !pending_candidate && !daemon_rollback) ||
-        !candidate_digest_matches) {
-      m_manager->push_log_std("RR migration pending: unproven load refused: " + torrent::utils::transform_to_hex_str(download->info()->hash()));
-      torrent::download_remove(*download->download());
-      delete download;
-      m_slot_finished();
-      return;
+  std::string rr_target_source;
+  bool rr_unproven = false;
+  const auto refuse_load = [this, download]() {
+    torrent::download_remove(*download->download());
+    delete download;
+    m_slot_finished();
+  };
+  try {
+    rr_target_source = retrackers_migration_target_source(rr_hash);
+    const bool rr_has_apply = has_retrackers_apply_command();
+    if ((retrackers_migration_source_reserved(rr_hash) && m_retrackersRollbackHash != rr_hash) ||
+        !rr_target_source.empty()) {
+      const bool committed_session = !rr_target_source.empty() && m_session &&
+          retrackers_migration_committed(rr_target_source, rr_hash) && !download->is_hash_failed();
+      const bool restored_session = m_session && rr_target_source == rr_hash &&
+          retrackers_migration_restored_source(rr_hash) && !download->is_hash_failed();
+      const bool prepared_session = m_session && !download->is_hash_failed() &&
+          retrackers_migration_prepared_session(download, rr_hash);
+      const bool pending_candidate = !rr_target_source.empty() && !m_session && rr_has_apply &&
+          retrackers_migration_pending(rr_target_source);
+      const bool daemon_rollback = m_session && m_retrackersRollbackHash == rr_hash &&
+          !download->is_hash_failed();
+      const std::string expected_digest = pending_candidate ?
+          retrackers_migration_candidate_digest(rr_target_source) : std::string();
+      const bool candidate_digest_matches = expected_digest.empty() ||
+          expected_digest == m_retrackersRawSha256;
+      rr_unproven = ((!committed_session && !restored_session && !prepared_session &&
+                      !pending_candidate && !daemon_rollback) ||
+                     !candidate_digest_matches);
     }
+  } catch (const torrent::input_error& e) {
+    const std::string msg = "RR migration reservation load refused: " + rr_hash + ": " + e.what();
+    lt_log_print(torrent::LOG_ERROR, "%s", msg.c_str());
+    m_manager->push_log_std(msg);
+    refuse_load();
+    return;
+  }
+  if (rr_unproven) {
+    m_manager->push_log_std("RR migration pending: unproven load refused: " + rr_hash);
+    refuse_load();
+    return;
   }
 
   // The action of inserting might cause the torrent to be
