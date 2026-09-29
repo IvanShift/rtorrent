@@ -14,6 +14,7 @@
 #include <torrent/utils/log.h>
 #include "control.h"
 #include "core/manager.h"
+#include "core/session_path.h"
 #include "globals.h"
 #include "core/download.h"
 #include "core/incarnation.h"
@@ -21,23 +22,33 @@
 #include "rpc/parse_commands.h"
 
 namespace stop_intent {
-class Fd {
-public:
-  explicit Fd(int fd) : fd_(fd) {
-    if (fd_ < 0) throw std::runtime_error(std::strerror(errno));
+using Fd = core::SessionPathFd;
+
+inline int open_directory(const std::string& session, bool create) {
+  Fd parent(core::open_trusted_session_directory(session));
+  struct stat st{};
+  constexpr const char* name = ".rutorrent-stop-intents";
+  if (create && ::mkdirat(parent.get(), name, 0700) == 0) {
+    if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync intent directory entry");
+  } else if (create && errno != EEXIST) {
+    throw std::runtime_error("cannot create intent directory");
   }
-  ~Fd() { ::close(fd_); }
-  Fd(const Fd&) = delete;
-  Fd& operator=(const Fd&) = delete;
-  int get() const { return fd_; }
-private:
-  int fd_;
-};
+  const int dir = ::openat(parent.get(), name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dir < 0 && !create && errno == ENOENT) return -1;
+  if (dir < 0) throw std::runtime_error(std::string("cannot open stop intent directory: ") + std::strerror(errno));
+  if (::fstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0700) {
+    ::close(dir);
+    throw std::runtime_error("unsafe stop intent directory ownership or mode");
+  }
+  return dir;
+}
 
 inline uint64_t read_counter(int fd) {
   struct stat st{};
-  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
-    throw std::runtime_error("invalid stop intent journal");
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600)
+    throw std::runtime_error("unsafe stop intent journal ownership or mode");
   if (st.st_size == 0) return 0;
   if (st.st_size < 0 || st.st_size % 17 != 0)
     throw std::runtime_error("partial stop intent journal");
@@ -58,15 +69,8 @@ inline uint64_t counter(const std::string& session, const std::string& hash, boo
   if (session.empty() && !increment) return 0; // No session means there is no durable intent journal.
   if (session.empty() || hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
     throw std::runtime_error("invalid session path or hash");
-  Fd parent(::open(session.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  constexpr const char* dirname = ".rutorrent-stop-intents";
-  if (increment && ::mkdirat(parent.get(), dirname, 0700) == 0) {
-    if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync intent directory entry");
-  } else if (increment && errno != EEXIST) {
-    throw std::runtime_error("cannot create intent directory");
-  }
-  int directory = ::openat(parent.get(), dirname, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (directory < 0 && !increment && errno == ENOENT) return 0;
+  const int directory = open_directory(session, increment);
+  if (directory < 0) return 0;
   Fd dir(directory);
   bool created = false;
   int file = -1;
@@ -78,6 +82,7 @@ inline uint64_t counter(const std::string& session, const std::string& hash, boo
     file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (file < 0 && errno == ENOENT) return 0;
   }
+  if (file < 0) throw std::runtime_error(std::string("cannot open stop intent journal: ") + std::strerror(errno));
   Fd journal(file);
   uint64_t value = read_counter(journal.get());
   if (!increment) return value;
@@ -169,16 +174,19 @@ inline Lease read_lease(const std::string& session, const std::string& hash) {
   if (session.empty()) return {}; // No lease can exist without a session directory.
   if (hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
     throw std::runtime_error("invalid session path or hash");
-  Fd parent(::open(session.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-  int directory = ::openat(parent.get(), ".rutorrent-stop-intents", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (directory < 0 && errno == ENOENT) return {};
+  const int directory = open_directory(session, false);
+  if (directory < 0) return {};
   Fd dir(directory);
   const std::string filename = hash + ".claim";
   int file = ::openat(dir.get(), filename.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno == ENOENT) return {};
+  if (file < 0) throw std::runtime_error(std::string("cannot open stop claim file: ") + std::strerror(errno));
   Fd file_handle(file);
   struct stat st{};
-  if (::fstat(file_handle.get(), &st) != 0 || !S_ISREG(st.st_mode) || (st.st_size != 50 && st.st_size != 128 && (st.st_size < 137 || st.st_size > 4233)))
+  if (::fstat(file_handle.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
+      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600)
+    throw std::runtime_error("unsafe stop claim file ownership or mode");
+  if (st.st_size != 50 && st.st_size != 128 && (st.st_size < 137 || st.st_size > 4233))
     throw std::runtime_error("invalid stop claim file");
   std::string value(static_cast<size_t>(st.st_size), '\0');
   if (::pread(file_handle.get(), value.data(), value.size(), 0) != st.st_size)
@@ -397,13 +405,7 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
     const std::string payload = token + "\n" + job + "\n" +
       std::to_string(state) + std::to_string(open) + std::to_string(active) + "\n" + local_id + "\n";
     if (payload.size() != 128) throw std::runtime_error("invalid stop claim receipt");
-    Fd parent(::open(session.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (::mkdirat(parent.get(), ".rutorrent-stop-intents", 0700) == 0) {
-      if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync stop claim directory entry");
-    } else if (errno != EEXIST) {
-      throw std::runtime_error("cannot create stop claim directory");
-    }
-    Fd dir(::openat(parent.get(), ".rutorrent-stop-intents", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    Fd dir(open_directory(session, true));
     const std::string filename = hash + ".claim";
     const std::string temporary = filename + "." + token.substr(0, 32) + ".tmp";
     ::unlinkat(dir.get(), temporary.c_str(), 0); // stale temp after SIGKILL.
@@ -435,8 +437,7 @@ inline Lease publish_phase(core::Download* download, const Lease& claim, char ph
       std::to_string(claim.state) + std::to_string(claim.open) + std::to_string(claim.active) +
       "\n" + claim.local_id + "\n";
     const std::string payload = std::string(1, phase) + "\n" + body + mode + "\n" + size + ":" + path;
-    Fd parent(::open(session.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    Fd dir(::openat(parent.get(), ".rutorrent-stop-intents", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    Fd dir(open_directory(session, false));
     const std::string filename = hash + ".claim";
     const std::string temporary = filename + "." + claim.token.substr(0, 32) + "." + phase + ".tmp";
     ::unlinkat(dir.get(), temporary.c_str(), 0); // stale temp after SIGKILL, never published.
@@ -465,8 +466,7 @@ inline bool release_lease(core::Download* download, const std::string& token) {
   if (held(download) != token) return false;
   const auto [session, hash] = identity(download);
   try {
-    Fd parent(::open(session.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    Fd dir(::openat(parent.get(), ".rutorrent-stop-intents", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    Fd dir(open_directory(session, false));
     if (::unlinkat(dir.get(), (hash + ".claim").c_str(), 0) != 0 || ::fsync(dir.get()) != 0)
       throw std::runtime_error("cannot durably release stop claim");
   } catch (const std::exception& e) { throw torrent::input_error(std::string("stop claim: ") + e.what()); }

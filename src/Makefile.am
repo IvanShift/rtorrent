@@ -209,7 +209,8 @@ libsub_root_a_SOURCES = \
 	setup.h \
 	signal_handler.cc \
 	signal_handler.h \
-	stop_intent.h
+	stop_intent.h \
+	core/session_path.h
 
 
 if NO_NCURSES
