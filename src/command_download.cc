@@ -1163,7 +1163,8 @@ torrent::Object rr_migration_rollback(const std::string& hash) {
     const auto state = rr_migration_read(hash);
     if (candidate->is_open() || candidate->is_active() ||
         rpc::call_command_string("d.local_id", target) != applied.second.second ||
-        retrieve_d_custom(candidate, "retrackers-recovery").as_string() != state.claim)
+        retrieve_d_custom(candidate, "retrackers-recovery").as_string() !=
+            (state.tx.empty() ? state.claim : rr_candidate_claim_marker(state)))
       return std::string("successor-busy");
     rpc::call_command("d.erase", torrent::Object(), target);
     if (control->core()->download_list()->find_hex_ptr(applied.first.c_str()))
