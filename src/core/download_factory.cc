@@ -594,6 +594,21 @@ DownloadFactory::initialize_rtorrent(Download* download, torrent::Object* rtorre
     rtorrent->insert_key("state_counter", int64_t());
   }
 
+  // A new same-hash download starts at the current durable generation. Old
+  // journal records belong to a prior incarnation, not to this new user load.
+  if (!m_session) {
+    try {
+      const auto hash = rpc::call_command_string("d.hash", rpc::make_target(download));
+      rtorrent->insert_key("stop_generation", static_cast<int64_t>(
+          stop_intent::counter(rpc::call_command_string("session.path"), hash, false)));
+    } catch (const std::exception& e) {
+      rtorrent->insert_key("state", int64_t(0));
+      m_start = false;
+      download->set_hash_failed(true);
+      download->set_message("Stop intent generation unavailable; new download held");
+      lt_log_print(torrent::LOG_ERROR, "Stop intent generation unavailable for new download: %s", e.what());
+    }
+  }
   // A saved active session older than the last durable Stop must not autostart.
   if (m_session) {
     try {

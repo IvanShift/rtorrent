@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <typeinfo>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <torrent/torrent.h>
 #include <torrent/exceptions.h>
 #include <torrent/data/chunk_utils.h>
@@ -42,6 +43,7 @@
 #include "globals.h"
 #include "setup.h"
 #include "signal_handler.h"
+#include "stop_intent.h"
 #include "option_parser.h"
 
 #define LT_LOG(log_fmt, ...)                                    \
@@ -441,18 +443,6 @@ main(int argc, char** argv) {
       CMD_REDIRECT("network.port_range.set",  "network.listen.port.range.set");
     }
 
-    {
-      auto fd = torrent::fd_open_family(torrent::fd_flag_stream, AF_INET6);
-
-      if (fd == -1) {
-        if (errno == EAFNOSUPPORT) {
-          lt_log_print(torrent::LOG_WARN, "disabling ipv6 support, not available on system");
-          rpc::call_command_set_value("network.block.ipv6.set", true);
-        }
-      } else {
-        torrent::fd_close(fd);
-      }
-    }
 
     int firstArg = parse_main_options(argc, argv);
 
@@ -464,6 +454,16 @@ main(int argc, char** argv) {
 
         rpc::parse_command_single(rpc::make_target(), "try_import=" + path);
       });
+
+    // Use the raw system call: libtorrent's family helper can silently fall
+    // back to IPv4. Apply detection after rc imports so config cannot undo it.
+    const int ipv6_fd = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (ipv6_fd < 0 && (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT)) {
+      lt_log_print(torrent::LOG_WARN, "disabling ipv6 support, not available on system");
+      rpc::call_command_set_value("network.block.ipv6.set", true);
+    } else if (ipv6_fd >= 0) {
+      ::close(ipv6_fd);
+    }
 
     LT_LOG("seeded srandom and srand48 (seed:%u)", random_seed);
     LT_LOG("max memory usage: %" PRIu64, torrent::runtime::memory_manager()->max_memory_usage());
@@ -483,6 +483,10 @@ main(int argc, char** argv) {
     retrackers_migration_repair_committed_startup();
     load_session_torrents(session_thread::manager()->path());
     retrackers_migration_recover_startup();
+    try { stop_intent::cleanup_startup(session_thread::manager()->path()); }
+    catch (const std::exception& e) {
+      lt_log_print(torrent::LOG_ERROR, "Stop intent cleanup held: %s", e.what());
+    }
     load_arg_torrents(argv + firstArg, argv + argc);
 
     // Make sure we update the display before any scheduled tasks can run, so that loading of

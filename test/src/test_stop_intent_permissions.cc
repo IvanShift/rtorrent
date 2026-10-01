@@ -36,6 +36,7 @@ void TestStopIntentPermissions::setUp() {
 
 void TestStopIntentPermissions::tearDown() {
   ::unlink((m_session + "/linked").c_str());
+  ::unlink((m_session + "/journal-link").c_str());
   const std::string nested = m_session + "/outer/session/.rutorrent-stop-intents";
   ::unlink((nested + "/" + hash).c_str());
   ::rmdir(nested.c_str());
@@ -130,4 +131,50 @@ void TestStopIntentPermissions::test_dotdot_cannot_hide_writable_ancestor() {
   CPPUNIT_ASSERT_EQUAL(0, ::mkdir(target.c_str(), 0700));
   CPPUNIT_ASSERT_EQUAL(0, ::chmod(outer.c_str(), 0777));
   CPPUNIT_ASSERT_THROW(stop_intent::counter(outer + "/../target/", hash, false), std::runtime_error);
+}
+
+void TestStopIntentPermissions::test_setgid_session_accepts_private_journal() {
+  CPPUNIT_ASSERT_EQUAL(0, ::chmod(m_session.c_str(), 02755));
+  CPPUNIT_ASSERT_EQUAL(uint64_t(1), stop_intent::counter(m_session, hash, true));
+  CPPUNIT_ASSERT_EQUAL(uint64_t(1), stop_intent::counter(m_session, hash, false));
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::stat((m_session + "/.rutorrent-stop-intents").c_str(), &st));
+  CPPUNIT_ASSERT_EQUAL(mode_t(0700), st.st_mode & 0777);
+}
+
+void TestStopIntentPermissions::test_legacy_counter_compacts_after_increment() {
+  const std::string dir = m_session + "/.rutorrent-stop-intents";
+  CPPUNIT_ASSERT_EQUAL(0, ::mkdir(dir.c_str(), 0700));
+  write_file(dir + "/" + hash, "0000000000000001\n0000000000000002\n0000000000000003\n", 0600);
+  CPPUNIT_ASSERT_EQUAL(uint64_t(4), stop_intent::counter(m_session, hash, true));
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::stat((dir + "/" + hash).c_str(), &st));
+  CPPUNIT_ASSERT_EQUAL(off_t(17), st.st_size);
+}
+
+void TestStopIntentPermissions::test_counter_stays_bounded() {
+  for (unsigned i = 1; i <= 100; ++i)
+    CPPUNIT_ASSERT_EQUAL(uint64_t(i), stop_intent::counter(m_session, hash, true));
+  const std::string dir = m_session + "/.rutorrent-stop-intents";
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::stat((dir + "/" + hash).c_str(), &st));
+  CPPUNIT_ASSERT_EQUAL(off_t(17), st.st_size);
+  CPPUNIT_ASSERT_EQUAL(size_t(1), static_cast<size_t>(std::distance(
+      std::filesystem::directory_iterator(dir), std::filesystem::directory_iterator())));
+}
+
+void TestStopIntentPermissions::test_retired_counter_is_not_inherited() {
+  CPPUNIT_ASSERT_EQUAL(uint64_t(1), stop_intent::counter(m_session, hash, true));
+  stop_intent::erase_counter(m_session, hash);
+  CPPUNIT_ASSERT_EQUAL(uint64_t(0), stop_intent::counter(m_session, hash, false));
+  stop_intent::erase_counter(m_session, hash);
+  CPPUNIT_ASSERT_EQUAL(uint64_t(1), stop_intent::counter(m_session, hash, true));
+}
+
+void TestStopIntentPermissions::test_multiple_link_journal_is_refused() {
+  CPPUNIT_ASSERT_EQUAL(uint64_t(1), stop_intent::counter(m_session, hash, true));
+  CPPUNIT_ASSERT_EQUAL(0, ::link((m_session + "/.rutorrent-stop-intents/" + hash).c_str(),
+                                (m_session + "/journal-link").c_str()));
+  CPPUNIT_ASSERT_THROW(stop_intent::counter(m_session, hash, true), std::runtime_error);
+  CPPUNIT_ASSERT_THROW(stop_intent::erase_counter(m_session, hash), std::runtime_error);
 }

@@ -681,6 +681,20 @@ thread_local std::string rr_native_release_start_hash;
 
 // The private journal is the durable authority until same-hash release and finalization.
 namespace {
+// Migration failpoints are available only in an explicitly enabled test build.
+bool rr_migration_test_cut(const char* name) {
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  static const std::string selected = [] {
+    const char* value = ::getenv("RR_MIG_TEST_CUT");
+    return value ? std::string(value) : std::string();
+  }();
+  return selected == name;
+#else
+  (void)name;
+  return false;
+#endif
+}
+
 struct RrMigrationFile {
   std::string path;
   int64_t size;
@@ -1332,8 +1346,7 @@ torrent::Object rr_migration_capture(core::Download* source,
                            hash, original.incarnation);
   rr_migration_publish(state, source); // Full rollback and T-bound intent precede owned stop.
   if (v2) {
-    if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-        std::string(cut) == "after-capture-intent") ::_exit(137);
+    if (rr_migration_test_cut("after-capture-intent")) ::_exit(137);
     stop_intent::record(source, true);
     {
       stop_intent::ScopedSuppress suppress;
@@ -1350,17 +1363,14 @@ torrent::Object rr_migration_capture(core::Download* source,
         source->is_open() || source->is_active())
       throw torrent::input_error("RR v2 owned quiesce did not close source.");
     rr_quiesced_publish(state, quiesced);
-    if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-        std::string(cut) == "after-capture-quiesced-throw")
+    if (rr_migration_test_cut("after-capture-quiesced-throw"))
       throw torrent::input_error("RR test quiesced receipt before source erase.");
-    if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-        std::string(cut) == "after-capture-quiesced") ::_exit(137);
+    if (rr_migration_test_cut("after-capture-quiesced")) ::_exit(137);
     rr_native_capture_erase_hash = hash;
     try { rpc::call_command("d.erase", torrent::Object(), target); }
     catch (...) { rr_native_capture_erase_hash.clear(); throw; }
     rr_native_capture_erase_hash.clear();
-    if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-        std::string(cut) == "after-capture-erase") ::_exit(137);
+    if (rr_migration_test_cut("after-capture-erase")) ::_exit(137);
   } else {
     rpc::call_command("d.erase", torrent::Object(), target);
   }
@@ -2054,6 +2064,8 @@ std::string rr_original_mint_tx() {
 
 torrent::Object rr_begin_original(core::Download* owner,
                                   const torrent::Object::list_type& args) {
+  if (owner->info()->is_meta_download())
+    throw torrent::input_error("RR original claim requires resolved torrent metadata.");
   if (args.size() != 3)
     throw torrent::input_error("RR original begin requires local ID, user digest and run bit.");
   const auto target = rpc::make_target(owner);
@@ -2121,8 +2133,7 @@ torrent::Object rr_begin_original(core::Download* owner,
       throw torrent::input_error("RR original preclaim directory fsync failed.");
   } catch (...) { ::close(dir); throw; }
   ::close(dir);
-  if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-      std::string(cut) == "after-original-claim") ::_exit(137);
+  if (rr_migration_test_cut("after-original-claim")) ::_exit(137);
   const std::string marker = rr_original_v2_marker(claim);
   auto& custom = owner->bencode()->get_key("rtorrent").insert_preserve_copy(
           "custom", torrent::Object::create_map()).first->second;
@@ -2482,8 +2493,7 @@ void rr_complete_same_hash_release(core::Download* owner,
                                    const std::string& tx,
                                    const std::string& incarnation) {
   rr_prepare_publish(hash, tx, incarnation);
-  if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-      std::string(cut) == "after-samehash-prepared") ::_exit(137);
+  if (rr_migration_test_cut("after-samehash-prepared")) ::_exit(137);
   // This RPC runs on the daemon main thread. After the durable prepare,
   // removing wa fences every later callback owned by this worker.
   auto* storage = control->object_storage();
@@ -2567,11 +2577,9 @@ torrent::Object rr_finish_original(core::Download* owner,
     }
     throw;
   }
-  if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut) {
-    if (std::string(cut) == "after-original-release") ::_exit(137);
-    if (std::string(cut) == "after-original-release-throw")
-      throw torrent::input_error("RR test release-repair failure after durable receipt.");
-  }
+  if (rr_migration_test_cut("after-original-release")) ::_exit(137);
+  if (rr_migration_test_cut("after-original-release-throw"))
+    throw torrent::input_error("RR test release-repair failure after durable receipt.");
   rr_original_release_repair(hash);
   rr_complete_same_hash_release(owner, hash, tx, incarnation);
   return std::string("finalized");
@@ -2689,8 +2697,7 @@ torrent::Object rr_release_owner(core::Download* owner,
           ":" + state.tx + ":" + rr_committed_digest(files) + ":" +
           std::to_string(baseline) + "\n");
       static bool release_rename_test_cut_fired = false;
-      if (const char* cut = ::getenv("RR_MIG_TEST_CUT"); cut &&
-          std::string(cut) == "after-committed-release-rename-throw" &&
+      if (rr_migration_test_cut("after-committed-release-rename-throw") &&
           !release_rename_test_cut_fired) {
         release_rename_test_cut_fired = true;
         throw torrent::input_error("RR test released receipt before directory fsync.");

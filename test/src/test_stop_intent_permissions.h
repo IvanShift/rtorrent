@@ -13,6 +13,11 @@ class TestStopIntentPermissions : public test_fixture {
   CPPUNIT_TEST(test_writable_ancestor_cannot_replace_private_session);
   CPPUNIT_TEST(test_relative_session_under_sticky_tmp_still_works);
   CPPUNIT_TEST(test_dotdot_cannot_hide_writable_ancestor);
+  CPPUNIT_TEST(test_setgid_session_accepts_private_journal);
+  CPPUNIT_TEST(test_legacy_counter_compacts_after_increment);
+  CPPUNIT_TEST(test_counter_stays_bounded);
+  CPPUNIT_TEST(test_retired_counter_is_not_inherited);
+  CPPUNIT_TEST(test_multiple_link_journal_is_refused);
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -28,6 +33,16 @@ public:
   void test_writable_ancestor_cannot_replace_private_session();
   void test_relative_session_under_sticky_tmp_still_works();
   void test_dotdot_cannot_hide_writable_ancestor();
+
+  void test_setgid_session_accepts_private_journal();
+
+  void test_legacy_counter_compacts_after_increment();
+
+  void test_counter_stays_bounded();
+
+  void test_retired_counter_is_not_inherited();
+
+  void test_multiple_link_journal_is_refused();
 
 private:
   std::string m_session;

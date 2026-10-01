@@ -86,3 +86,38 @@ compiled if the user wishes to avoid using OpenSSL.
 * autoconf
 * autoheader
 * automake
+
+## Native fork runtime requirements
+
+The `rutorrent-native` branch targets current upstream `master`. Native session
+and retrackers patches are not carried onto the legacy 0.9.8 build.
+
+Use a POSIX filesystem for the session directory: it must retain numeric
+ownership and private permissions and support `openat` with `O_NOFOLLOW`, atomic
+rename, `fsync`, and `fdatasync`. The daemon must own the session directory and
+its journals. Group/other write access is refused; setgid session directories
+are supported. Stop intent directories are private 0700 (setgid is allowed),
+and records are single-link files with mode 0600. Filesystems that discard
+these permissions, and mounts with incompatible ownership mapping, require
+operator correction rather than an automatic fallback. Refusals include the
+path and expected ownership/mode.
+
+Stop generations are published as one atomic 17-byte record. A new same-hash
+load starts at the current generation; erasure retires its record unless an
+unresolved retrackers migration still needs it. Startup removes safe orphaned
+records and unpublished temporary files after migration recovery. User Stop
+commands remain synchronous so a later crash cannot silently revoke a Stop.
+
+Destructive migration failpoints are disabled by default. Only dedicated test
+builds configured with `--enable-rr-migration-test-cuts` honor
+`RR_MIG_TEST_CUT`; production builds ignore it. Run `make check` for unit tests.
+The integration fixture in `test/integration/native_state.py` uses an isolated
+container and a synthetic local metadata peer, without public tracker traffic.
+Run `python3 test/integration/meta_callback.py` for callback lifetime and Stop
+transfer regressions against the actual function body using non-deleting test
+doubles; this focused check requires a host C++ compiler.
+
+Image pins use full commit SHAs. Keep every shipped pin reachable from an
+immutable published release tag; create and publish that tag only as part of
+the owner-approved release workflow. A moving branch tip alone is not a
+long-term source archive.

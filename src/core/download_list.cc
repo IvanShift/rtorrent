@@ -85,7 +85,7 @@ DownloadList::find(const torrent::HashString& hash) {
 
 DownloadList::iterator
 DownloadList::find_hex(const char* hash) {
-  if (strlen(hash) < 40)
+  if (strlen(hash) != 40)
     return end();
 
   torrent::HashString key;
@@ -192,8 +192,13 @@ DownloadList::erase_ptr(Download* download) {
   erase(std::find_if(begin(), end(), [download](const auto& entry) { return entry.get() == download; }));
 }
 
+void
+DownloadList::erase_meta_placeholder(Download* download) {
+  erase(std::find_if(begin(), end(), [download](const auto& entry) { return entry.get() == download; }), false);
+}
+
 DownloadList::iterator
-DownloadList::erase(iterator itr) {
+DownloadList::erase(iterator itr, bool retire_stop_intent) {
   if (itr == end())
     throw torrent::internal_error("DownloadList::erase(...) could not find download.");
 
@@ -210,6 +215,8 @@ DownloadList::erase(iterator itr) {
     throw torrent::input_error("RR original claim blocks direct erase.");
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
+  // Erasure and its view callbacks are internal shutdown, not a newer user Stop.
+  stop_intent::ScopedSuppress suppress;
 
   lt_log_print_info(torrent::LOG_TORRENT_INFO, (*itr)->info(), "download_list", "Erasing download.");
 
@@ -223,6 +230,15 @@ DownloadList::erase(iterator itr) {
 
   for (auto v : *control->view_manager())
     v->erase(itr->get());
+
+  if (retire_stop_intent && !retrackers_migration_pending(erase_hash) &&
+      !retrackers_migration_original_claim_active(erase_hash) &&
+      !retrackers_migration_uncommitted_candidate(erase_hash)) {
+    try { stop_intent::erase_counter(session_thread::manager()->path(), erase_hash); }
+    catch (const std::exception& e) {
+      lt_log_print(torrent::LOG_ERROR, "Cannot retire stop intent for %s: %s", erase_hash.c_str(), e.what());
+    }
+  }
 
   (*itr)->release_lifetime();
   torrent::download_remove(*(*itr)->download());
@@ -796,38 +812,70 @@ void
 DownloadList::process_meta_download(Download* download) {
   lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Processing meta download.");
 
-  rpc::call_command("d.stop", torrent::Object(), rpc::make_target(download));
-  rpc::call_command("d.close", torrent::Object(), rpc::make_target(download));
+  const auto lifetime = download->lifetime();
+  try {
+    const auto target = rpc::make_target(download);
+    const auto hash = rpc::call_command_string("d.hash", target);
+    const auto session = rpc::call_command_string("session.path");
+    const auto generation = stop_intent::counter(session, hash, false);
+    int64_t start = rpc::call_command_value("d.state", target);
 
-  std::string  metafile = (*download->file_list()->begin())->frozen_path().str();
+    // The metadata placeholder shares the real torrent's hash. Its replacement
+    // must not create a user Stop generation inherited by the real download.
+    {
+      stop_intent::ScopedSuppress suppress;
+      rpc::parse_command_single(target, "view.set_visible=stopped");
+      if (lifetime.expired())
+        return;
+      rpc::call_command("d.close", torrent::Object(), target);
+      if (lifetime.expired())
+        return;
+    }
 
-  std::fstream file(metafile.c_str(), std::ios::in | std::ios::binary);
+    std::string  metafile = (*download->file_list()->begin())->frozen_path().str();
 
-  if (!file.is_open()) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not read download metadata.");
-    return;
+    std::fstream file(metafile.c_str(), std::ios::in | std::ios::binary);
+
+    if (!file.is_open()) {
+      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not read download metadata.");
+      return;
+    }
+
+    auto bencode = std::make_unique<torrent::Object>(torrent::Object::create_map());
+    file >> bencode->insert_key("info", torrent::Object());
+
+    if (file.fail()) {
+      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download, the input is not a valid torrent.");
+      return;
+    }
+
+    file.close();
+
+    // Preserve the placeholder until erasure succeeds; a refused conversion can be retried.
+    bencode->insert_key("rtorrent_meta_download", download->bencode()->get_key("rtorrent_meta_download"));
+    if (download->bencode()->has_key("announce"))
+      bencode->insert_key("announce", download->bencode()->get_key("announce"));
+    if (download->bencode()->has_key("announce-list"))
+      bencode->insert_key("announce-list", download->bencode()->get_key("announce-list"));
+
+    // Keep the generation until all close/erase/view callbacks have finished.
+    // An explicit Stop from any of them must transfer to the real download.
+    erase_meta_placeholder(download);
+    if (stop_intent::counter(session, hash, false) != generation)
+      start = 0;
+    bencode->get_key("rtorrent_meta_download").insert_key("start", start);
+    if (!retrackers_migration_pending(hash) &&
+        !retrackers_migration_original_claim_active(hash) &&
+        !retrackers_migration_uncommitted_candidate(hash))
+      stop_intent::erase_counter(session, hash);
+
+    control->core()->try_create_download_from_meta_download(std::move(bencode), metafile);
+  } catch (const std::exception& e) {
+    // Metadata callbacks run outside an RPC boundary. Contain a refused claim
+    // or malformed metadata instead of unwinding the daemon's main loop.
+    lt_log_print(torrent::LOG_ERROR, "Metadata replacement held: %s", e.what());
+    if (!lifetime.expired()) download->set_message(std::string("Metadata replacement held: ") + e.what());
   }
-
-  auto bencode = std::make_unique<torrent::Object>(torrent::Object::create_map());
-  file >> bencode->insert_key("info", torrent::Object());
-
-  if (file.fail()) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download, the input is not a valid torrent.");
-    return;
-  }
-
-  file.close();
-
-  // Steal the keys we still need. The old download has no use for them.
-  bencode->insert_key("rtorrent_meta_download", torrent::Object()).swap(download->bencode()->get_key("rtorrent_meta_download"));
-  if (download->bencode()->has_key("announce"))
-    bencode->insert_key("announce", torrent::Object()).swap(download->bencode()->get_key("announce"));
-  if (download->bencode()->has_key("announce-list"))
-    bencode->insert_key("announce-list", torrent::Object()).swap(download->bencode()->get_key("announce-list"));
-
-  erase_ptr(download);
-
-  control->core()->try_create_download_from_meta_download(std::move(bencode), metafile);
 }
 
 }

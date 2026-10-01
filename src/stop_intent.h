@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
+#include <vector>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -37,9 +39,11 @@ inline int open_directory(const std::string& session, bool create) {
   if (dir < 0 && !create && errno == ENOENT) return -1;
   if (dir < 0) throw std::runtime_error(std::string("cannot open stop intent directory: ") + std::strerror(errno));
   if (::fstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
-      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0700) {
+      st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
     ::close(dir);
-    throw std::runtime_error("unsafe stop intent directory ownership or mode");
+    throw std::runtime_error("unsafe stop intent directory ownership or mode: " + session + "/" + name +
+        " uid=" + std::to_string(st.st_uid) + " mode=" + std::to_string(st.st_mode & 07777) +
+        "; require uid=" + std::to_string(::geteuid()) + " mode=0700 (setgid is allowed)");
   }
   return dir;
 }
@@ -47,7 +51,7 @@ inline int open_directory(const std::string& session, bool create) {
 inline uint64_t read_counter(int fd) {
   struct stat st{};
   if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600)
+      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600 || st.st_nlink != 1)
     throw std::runtime_error("unsafe stop intent journal ownership or mode");
   if (st.st_size == 0) return 0;
   if (st.st_size < 0 || st.st_size % 17 != 0)
@@ -65,34 +69,96 @@ inline uint64_t read_counter(int fd) {
   return value;
 }
 
+inline bool valid_hash(const std::string& hash) {
+  return hash.size() == 40 && hash.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+}
+
+struct TemporaryEntry {
+  int directory;
+  std::string name;
+  bool owned = false;
+  ~TemporaryEntry() { if (owned && !name.empty()) ::unlinkat(directory, name.c_str(), 0); }
+};
+
 inline uint64_t counter(const std::string& session, const std::string& hash, bool increment) {
-  if (session.empty() && !increment) return 0; // No session means there is no durable intent journal.
-  if (session.empty() || hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+  if (session.empty() && !increment) return 0;
+  if (session.empty() || !valid_hash(hash))
     throw std::runtime_error("invalid session path or hash");
   const int directory = open_directory(session, increment);
   if (directory < 0) return 0;
   Fd dir(directory);
-  bool created = false;
-  int file = -1;
-  if (increment) {
-    file = ::openat(dir.get(), hash.c_str(), O_RDWR | O_APPEND | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (file >= 0) created = true;
-    else if (errno == EEXIST) file = ::openat(dir.get(), hash.c_str(), O_RDWR | O_APPEND | O_NOFOLLOW | O_CLOEXEC);
-  } else {
-    file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (file < 0 && errno == ENOENT) return 0;
+  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (file < 0 && errno != ENOENT)
+    throw std::runtime_error(std::string("cannot open stop intent journal: ") + std::strerror(errno));
+  uint64_t value = 0;
+  if (file >= 0) {
+    Fd journal(file);
+    value = read_counter(journal.get());
   }
-  if (file < 0) throw std::runtime_error(std::string("cannot open stop intent journal: ") + std::strerror(errno));
-  Fd journal(file);
-  uint64_t value = read_counter(journal.get());
   if (!increment) return value;
   if (value >= INT64_MAX) throw std::runtime_error("stop intent counter exhausted");
   char record[18];
-  int length = std::snprintf(record, sizeof(record), "%016llx\n", static_cast<unsigned long long>(++value));
-  if (length != 17 || ::write(journal.get(), record, 17) != 17 || ::fdatasync(journal.get()) != 0)
-    throw std::runtime_error("cannot durably write stop intent");
-  if (created && ::fsync(dir.get()) != 0) throw std::runtime_error("cannot sync intent file entry");
+  const int length = std::snprintf(record, sizeof(record), "%016llx\n", static_cast<unsigned long long>(++value));
+  TemporaryEntry temporary{dir.get(), hash + ".counter." +
+      core::random_hex16<std::runtime_error>(nullptr, "cannot generate stop counter nonce") + ".tmp"};
+  Fd staging(::openat(dir.get(), temporary.name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+  temporary.owned = true;
+  // Replace one complete record. Interrupted or partial writes preserve the
+  // previous generation; successful writes compact legacy append-only journals.
+  if (length != 17 || ::write(staging.get(), record, 17) != 17 || ::fdatasync(staging.get()) != 0)
+    throw std::runtime_error("cannot durably stage stop intent");
+  if (::renameat(dir.get(), temporary.name.c_str(), dir.get(), hash.c_str()) != 0 || ::fsync(dir.get()) != 0)
+    throw std::runtime_error("cannot durably publish stop intent");
+  temporary.name.clear();
   return value;
+}
+
+inline void erase_counter(const std::string& session, const std::string& hash) {
+  if (session.empty()) return;
+  if (!valid_hash(hash)) throw std::runtime_error("invalid stop intent hash");
+  const int directory = open_directory(session, false);
+  if (directory < 0) return;
+  Fd dir(directory);
+  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (file < 0 && errno == ENOENT) return;
+  Fd journal(file);
+  read_counter(journal.get());
+  if (::unlinkat(dir.get(), hash.c_str(), 0) != 0 || ::fsync(dir.get()) != 0)
+    throw std::runtime_error("cannot retire stop intent journal");
+}
+
+inline void cleanup_startup(const std::string& session) {
+  if (session.empty()) return;
+  const int directory = open_directory(session, false);
+  if (directory < 0) return;
+  Fd dir(directory);
+  Fd parent(core::open_trusted_session_directory(session));
+  DIR* entries = ::fdopendir(::dup(dir.get()));
+  if (!entries) throw std::runtime_error("cannot scan stop intent directory");
+  std::vector<std::string> names;
+  while (const auto* entry = ::readdir(entries)) names.emplace_back(entry->d_name);
+  ::closedir(entries);
+  bool changed = false;
+  for (const auto& name : names) {
+    if (name.size() < 40 || !valid_hash(name.substr(0, 40))) continue;
+    struct stat st{};
+    if (::fstatat(dir.get(), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600) continue;
+    const std::string suffix = name.substr(40);
+    const bool temporary = suffix.size() > 4 && suffix.compare(suffix.size() - 4, 4, ".tmp") == 0 &&
+        (suffix.rfind(".claim.", 0) == 0 || suffix.rfind(".counter.", 0) == 0);
+    bool orphan = false;
+    if (suffix.empty() && st.st_nlink == 1) {
+      const std::string hash = name;
+      struct stat saved{}, claim{};
+      const bool no_session = ::fstatat(parent.get(), (hash + ".torrent").c_str(), &saved, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT;
+      const bool no_claim = ::fstatat(dir.get(), (hash + ".claim").c_str(), &claim, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT;
+      orphan = no_session && no_claim && !retrackers_migration_source_reserved(hash) &&
+          !retrackers_migration_pending(hash) && retrackers_migration_target_source(hash).empty();
+    }
+    if ((temporary || orphan) && ::unlinkat(dir.get(), name.c_str(), 0) == 0) changed = true;
+  }
+  if (changed && ::fsync(dir.get()) != 0) throw std::runtime_error("cannot sync retired stop intents");
 }
 
 inline std::string token(const std::string& local_id, uint64_t value) {
@@ -408,8 +474,9 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
     Fd dir(open_directory(session, true));
     const std::string filename = hash + ".claim";
     const std::string temporary = filename + "." + token.substr(0, 32) + ".tmp";
-    ::unlinkat(dir.get(), temporary.c_str(), 0); // stale temp after SIGKILL.
+    TemporaryEntry cleanup{dir.get(), temporary};
     Fd file(::openat(dir.get(), temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    cleanup.owned = true;
     if (::write(file.get(), payload.data(), payload.size()) != static_cast<ssize_t>(payload.size()) ||
         ::fdatasync(file.get()) != 0)
       throw std::runtime_error("cannot durably write stop claim receipt");
@@ -419,6 +486,7 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
       throw std::runtime_error("cannot durably publish stop claim receipt");
     if (::unlinkat(dir.get(), temporary.c_str(), 0) != 0 || ::fsync(dir.get()) != 0)
       throw std::runtime_error("cannot clean stop claim temporary file");
+    cleanup.name.clear();
     return claim;
   } catch (const std::exception& e) { throw torrent::input_error(std::string("stop claim: ") + e.what()); }
 }
@@ -440,13 +508,15 @@ inline Lease publish_phase(core::Download* download, const Lease& claim, char ph
     Fd dir(open_directory(session, false));
     const std::string filename = hash + ".claim";
     const std::string temporary = filename + "." + claim.token.substr(0, 32) + "." + phase + ".tmp";
-    ::unlinkat(dir.get(), temporary.c_str(), 0); // stale temp after SIGKILL, never published.
+    TemporaryEntry cleanup{dir.get(), temporary};
     Fd file(::openat(dir.get(), temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    cleanup.owned = true;
     if (::write(file.get(), payload.data(), payload.size()) != static_cast<ssize_t>(payload.size()) ||
         ::fdatasync(file.get()) != 0 ||
         ::renameat(dir.get(), temporary.c_str(), dir.get(), filename.c_str()) != 0 ||
         ::fsync(dir.get()) != 0)
       throw std::runtime_error("cannot durably publish terminal claim");
+    cleanup.name.clear();
     Lease terminal = claim;
     terminal.phase = phase;
     terminal.mode = mode;

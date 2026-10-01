@@ -24,6 +24,12 @@ RAK_ENABLE_WERROR
 
 TORRENT_CHECK_ATOMIC
 
+AC_ARG_ENABLE([rr-migration-test-cuts],
+  AS_HELP_STRING([--enable-rr-migration-test-cuts], [enable destructive retrackers migration failpoints (tests only)]),
+  [], [enable_rr_migration_test_cuts=no])
+AS_IF([test "x$enable_rr_migration_test_cuts" = xyes],
+  [AC_DEFINE([ENABLE_RR_MIGRATION_TEST_CUTS], [1], [Enable destructive migration test failpoints])])
+
 AC_ARG_ENABLE(execinfo,
   AS_HELP_STRING([--disable-execinfo],
     [disable libexecinfo [[default=enable]]]),

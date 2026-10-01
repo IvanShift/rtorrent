@@ -58,7 +58,7 @@ public:
   iterator            insert(Download* d);
 
   void                erase_ptr(Download* d);
-  iterator            erase(iterator itr);
+  iterator            erase(iterator itr, bool retire_stop_intent = true);
 
   //void                save(Download* d);
 
@@ -142,6 +142,7 @@ private:
   void                confirm_finished(Download* d);
 
   void                process_meta_download(Download* d);
+  void                erase_meta_placeholder(Download* d);
 };
 
 }
