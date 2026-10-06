@@ -12,6 +12,9 @@
 #include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <torrent/exceptions.h>
 #include <torrent/utils/log.h>
 #include "control.h"
@@ -30,40 +33,49 @@ inline int open_directory(const std::string& session, bool create) {
   Fd parent(core::open_trusted_session_directory(session));
   struct stat st{};
   constexpr const char* name = ".rutorrent-stop-intents";
+  const std::string path = core::session_path_child(session, name);
   if (create && ::mkdirat(parent.get(), name, 0700) == 0) {
-    if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync intent directory entry");
+    if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync intent directory entry: " + path + ": " + std::strerror(errno));
   } else if (create && errno != EEXIST) {
-    throw std::runtime_error("cannot create intent directory");
+    throw std::runtime_error("cannot create intent directory: " + path + ": " + std::strerror(errno));
   }
   const int dir = ::openat(parent.get(), name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (dir < 0 && !create && errno == ENOENT) return -1;
-  if (dir < 0) throw std::runtime_error(std::string("cannot open stop intent directory: ") + std::strerror(errno));
-  if (::fstat(dir, &st) != 0 || !S_ISDIR(st.st_mode) ||
+  if (dir < 0) throw std::runtime_error("cannot open stop intent directory: " + path + ": " + std::strerror(errno));
+  if (::fstat(dir, &st) != 0) {
+    const int error = errno;
+    ::close(dir);
+    throw std::runtime_error("cannot inspect stop intent directory: " + path + ": " + std::strerror(error));
+  }
+  if (!S_ISDIR(st.st_mode) ||
       st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
     ::close(dir);
-    throw std::runtime_error("unsafe stop intent directory ownership or mode: " + session + "/" + name +
-        " uid=" + std::to_string(st.st_uid) + " mode=" + std::to_string(st.st_mode & 07777) +
+    throw std::runtime_error("unsafe stop intent directory ownership or mode: " + path + " " +
+        core::session_path_metadata(st) +
         "; require uid=" + std::to_string(::geteuid()) + " mode=0700 (setgid is allowed)");
   }
   return dir;
 }
 
-inline uint64_t read_counter(int fd) {
+inline uint64_t read_counter(int fd, const std::string& path) {
   struct stat st{};
-  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600 || st.st_nlink != 1)
-    throw std::runtime_error("unsafe stop intent journal ownership or mode");
+  if (::fstat(fd, &st) != 0)
+    throw std::runtime_error("cannot inspect stop intent journal: " + path + ": " + std::strerror(errno));
+  if (!S_ISREG(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600 || st.st_nlink != 1)
+    throw std::runtime_error("unsafe stop intent journal ownership or mode: " + path + " " +
+        core::session_path_metadata(st) + "; require single-link regular file uid=" +
+        std::to_string(::geteuid()) + " mode=0600");
   if (st.st_size == 0) return 0;
   if (st.st_size < 0 || st.st_size % 17 != 0)
-    throw std::runtime_error("partial stop intent journal");
+    throw std::runtime_error("partial stop intent journal: " + path);
   char record[17];
   if (::pread(fd, record, sizeof(record), st.st_size - sizeof(record)) != sizeof(record) || record[16] != '\n')
-    throw std::runtime_error("unreadable stop intent journal");
+    throw std::runtime_error("unreadable stop intent journal: " + path);
   uint64_t value = 0;
   for (unsigned i = 0; i < 16; ++i) {
     char c = record[i];
     unsigned nibble = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
-    if (nibble == 16) throw std::runtime_error("malformed stop intent journal");
+    if (nibble == 16) throw std::runtime_error("malformed stop intent journal: " + path);
     value = (value << 4) | nibble;
   }
   return value;
@@ -87,16 +99,17 @@ inline uint64_t counter(const std::string& session, const std::string& hash, boo
   const int directory = open_directory(session, increment);
   if (directory < 0) return 0;
   Fd dir(directory);
-  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + hash);
+  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno != ENOENT)
-    throw std::runtime_error(std::string("cannot open stop intent journal: ") + std::strerror(errno));
+    throw std::runtime_error("cannot open stop intent journal: " + path + ": " + std::strerror(errno));
   uint64_t value = 0;
   if (file >= 0) {
     Fd journal(file);
-    value = read_counter(journal.get());
+    value = read_counter(journal.get(), path);
   }
   if (!increment) return value;
-  if (value >= INT64_MAX) throw std::runtime_error("stop intent counter exhausted");
+  if (value >= INT64_MAX) throw std::runtime_error("stop intent counter exhausted: " + path);
   char record[18];
   const int length = std::snprintf(record, sizeof(record), "%016llx\n", static_cast<unsigned long long>(++value));
   TemporaryEntry temporary{dir.get(), hash + ".counter." +
@@ -106,9 +119,9 @@ inline uint64_t counter(const std::string& session, const std::string& hash, boo
   // Replace one complete record. Interrupted or partial writes preserve the
   // previous generation; successful writes compact legacy append-only journals.
   if (length != 17 || ::write(staging.get(), record, 17) != 17 || ::fdatasync(staging.get()) != 0)
-    throw std::runtime_error("cannot durably stage stop intent");
+    throw std::runtime_error("cannot durably stage stop intent: " + path);
   if (::renameat(dir.get(), temporary.name.c_str(), dir.get(), hash.c_str()) != 0 || ::fsync(dir.get()) != 0)
-    throw std::runtime_error("cannot durably publish stop intent");
+    throw std::runtime_error("cannot durably publish stop intent: " + path);
   temporary.name.clear();
   return value;
 }
@@ -119,12 +132,14 @@ inline void erase_counter(const std::string& session, const std::string& hash) {
   const int directory = open_directory(session, false);
   if (directory < 0) return;
   Fd dir(directory);
-  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + hash);
+  const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno == ENOENT) return;
+  if (file < 0) throw std::runtime_error("cannot open stop intent journal: " + path + ": " + std::strerror(errno));
   Fd journal(file);
-  read_counter(journal.get());
+  read_counter(journal.get(), path);
   if (::unlinkat(dir.get(), hash.c_str(), 0) != 0 || ::fsync(dir.get()) != 0)
-    throw std::runtime_error("cannot retire stop intent journal");
+    throw std::runtime_error("cannot retire stop intent journal: " + path);
 }
 
 inline void cleanup_startup(const std::string& session) {
@@ -156,7 +171,7 @@ inline void cleanup_startup(const std::string& session) {
       orphan = no_session && no_claim && !retrackers_migration_source_reserved(hash) &&
           !retrackers_migration_pending(hash) && retrackers_migration_target_source(hash).empty();
     }
-    if ((temporary || orphan) && ::unlinkat(dir.get(), name.c_str(), 0) == 0) changed = true;
+    if (((temporary && st.st_nlink == 1) || orphan) && ::unlinkat(dir.get(), name.c_str(), 0) == 0) changed = true;
   }
   if (changed && ::fsync(dir.get()) != 0) throw std::runtime_error("cannot sync retired stop intents");
 }
@@ -244,30 +259,35 @@ inline Lease read_lease(const std::string& session, const std::string& hash) {
   if (directory < 0) return {};
   Fd dir(directory);
   const std::string filename = hash + ".claim";
-  int file = ::openat(dir.get(), filename.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + filename);
+  int file = ::openat(dir.get(), filename.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno == ENOENT) return {};
-  if (file < 0) throw std::runtime_error(std::string("cannot open stop claim file: ") + std::strerror(errno));
+  if (file < 0) throw std::runtime_error("cannot open stop claim file: " + path + ": " + std::strerror(errno));
   Fd file_handle(file);
   struct stat st{};
-  if (::fstat(file_handle.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
-      st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600)
-    throw std::runtime_error("unsafe stop claim file ownership or mode");
+  if (::fstat(file_handle.get(), &st) != 0)
+    throw std::runtime_error("cannot inspect stop claim file: " + path + ": " + std::strerror(errno));
+  if (!S_ISREG(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 07777) != 0600)
+    throw std::runtime_error("unsafe stop claim file ownership or mode: " + path + " " +
+        core::session_path_metadata(st) + "; require regular file uid=" + std::to_string(::geteuid()) + " mode=0600");
   if (st.st_size != 50 && st.st_size != 128 && (st.st_size < 137 || st.st_size > 4233))
-    throw std::runtime_error("invalid stop claim file");
+    throw std::runtime_error("invalid stop claim file: " + path);
   std::string value(static_cast<size_t>(st.st_size), '\0');
   if (::pread(file_handle.get(), value.data(), value.size(), 0) != st.st_size)
-    throw std::runtime_error("unreadable stop claim file");
+    throw std::runtime_error("unreadable stop claim file: " + path);
   Lease result;
   const bool terminal = st.st_size != 50 && st.st_size != 128;
   const size_t offset = terminal ? 2 : 0;
   if (terminal && value.substr(0, 2) != "T\n" && value.substr(0, 2) != "D\n")
-    throw std::runtime_error("invalid terminal claim phase");
+    throw std::runtime_error("invalid terminal claim phase: " + path);
   if (value[offset + 32] != ':' || value[offset + 49] != '\n')
-    throw std::runtime_error("unreadable stop claim file");
+    throw std::runtime_error("unreadable stop claim file: " + path);
   result.token = value.substr(offset, 49);
   if (result.token.substr(0, 32).find_first_not_of("0123456789abcdef") != std::string::npos ||
       result.token.substr(33).find_first_not_of("0123456789abcdef") != std::string::npos)
-    throw std::runtime_error("malformed stop claim file");
+    throw std::runtime_error("malformed stop claim file: " + path);
+  if (st.st_size == 50 && st.st_nlink != 1)
+    throw std::runtime_error("unsafe legacy stop claim links: " + path);
   if (st.st_size == 50) return result; // v5 lease: guarded, but no recoverable receipt.
   result.job = value.substr(offset + 50, 32);
   result.local_id = value.substr(offset + 87, 40);
@@ -277,7 +297,7 @@ inline Lease read_lease(const std::string& session, const std::string& hash) {
       value[offset + 83] < '0' || value[offset + 83] > '1' ||
       value[offset + 84] < '0' || value[offset + 84] > '1' ||
       value[offset + 85] < '0' || value[offset + 85] > '1')
-    throw std::runtime_error("malformed stop claim receipt");
+    throw std::runtime_error("malformed stop claim receipt: " + path);
   result.state = value[offset + 83] - '0';
   result.open = value[offset + 84] - '0';
   result.active = value[offset + 85] - '0';
@@ -286,18 +306,36 @@ inline Lease read_lease(const std::string& session, const std::string& hash) {
     result.mode = value[130];
     if ((result.mode != 'S' && result.mode != 'O' && result.mode != 'R' && result.mode != 'K') ||
         value[131] != '\n' || value[136] != ':')
-      throw std::runtime_error("malformed terminal claim");
+      throw std::runtime_error("malformed terminal claim: " + path);
     unsigned length = 0;
     for (size_t i = 132; i < 136; ++i) {
       const char c = value[i];
       const unsigned digit = c >= '0' && c <= '9' ? c - '0' :
                              c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
-      if (digit == 16) throw std::runtime_error("malformed terminal path length");
+      if (digit == 16) throw std::runtime_error("malformed terminal path length: " + path);
       length = (length << 4) | digit;
     }
     if (length > 4096 || value.size() != 137 + length)
-      throw std::runtime_error("malformed terminal path");
+      throw std::runtime_error("malformed terminal path: " + path);
     result.path = value.substr(137, length);
+  }
+  if (st.st_nlink != 1) {
+    // Only the former linkat publisher can explain this complete active pair.
+    // Other aliases remain a visible refusal; never prune by filename alone.
+    const std::string temporary = filename + "." + result.token.substr(0, 32) + ".tmp";
+    struct stat staged{}, current{};
+    if (st.st_nlink != 2 || st.st_size != 128 || result.phase != 'A' ||
+        ::fstatat(dir.get(), temporary.c_str(), &staged, AT_SYMLINK_NOFOLLOW) != 0 ||
+        ::fstatat(dir.get(), filename.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(staged.st_mode) || staged.st_uid != st.st_uid ||
+        (staged.st_mode & 07777) != 0600 || staged.st_nlink != 2 ||
+        staged.st_dev != st.st_dev || staged.st_ino != st.st_ino ||
+        current.st_dev != st.st_dev || current.st_ino != st.st_ino)
+      throw std::runtime_error("unsafe stop claim links: " + path + " " + core::session_path_metadata(st) +
+          "; require single-link receipt or attested interrupted publication pair");
+    if (::unlinkat(dir.get(), temporary.c_str(), 0) != 0 || ::fsync(dir.get()) != 0 ||
+        ::fstat(file_handle.get(), &current) != 0 || current.st_nlink != 1)
+      throw std::runtime_error("cannot recover interrupted stop claim publication: " + path);
   }
   return result;
 }
@@ -453,6 +491,30 @@ inline Lease finish_claim(core::Download* download, const std::string& expected,
   return claim;
 }
 
+inline void publish_claim_file(int directory, const std::string& staging, const std::string& name) {
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  const char* cut = ::getenv("RR_MIG_TEST_CUT");
+  if (cut && std::strcmp(cut, "before-stop-claim-publication") == 0) ::_exit(137);
+#endif
+#ifdef __linux__
+  // No hardlink interval: a killed publisher leaves either staging or one claim.
+  // Do not fall back to overwrite or link/unlink on an unsupported kernel.
+  if (::syscall(SYS_renameat2, directory, staging.c_str(), directory, name.c_str(), 1 /* RENAME_NOREPLACE */) != 0)
+    throw std::runtime_error("cannot exclusively publish stop claim receipt: " + std::string(std::strerror(errno)));
+#else
+  // Non-Linux installations retain the legacy no-overwrite primitive. Startup
+  // recovery attests the exact nonce-named same-inode pair before retiring it.
+  if (::linkat(directory, staging.c_str(), directory, name.c_str(), 0) != 0 ||
+      ::unlinkat(directory, staging.c_str(), 0) != 0)
+    throw std::runtime_error("cannot exclusively publish stop claim receipt");
+#endif
+  if (::fsync(directory) != 0)
+    throw std::runtime_error("cannot durably publish stop claim receipt");
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  if (cut && std::strcmp(cut, "after-stop-claim-publication") == 0) ::_exit(137);
+#endif
+}
+
 inline Lease create_lease(core::Download* download, const std::string& stop_token,
                           const std::string& job, int state, int open, int active,
                           const std::string& local_id) {
@@ -480,12 +542,7 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
     if (::write(file.get(), payload.data(), payload.size()) != static_cast<ssize_t>(payload.size()) ||
         ::fdatasync(file.get()) != 0)
       throw std::runtime_error("cannot durably write stop claim receipt");
-    // Only publish a fully written receipt. A crash before link leaves no claim to recover.
-    if (::linkat(dir.get(), temporary.c_str(), dir.get(), filename.c_str(), 0) != 0 ||
-        ::fsync(dir.get()) != 0)
-      throw std::runtime_error("cannot durably publish stop claim receipt");
-    if (::unlinkat(dir.get(), temporary.c_str(), 0) != 0 || ::fsync(dir.get()) != 0)
-      throw std::runtime_error("cannot clean stop claim temporary file");
+    publish_claim_file(dir.get(), temporary, filename);
     cleanup.name.clear();
     return claim;
   } catch (const std::exception& e) { throw torrent::input_error(std::string("stop claim: ") + e.what()); }

@@ -27,6 +27,7 @@
 #include "core/dht_manager.h"
 #include "core/download.h"
 #include "core/download_list.h"
+#include "core/download_factory.h"
 #include "core/retrackers_migration_creation.h"
 #include "core/retrackers_migration_pending.h"
 #include "session/session_manager.h"
@@ -213,6 +214,10 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
       !(RetrackersMigrationCreation::abort_erase_permitted(itr->get()) &&
         retrackers_migration_uncommitted_candidate(erase_hash)))
     throw torrent::input_error("RR original claim blocks direct erase.");
+  // Read every migration guard before changing erasure state or removing views.
+  const bool retire_counter = retire_stop_intent && !retrackers_migration_pending(erase_hash) &&
+      !retrackers_migration_original_claim_active(erase_hash) &&
+      !retrackers_migration_uncommitted_candidate(erase_hash);
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
   // Erasure and its view callbacks are internal shutdown, not a newer user Stop.
@@ -231,9 +236,7 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   for (auto v : *control->view_manager())
     v->erase(itr->get());
 
-  if (retire_stop_intent && !retrackers_migration_pending(erase_hash) &&
-      !retrackers_migration_original_claim_active(erase_hash) &&
-      !retrackers_migration_uncommitted_candidate(erase_hash)) {
+  if (retire_counter) {
     try { stop_intent::erase_counter(session_thread::manager()->path(), erase_hash); }
     catch (const std::exception& e) {
       lt_log_print(torrent::LOG_ERROR, "Cannot retire stop intent for %s: %s", erase_hash.c_str(), e.what());
@@ -818,7 +821,10 @@ DownloadList::process_meta_download(Download* download) {
     const auto hash = rpc::call_command_string("d.hash", target);
     const auto session = rpc::call_command_string("session.path");
     const auto generation = stop_intent::counter(session, hash, false);
-    int64_t start = rpc::call_command_value("d.state", target);
+    // A stopped load may temporarily start solely to fetch metadata. Preserve
+    // its declared start flag while still honoring a later explicit user Stop.
+    int64_t start = download->bencode()->get_key("rtorrent_meta_download").get_key_value("start");
+    if (rpc::call_command_value("d.state", target) == 0) start = 0;
 
     // The metadata placeholder shares the real torrent's hash. Its replacement
     // must not create a user Stop generation inherited by the real download.
@@ -858,18 +864,31 @@ DownloadList::process_meta_download(Download* download) {
     if (download->bencode()->has_key("announce-list"))
       bencode->insert_key("announce-list", download->bencode()->get_key("announce-list"));
 
+    const bool retire_counter = !retrackers_migration_pending(hash) &&
+        !retrackers_migration_original_claim_active(hash) &&
+        !retrackers_migration_uncommitted_candidate(hash);
+    // Stage fallible factory setup while the placeholder can still be retained.
+    auto factory = control->core()->prepare_download_from_meta_download(std::move(bencode), metafile);
     // Keep the generation until all close/erase/view callbacks have finished.
     // An explicit Stop from any of them must transfer to the real download.
     erase_meta_placeholder(download);
-    if (stop_intent::counter(session, hash, false) != generation)
+    try {
+      if (stop_intent::counter(session, hash, false) != generation) start = 0;
+    } catch (const std::exception& e) {
       start = 0;
-    bencode->get_key("rtorrent_meta_download").insert_key("start", start);
-    if (!retrackers_migration_pending(hash) &&
-        !retrackers_migration_original_claim_active(hash) &&
-        !retrackers_migration_uncommitted_candidate(hash))
-      stop_intent::erase_counter(session, hash);
+      lt_log_print(torrent::LOG_ERROR, "Metadata stop generation unavailable for %s; replacement stopped: %s",
+                   hash.c_str(), e.what());
+    }
+    factory->set_start(start);
+    if (retire_counter) {
+      try { stop_intent::erase_counter(session, hash); }
+      catch (const std::exception& e) {
+        lt_log_print(torrent::LOG_ERROR, "Cannot retire metadata stop intent for %s: %s", hash.c_str(), e.what());
+      }
+    }
 
-    control->core()->try_create_download_from_meta_download(std::move(bencode), metafile);
+    factory->commit();
+    factory.release(); // The scheduled completion callback now owns the factory.
   } catch (const std::exception& e) {
     // Metadata callbacks run outside an RPC boundary. Contain a refused claim
     // or malformed metadata instead of unwinding the daemon's main loop.

@@ -260,8 +260,17 @@ DownloadFactory::receive_success() {
   torrent::Object* root = download->bencode();
 
   if (download->download()->info()->is_meta_download()) {
+    int64_t declared_start = m_start;
+    // Session reloads do not set m_start. Preserve a valid original load flag:
+    // service magnets may have been started solely to retrieve metadata.
+    if (m_session && root->has_key_map("rtorrent_meta_download")) {
+      const auto& saved_meta = root->get_key("rtorrent_meta_download");
+      if (saved_meta.has_key_value("start") &&
+          (saved_meta.get_key_value("start") == 0 || saved_meta.get_key_value("start") == 1))
+        declared_start = saved_meta.get_key_value("start");
+    }
     torrent::Object& meta = root->insert_key("rtorrent_meta_download", torrent::Object::create_map());
-    meta.insert_key("start", m_start);
+    meta.insert_key("start", declared_start);
     meta.insert_key("print_log", m_printLog);
 
     torrent::Object::list_type& commands = meta.insert_key("commands", torrent::Object::create_list()).as_list();

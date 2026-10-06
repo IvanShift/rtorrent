@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include "control.h"
+#include "core/retrackers_process_pool.h"
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -80,6 +81,7 @@ Control::initialize() {
 
 void
 Control::cleanup() {
+  core::retrackers_process_pool::shutdown();
   rpc::rpc.cleanup();
 
   torrent::this_thread::scheduler()->erase(&m_task_shutdown);
@@ -130,6 +132,7 @@ Control::is_shutdown_completed() {
 
 void
 Control::handle_shutdown() {
+  core::retrackers_process_pool::shutdown();
   m_watch_ready_queue->shutdown();
 
   rpc::commands.call_catch("event.system.shutdown", rpc::make_target(), "shutdown", "System shutdown event action failed: ");

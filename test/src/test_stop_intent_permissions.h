@@ -18,6 +18,15 @@ class TestStopIntentPermissions : public test_fixture {
   CPPUNIT_TEST(test_counter_stays_bounded);
   CPPUNIT_TEST(test_retired_counter_is_not_inherited);
   CPPUNIT_TEST(test_multiple_link_journal_is_refused);
+  CPPUNIT_TEST(test_corrupt_journal_names_document_and_hash);
+  CPPUNIT_TEST(test_malformed_claim_names_document_and_hash);
+  CPPUNIT_TEST(test_claim_publication_never_creates_hardlink);
+  CPPUNIT_TEST(test_claim_publication_collision_preserves_both_files);
+  CPPUNIT_TEST(test_interrupted_claim_pair_recovers_exact_staging_link);
+  CPPUNIT_TEST(test_unexplained_claim_link_is_refused);
+  CPPUNIT_TEST(test_interrupted_claim_wrong_nonce_is_refused);
+  CPPUNIT_TEST(test_fifo_counter_is_refused_without_blocking);
+  CPPUNIT_TEST(test_fifo_claim_is_refused_without_blocking);
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -43,6 +52,19 @@ public:
   void test_retired_counter_is_not_inherited();
 
   void test_multiple_link_journal_is_refused();
+
+  void test_corrupt_journal_names_document_and_hash();
+
+  void test_malformed_claim_names_document_and_hash();
+
+  void test_claim_publication_never_creates_hardlink();
+  void test_claim_publication_collision_preserves_both_files();
+  void test_interrupted_claim_pair_recovers_exact_staging_link();
+  void test_unexplained_claim_link_is_refused();
+  void test_interrupted_claim_wrong_nonce_is_refused();
+
+  void test_fifo_counter_is_refused_without_blocking();
+  void test_fifo_claim_is_refused_without_blocking();
 
 private:
   std::string m_session;

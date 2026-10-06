@@ -39,6 +39,7 @@
 #include "utils/directory.h"
 
 #include "control.h"
+#include "core/retrackers_process_pool.h"
 #include "command_helpers.h"
 #include "globals.h"
 #include "setup.h"
@@ -88,6 +89,7 @@ initialize_rpc_slots() {
 
 static void
 client_perform() {
+  core::retrackers_process_pool::reap();
   // Use throw exclusively.
   if (control->is_shutdown_completed())
     throw torrent::shutdown_exception();
@@ -104,6 +106,7 @@ main(int argc, char** argv) {
 
     // Temporary.
     setlocale(LC_ALL, "");
+    core::retrackers_process_pool::initialize_policy();
 
     auto random_seed = []() -> unsigned int {
         auto current_time = torrent::utils::time_since_epoch();
@@ -457,7 +460,11 @@ main(int argc, char** argv) {
 
     // Use the raw system call: libtorrent's family helper can silently fall
     // back to IPv4. Apply detection after rc imports so config cannot undo it.
-    const int ipv6_fd = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int ipv6_socket_type = SOCK_STREAM;
+#ifdef SOCK_CLOEXEC
+    ipv6_socket_type |= SOCK_CLOEXEC;
+#endif
+    const int ipv6_fd = ::socket(AF_INET6, ipv6_socket_type, 0);
     if (ipv6_fd < 0 && (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT)) {
       lt_log_print(torrent::LOG_WARN, "disabling ipv6 support, not available on system");
       rpc::call_command_set_value("network.block.ipv6.set", true);

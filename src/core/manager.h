@@ -20,6 +20,7 @@ class FileStatusCache;
 namespace core {
 
 class HttpQueue;
+class DownloadFactory;
 
 using ThrottlePair = std::pair<torrent::Throttle*, torrent::Throttle*>;
 using ThrottleMap  =  std::map<std::string, ThrottlePair>;
@@ -75,7 +76,8 @@ public:
   // Temporary, find a better place for this.
   void                try_create_download(const std::string& uri, int flags, const command_list_type& commands);
   void                try_create_download_expand(const std::string& uri, int flags, command_list_type commands = command_list_type());
-  void                try_create_download_from_meta_download(std::unique_ptr<torrent::Object> bencode, const std::string& metafile);
+  std::unique_ptr<DownloadFactory> prepare_download_from_meta_download(
+      std::unique_ptr<torrent::Object> bencode, const std::string& metafile);
 
 private:
   void                create_http(const std::string& uri);

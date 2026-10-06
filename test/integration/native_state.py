@@ -41,6 +41,14 @@ def fixture(name):
     write(path, b'd4:info' + info + b'e')
     return path, hashlib.sha1(info).hexdigest().upper(), info
 
+if BINARY:
+    probe = docker('run', '--rm', '--pull=never', '--network', 'none',
+                   '--mount', f'type=bind,src={BINARY},dst=/native-bin,readonly',
+                   '--entrypoint', '/native-bin', IMAGE, '-h', check=False)
+    if probe.returncode != 0:
+        raise SystemExit('Candidate daemon cannot run in this image; supply its matching libtorrent ABI.\n' +
+                         probe.stdout + probe.stderr)
+
 try:
     docker('run', '-d', '--name', NAME, '--stop-timeout', '60', '--network', 'none',
            '-e', 'RR_MIG_TEST_CUT=after-original-claim',

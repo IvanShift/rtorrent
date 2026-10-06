@@ -222,9 +222,9 @@ Manager::try_create_download(const std::string& uri, int flags, const command_li
   f.release();
 }
 
-void
-Manager::try_create_download_from_meta_download(std::unique_ptr<torrent::Object> bencode, const std::string& metafile) {
-  DownloadFactory* f = new DownloadFactory(this);
+std::unique_ptr<DownloadFactory>
+Manager::prepare_download_from_meta_download(std::unique_ptr<torrent::Object> bencode, const std::string& metafile) {
+  auto f = std::make_unique<DownloadFactory>(this);
 
   f->variables()["tied_to_file"] = (int64_t)true;
   f->variables()["tied_file"] = metafile;
@@ -236,7 +236,7 @@ Manager::try_create_download_from_meta_download(std::unique_ptr<torrent::Object>
 
   f->set_start(meta.get_key_value("start"));
   f->set_print_log(meta.get_key_value("print_log"));
-  f->slot_finished([f]() { delete f; });
+  f->slot_finished([factory = f.get()]() { delete factory; });
 
   // Bit of a waste to create the bencode repesentation here
   // only to have the DownloadFactory decode it.
@@ -244,7 +244,7 @@ Manager::try_create_download_from_meta_download(std::unique_ptr<torrent::Object>
   s.imbue(std::locale::classic());
   s << *bencode;
   f->load_raw_data(s.str());
-  f->commit();
+  return f;
 }
 
 utils::Directory

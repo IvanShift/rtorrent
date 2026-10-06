@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <unistd.h>
+#include <torrent/utils/log.h>
 #include <time.h>
 #include <torrent/exceptions.h>
 #include <torrent/utils/chrono.h>
@@ -67,6 +69,12 @@ CommandScheduler::call_item(value_type item) {
     rpc::call_object(item->command());
 
   } catch (torrent::input_error& e) {
+    const bool safe_key = !key.empty() && key.size() <= 128 &&
+        key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-") == std::string::npos;
+    const std::string diagnostic = "Scheduled command failed: key=" + (safe_key ? key : std::string("unknown")) + " reason=input-error";
+    lt_log_print(torrent::LOG_ERROR, "%s", diagnostic.c_str());
+    const std::string line = diagnostic + "\n";
+    (void)::write(STDERR_FILENO, line.data(), line.size());
     if (m_slotErrorMessage)
       m_slotErrorMessage("Scheduled command failed: " + key + ": " + e.what());
   }
