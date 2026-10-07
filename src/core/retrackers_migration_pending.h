@@ -6,6 +6,7 @@
 namespace core { class Download; }
 bool retrackers_migration_late_save(core::Download* download);
 bool retrackers_migration_original_claim_active(const std::string& hash);
+bool retrackers_migration_cancel_uncaptured_for_erase(core::Download* download);
 extern thread_local std::string rr_native_capture_erase_hash;
 bool retrackers_migration_uncommitted_candidate(const std::string& hash);
 bool retrackers_migration_candidate_activity_held(const std::string& hash);

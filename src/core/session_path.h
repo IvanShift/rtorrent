@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fcntl.h>
@@ -9,8 +10,48 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 namespace core {
+
+// The main-thread caller owns this attested private session directory. Only
+// trusted same-UID processes can race the absence check on the fallback path.
+// Keep file and directory durability at the publication call site.
+inline int rename_session_entry_noreplace(int directory, const std::string& source,
+                                           const std::string& destination) {
+#ifdef __linux__
+  int result;
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  const char* cut = ::getenv("RR_MIG_TEST_CUT");
+  int injected = 0;
+  if (cut && std::strcmp(cut, "rename-noreplace-einval") == 0) injected = EINVAL;
+  if (cut && std::strcmp(cut, "rename-noreplace-enosys") == 0) injected = ENOSYS;
+  if (cut && std::strcmp(cut, "rename-noreplace-eopnotsupp") == 0) injected = EOPNOTSUPP;
+  if (cut && std::strcmp(cut, "rename-noreplace-eacces") == 0) injected = EACCES;
+  if (injected) { errno = injected; result = -1; }
+  else
+#endif
+    result = ::syscall(SYS_renameat2, directory, source.c_str(), directory,
+                       destination.c_str(), 1 /* RENAME_NOREPLACE */);
+  if (result == 0 || (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP))
+    return result;
+  // WSL drvfs over 9p rejects rename flags even on a current Linux kernel.
+  // A dangling symlink is also an existing target and must never be replaced.
+  struct stat target{};
+  if (::fstatat(directory, destination.c_str(), &target, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST;
+    return -1;
+  }
+  if (errno != ENOENT) return -1;
+  return ::renameat(directory, source.c_str(), directory, destination.c_str());
+#else
+  // Preserve the historical no-overwrite primitive outside Linux.
+  if (::linkat(directory, source.c_str(), directory, destination.c_str(), 0) != 0) return -1;
+  return ::unlinkat(directory, source.c_str(), 0);
+#endif
+}
 
 inline std::string session_path_absolute(const std::string& session) {
   if (session.empty()) throw std::runtime_error("session directory required");

@@ -472,6 +472,14 @@ SessionManager::process_finished_saves() {
 }
 
 void
+SessionManager::flush_shutdown_saves() {
+  assert(torrent::this_thread::thread() == torrent::main_thread::thread());
+  flush_all_pending_builds();
+  std::unique_lock<std::mutex> lock(m_mutex);
+  flush_all_and_wait_unsafe(lock);
+}
+
+void
 SessionManager::flush_all_and_wait_unsafe(std::unique_lock<std::mutex>& lock) {
   LT_LOG("flushing all pending saves", 0);
 
@@ -489,8 +497,14 @@ SessionManager::flush_all_and_wait_unsafe(std::unique_lock<std::mutex>& lock) {
   while (!m_processing_saves.empty())
     m_finished_condition.wait(lock);
 
-  for (auto& request : m_finished_saves)
-    LT_LOG("finished saving download : download:%p path:%s", request.second.download, request.second.path.c_str());
+  for (auto& request : m_finished_saves) {
+    try {
+      request.first.get();
+      LT_LOG("finished saving download : download:%p path:%s", request.second.download, request.second.path.c_str());
+    } catch (const torrent::storage_error& error) {
+      lt_log_print(torrent::LOG_ERROR, "Storage errors flushing session data for download: %s", error.what());
+    }
+  }
 
   m_finished_saves.clear();
 

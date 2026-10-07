@@ -4,6 +4,9 @@
 #include "core/retrackers_process_pool.h"
 
 #include <unistd.h>
+#include <cstdlib>
+#include <cstring>
+#include "core/download_list.h"
 #include <sys/stat.h>
 #include <torrent/net/http_stack.h>
 #include <torrent/runtime/network_manager.h>
@@ -139,6 +142,17 @@ Control::handle_shutdown() {
 
   if (scgi_thread::thread()->is_active())
     scgi_thread::thread()->stop_thread_wait();
+
+  if (!m_shutdown_session_saved) {
+    // Persist user state before stopped announces can consume the stop timeout.
+    m_core->download_list()->session_save();
+    session_thread::manager()->flush_shutdown_saves();
+    m_shutdown_session_saved = true;
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+    const char* cut = ::getenv("RR_MIG_TEST_CUT");
+    if (cut && std::strcmp(cut, "after-shutdown-session-save") == 0) ::_exit(137);
+#endif
+  }
 
   if (!m_shutdown_quick) {
     torrent::runtime::network_manager()->listen_close();

@@ -212,7 +212,8 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   if (retrackers_migration_original_claim_active(erase_hash) &&
       rr_native_capture_erase_hash != erase_hash &&
       !(RetrackersMigrationCreation::abort_erase_permitted(itr->get()) &&
-        retrackers_migration_uncommitted_candidate(erase_hash)))
+        retrackers_migration_uncommitted_candidate(erase_hash)) &&
+      !retrackers_migration_cancel_uncaptured_for_erase(itr->get()))
     throw torrent::input_error("RR original claim blocks direct erase.");
   // Read every migration guard before changing erasure state or removing views.
   const bool retire_counter = retire_stop_intent && !retrackers_migration_pending(erase_hash) &&

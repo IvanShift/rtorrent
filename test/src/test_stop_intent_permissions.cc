@@ -219,6 +219,19 @@ void TestStopIntentPermissions::test_malformed_claim_names_document_and_hash() {
 }
 
 namespace {
+class ScopedRenameCut {
+public:
+  explicit ScopedRenameCut(const char* value) : prior_(::getenv("RR_MIG_TEST_CUT") != nullptr),
+      saved_(prior_ ? ::getenv("RR_MIG_TEST_CUT") : "") { ::setenv("RR_MIG_TEST_CUT", value, 1); }
+  ~ScopedRenameCut() {
+    if (prior_) ::setenv("RR_MIG_TEST_CUT", saved_.c_str(), 1);
+    else ::unsetenv("RR_MIG_TEST_CUT");
+  }
+private:
+  bool prior_;
+  std::string saved_;
+};
+
 std::string complete_claim() {
   return std::string(32, 'b') + ":0000000000000001\n" + std::string(32, 'c') + "\n100\n" + std::string(40, 'd') + "\n";
 }
@@ -246,6 +259,61 @@ void TestStopIntentPermissions::test_claim_publication_collision_preserves_both_
   CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
   CPPUNIT_ASSERT_EQUAL(off_t(11), st.st_size);
   CPPUNIT_ASSERT_EQUAL(std::string(32, 'b') + ":0000000000000001", stop_intent::read_lease(m_session, hash).token);
+}
+
+void TestStopIntentPermissions::test_claim_publication_falls_back_for_unsupported_rename_flags() {
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  const std::string prefix = m_session + "/.rutorrent-stop-intents/";
+  for (const char* cut : {"rename-noreplace-einval", "rename-noreplace-enosys", "rename-noreplace-eopnotsupp"}) {
+    ScopedRenameCut inject(cut);
+    write_file(prefix + "staging", complete_claim(), 0600);
+    stop_intent::publish_claim_file(dir.get(), "staging", hash + ".claim");
+    struct stat st{};
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), (hash + ".claim").c_str(), &st, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(nlink_t(1), st.st_nlink);
+    CPPUNIT_ASSERT_EQUAL(-1, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(std::string(32, 'b') + ":0000000000000001", stop_intent::read_lease(m_session, hash).token);
+    CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), (hash + ".claim").c_str(), 0));
+  }
+#endif
+}
+
+void TestStopIntentPermissions::test_claim_fallback_refuses_existing_and_dangling_targets() {
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  ScopedRenameCut inject("rename-noreplace-einval");
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  const std::string prefix = m_session + "/.rutorrent-stop-intents/";
+  write_file(prefix + "staging", complete_claim(), 0600);
+  for (int kind = 0; kind != 3; ++kind) {
+    if (kind == 0) write_file(prefix + "existing", "retain", 0600);
+    if (kind == 1) CPPUNIT_ASSERT_EQUAL(0, ::symlinkat("missing-target", dir.get(), "existing"));
+    if (kind == 2) CPPUNIT_ASSERT_EQUAL(0, ::mkdirat(dir.get(), "existing", 0700));
+    struct stat before{}, after{};
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "existing", &before, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(-1, core::rename_session_entry_noreplace(dir.get(), "staging", "existing"));
+    CPPUNIT_ASSERT_EQUAL(EEXIST, errno);
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "existing", &after, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(before.st_ino, after.st_ino);
+    CPPUNIT_ASSERT_EQUAL(before.st_mode, after.st_mode);
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &after, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), "existing", kind == 2 ? AT_REMOVEDIR : 0));
+  }
+#endif
+}
+
+void TestStopIntentPermissions::test_claim_publication_does_not_fall_back_for_permission_failure() {
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  ScopedRenameCut inject("rename-noreplace-eacces");
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  write_file(m_session + "/.rutorrent-stop-intents/staging", complete_claim(), 0600);
+  CPPUNIT_ASSERT_EQUAL(-1, core::rename_session_entry_noreplace(dir.get(), "staging", "target"));
+  CPPUNIT_ASSERT_EQUAL(EACCES, errno);
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(-1, ::fstatat(dir.get(), "target", &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(ENOENT, errno);
+#endif
 }
 
 void TestStopIntentPermissions::test_interrupted_claim_pair_recovers_exact_staging_link() {

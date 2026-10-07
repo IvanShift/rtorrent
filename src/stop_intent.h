@@ -496,18 +496,8 @@ inline void publish_claim_file(int directory, const std::string& staging, const 
   const char* cut = ::getenv("RR_MIG_TEST_CUT");
   if (cut && std::strcmp(cut, "before-stop-claim-publication") == 0) ::_exit(137);
 #endif
-#ifdef __linux__
-  // No hardlink interval: a killed publisher leaves either staging or one claim.
-  // Do not fall back to overwrite or link/unlink on an unsupported kernel.
-  if (::syscall(SYS_renameat2, directory, staging.c_str(), directory, name.c_str(), 1 /* RENAME_NOREPLACE */) != 0)
+  if (core::rename_session_entry_noreplace(directory, staging, name) != 0)
     throw std::runtime_error("cannot exclusively publish stop claim receipt: " + std::string(std::strerror(errno)));
-#else
-  // Non-Linux installations retain the legacy no-overwrite primitive. Startup
-  // recovery attests the exact nonce-named same-inode pair before retiring it.
-  if (::linkat(directory, staging.c_str(), directory, name.c_str(), 0) != 0 ||
-      ::unlinkat(directory, staging.c_str(), 0) != 0)
-    throw std::runtime_error("cannot exclusively publish stop claim receipt");
-#endif
   if (::fsync(directory) != 0)
     throw std::runtime_error("cannot durably publish stop claim receipt");
 #ifdef ENABLE_RR_MIGRATION_TEST_CUTS

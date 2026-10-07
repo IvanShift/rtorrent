@@ -75,6 +75,7 @@ protected:
   void                cleanup();
 
   void                flush_all_pending_builds();
+  void                flush_shutdown_saves();
 
 private:
   void                callback_pending_builds();

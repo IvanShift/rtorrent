@@ -957,14 +957,8 @@ void rr_migration_publish(const RrMigrationCapsule& state, core::Download* sourc
     }
     if (::fsync(fd) < 0) okay = false;
     if (::close(fd) < 0) okay = false;
-#ifdef __linux__
-    // A killed publisher must not leave an unexplained hardlinked private file.
-    if (okay && ::syscall(SYS_renameat2, dir, temp_name.c_str(), dir, final_name.c_str(), 1 /* RENAME_NOREPLACE */) < 0)
+    if (okay && core::rename_session_entry_noreplace(dir, temp_name, final_name) < 0)
       okay = false;
-#else
-    if (okay && ::linkat(dir, temp_name.c_str(), dir, final_name.c_str(), 0) < 0)
-      okay = false;
-#endif
     ::unlinkat(dir, temp_name.c_str(), 0);
     if (!okay) break;
   }
@@ -1402,6 +1396,8 @@ torrent::Object rr_migration_capture(core::Download* source,
   rr_migration_publish(state, source); // Full rollback and T-bound intent precede owned stop.
   if (v2) {
     if (rr_migration_test_cut("after-capture-intent")) ::_exit(137);
+    if (rr_migration_test_cut("after-capture-intent-throw"))
+      throw torrent::input_error("RR test captured intent held before quiesce.");
     stop_intent::record(source, true);
     {
       stop_intent::ScopedSuppress suppress;
@@ -1909,6 +1905,16 @@ bool rr_journal_exists(const std::string& name, const char* error_message) {
   if (found == 0) return true;
   if (error == ENOENT) return false;
   throw torrent::input_error(error_message);
+}
+
+// A failed publication may leave its first durable file before .benc exists.
+// Every such entry is uncertain capture until explicit migration recovery.
+bool rr_capture_intent_present(const std::string& hash) {
+  for (const char* suffix : {".benc", ".backup.benc", ".rollback.torrent",
+                            ".rollback.torrent.rtorrent", ".rollback.torrent.libtorrent_resume",
+                            ".target", ".quiesced.receipt", ".prepared.receipt"})
+    if (rr_journal_exists(hash + suffix)) return true;
+  return false;
 }
 
 bool rr_owner_read(const std::string& hash, std::string* incarnation, bool* retired,
@@ -2625,7 +2631,7 @@ torrent::Object rr_finish_original(core::Download* owner,
       claim.incarnation != incarnation ||
       claim.local_id != rpc::call_command_string("d.local_id", target))
     throw torrent::input_error("RR original finish claim identity changed.");
-  if (rr_journal_exists(hash + ".benc") || !stop_intent::held(owner).empty())
+  if (rr_capture_intent_present(hash) || !stop_intent::held(owner).empty())
     throw torrent::input_error("RR original finish blocked by capture or file-operation claim.");
   uint64_t current_generation;
   try { current_generation = stop_intent::counter(session_thread::manager()->path(), hash, false); }
@@ -3784,6 +3790,8 @@ replay_stop_close_terminal(core::Download* download, const std::string& job) {
 
 namespace {
 std::map<std::string, std::string> rr_queue_cursors;
+constexpr const char* rr_retry_exhausted_message =
+    "retrackers: retries exhausted; inspect d.custom=retrackers-retry; queued work retained";
 bool rr_queue_valid(const std::string& q) {
   return q.size() == 100 && q.compare(0, 3, "q1:") == 0 && q[67] == ':' && rr_lower_hex(q.substr(3,64),64) && rr_lower_hex(q.substr(68),32);
 }
@@ -3919,14 +3927,24 @@ torrent::Object rr_enqueue_original(core::Download* owner,const torrent::Object:
   const auto target=rpc::make_target(owner); const std::string h=rpc::call_command_string("d.hash",target),u=args[1].as_string(),run=args[2].as_string();
   if(args[0].as_string()!=rpc::call_command_string("d.local_id",target) || !rr_lower_hex(u,64) || (run!="0" && run!="1") || (rpc::call_command_value("d.state",target)!=0)!=(run=="1")) throw torrent::input_error("RR enqueue identity invalid.");
   stop_intent::require_unleased(owner);
+  auto* ledger = control->object_storage();
+  const auto receipts = ledger->find(rpc::object_storage::key_type::from_c_str("rr.receipts.v1"));
+  if (receipts != ledger->end() && !(receipts->second.flags & rpc::object_storage::flag_multi_type))
+    throw torrent::input_error("RR enqueue receipt ledger has wrong type.");
   std::string q=retrieve_d_custom(owner,"retrackers-queued").as_string(); RrOriginalClaim prior;
   if(q.empty()) {
     if(rr_original_claim_read(h,&prior) || rr_journal_exists(h+".benc") || !retrieve_d_custom(owner,"retrackers-recovery").as_string().empty() || !retrieve_d_custom(owner,"retrackers-recovery-ack").as_string().empty()) throw torrent::input_error("RR enqueue prior authority must be retired.");
     q="q1:"+u+":"+rr_original_mint_tx();
     auto& custom=owner->bencode()->get_key("rtorrent").insert_preserve_copy("custom",torrent::Object::create_map()).first->second;
     custom.insert_key("retrackers-queued",q); custom.insert_key("retrackers-queue-finished",std::string());
+    custom.insert_key("retrackers-retry", std::string());
+    if (owner->message() == rr_retry_exhausted_message) owner->set_message(std::string());
     session_thread::manager()->save_full_download_durable(owner);
   } else if(!rr_queue_valid(q) || q.substr(3,64)!=u) throw torrent::input_error("RR queue belongs to another owner.");
+  // Requeue and its application pending receipt are one main-thread action.
+  // Preserve hook receipts and publish the same value as the insert callback.
+  if (receipts != ledger->end())
+    ledger->set_str_multi_key("rr.receipts.v1", "wp:" + args[0].as_string(), "1");
   return rr_begin_original(owner,args);
 }
 torrent::Object rr_finish_queued_original(core::Download* owner,const torrent::Object::list_type& args) {
@@ -3938,10 +3956,27 @@ torrent::Object rr_finish_queued_original(core::Download* owner,const torrent::O
   }
   return rr_finish_original(owner,args);
 }
+bool rr_retry_valid(const std::string& retry, const std::string& queue_token) {
+  const std::string prefix = "r1:" + queue_token + ":";
+  if (retry.compare(0, prefix.size(), prefix) != 0 || retry.size() > 100) return false;
+  const size_t count = prefix.size(), due = count + 2;
+  if (retry.size() <= due || retry[count] < '1' || retry[count] > '6' || retry[count + 1] != ':')
+    return false;
+  const size_t end = retry.find(':', due);
+  if (end == std::string::npos || end == due || end - due > 10) return false;
+  const std::string when = retry.substr(due, end - due);
+  if (when.find_first_not_of("0123456789") != std::string::npos ||
+      (when.size() > 1 && when[0] == '0') || (retry[count] == '6') != (when == "0"))
+    return false;
+  const std::string reason = retry.substr(end + 1);
+  return reason == "capture-refused" || reason == "transport-unavailable" ||
+         reason == "source-not-ready" || reason == "preflight-refused";
+}
+
 // Retire only a proven uncaptured observation, while its durable Q stays owed.
 // No payload erase, completed-marker clearing or unknown ownership is allowed.
 torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object::list_type& args) {
-  if (args.size() != 3 || !std::all_of(args.begin(), args.end(), [](const auto& a) { return a.is_string(); }) ||
+  if ((args.size() != 3 && args.size() != 5) || !std::all_of(args.begin(), args.end(), [](const auto& a) { return a.is_string(); }) ||
       !rr_lower_hex(args[0].as_string(), 32) || !core::valid_incarnation(args[1].as_string()) ||
       !rr_lower_hex(args[2].as_string(), 32))
     throw torrent::input_error("RR original cancel needs exact transaction, incarnation and queue token.");
@@ -3957,9 +3992,19 @@ torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object:
       retrieve_d_custom(owner, "retrackers-recovery").as_string() != rr_original_v2_marker(claim) ||
       retrieve_d_custom(owner, "retrackers-recovery-ack").as_string() != rr_original_v2_marker(claim))
     throw torrent::input_error("RR original cancel preclaim authority changed.");
-  // Explicit refusals precede every mutation. A matching query alone must
-  // never authorize cancellation of a captured, leased or completed job.
-  if (rr_journal_exists(h + ".benc") || rr_journal_exists(h + ".released.receipt") ||
+  if (args.size() == 5 &&
+      (retrieve_d_custom(owner, "retrackers-retry").as_string() != args[3].as_string() ||
+       (!args[3].as_string().empty() && !rr_retry_valid(args[3].as_string(), q)) ||
+       !rr_retry_valid(args[4].as_string(), q)))
+    throw torrent::input_error("RR original cancel retry state changed or is invalid.");
+  if (args.size() == 5) {
+    const char prior_count = args[3].as_string().empty() ? '0' : args[3].as_string()[36];
+    if (prior_count >= '6' || args[4].as_string()[36] != prior_count + 1)
+      throw torrent::input_error("RR original cancel retry count must advance once.");
+  }
+  // Explicit refusals precede every mutation. Partial publication is uncertain
+  // capture too; absence of only the final .benc cannot prove it uncaptured.
+  if (rr_capture_intent_present(h) || rr_journal_exists(h + ".released.receipt") ||
       rr_release_present(h) || !stop_intent::held(owner).empty() || rr_owner_hold_hashes.count(h) ||
       !retrieve_d_custom(owner, "retrackers-queue-finished").as_string().empty())
     throw torrent::input_error("RR original cancel is blocked by capture, release, lease or completion.");
@@ -3969,12 +4014,20 @@ torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object:
       (!(entry->second.flags & rpc::object_storage::flag_multi_type) ||
        entry->second.object.has_key("wh:" + claim.local_id)))
     throw torrent::input_error("RR original cancel hook or ledger is active.");
+  // Publish retry state in the same durable owner release as cancellation.
+  // A dispatcher cannot observe retired authority with no backoff receipt.
+  if (args.size() == 5) {
+    owner->bencode()->get_key("rtorrent").get_key("custom").insert_key("retrackers-retry", args[4]);
+    if (args[4].as_string().compare(36, 4, "6:0:") == 0 && owner->message().empty())
+      owner->set_message(rr_retry_exhausted_message);
+  }
   // The existing release path snapshots the live owner and durably hands
   // ownership to its ordinary session. It leaves Q unchanged and unfinished.
   torrent::Object::list_type finish{torrent::Object(t), torrent::Object(i)};
   if (rr_finish_original(owner, finish, false).as_string() != "finalized")
     throw torrent::input_error("RR original cancel retirement is unconfirmed.");
   if (entry != storage->end()) storage->erase_str_multi_key("rr.receipts.v1", "wp:" + claim.local_id);
+  if (args.size() == 5 && rr_migration_test_cut("after-original-defer")) ::_exit(137);
   return std::string("cancelled");
 }
 
@@ -3987,12 +4040,26 @@ torrent::Object rr_dequeue_original(core::Download* owner,const torrent::Object:
   session_thread::manager()->save_full_download_durable(owner);return std::string("dequeued");
 }
 }
+
+bool retrackers_migration_cancel_uncaptured_for_erase(core::Download* owner) {
+  const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
+  RrOriginalClaim claim;
+  if (!rr_original_claim_read(hash, &claim) || claim.queue_token.empty()) return false;
+  torrent::Object::list_type args{torrent::Object(claim.tx), torrent::Object(claim.incarnation),
+                                torrent::Object(claim.queue_token)};
+  return rr_cancel_original(owner, args).as_string() == "cancelled";
+}
+
 void
 initialize_command_download() {
   CMD2_DL_LIST("d.retrackers.preflight_stage", rr_preflight_stage);
   CMD2_DL_LIST("d.retrackers.enqueue_original",rr_enqueue_original);
   CMD2_DL_LIST("d.retrackers.dequeue_original",rr_dequeue_original);
   CMD2_DL_LIST("d.retrackers.cancel_original", rr_cancel_original);
+  CMD2_DL_LIST("d.retrackers.defer_original", [](core::Download* owner, const torrent::Object::list_type& args) {
+    if (args.size() != 5) throw torrent::input_error("RR original defer needs transaction, incarnation, queue and retry CAS.");
+    return rr_cancel_original(owner, args);
+  });
   CMD2_ANY_STRING("system.retrackers.original_claim",[](auto,const auto& h){return rr_queued_original(h);});
   CMD2_ANY_LIST("system.retrackers.worker_start",[](auto,const torrent::Object::list_type& a){
     if(a.size()!=4 || !std::all_of(a.begin(),a.end(),[](const auto& v){return v.is_string();})) throw torrent::input_error("RR worker needs hash, transaction, incarnation and user.");
@@ -4438,7 +4505,18 @@ initialize_command_download() {
 
   // This command really needs to be improved, so we have proper
   // logging support.
-  CMD2_DL         ("d.message",     std::bind(&core::Download::message, std::placeholders::_1));
+  CMD2_DL("d.message", [](core::Download* owner, auto) {
+    if (!owner->message().empty() && owner->message() != rr_retry_exhausted_message)
+      return owner->message();
+    const std::string queue = retrieve_d_custom(owner, "retrackers-queued").as_string();
+    const std::string retry = retrieve_d_custom(owner, "retrackers-retry").as_string();
+    // Tracker success clears the volatile message; exact durable Q still owns
+    // an exhausted retry after that callback and after a cold restart.
+    // Our own volatile status is derived too: clearing retry/Q clears its view.
+    if (rr_queue_valid(queue) && rr_retry_valid(retry, queue.substr(68)) &&
+        retry.compare(36, 4, "6:0:") == 0) return std::string(rr_retry_exhausted_message);
+    return std::string();
+  });
   CMD2_DL_STRING_V("d.message.set", std::bind(&core::Download::set_message, std::placeholders::_1, std::placeholders::_2));
 
   CMD2_DL         ("d.max_file_size",       CMD2_ON_FL(max_file_size));

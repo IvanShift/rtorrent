@@ -109,7 +109,12 @@ must be regular, single-link files with mode 0600. A historical interrupted
 link publication is recovered only when its complete 128-byte receipt and
 exact nonce-named staging entry identify the same owned inode with precisely
 two links; all other aliases remain refused. Linux publication now uses
-`renameat2(RENAME_NOREPLACE)` and requires kernel support. Journal and claim opens refuse symlinks;
+`renameat2(RENAME_NOREPLACE)`. When the filesystem or kernel rejects that
+operation with EINVAL, ENOSYS or EOPNOTSUPP, the main-thread owner checks the
+final entry with `AT_SYMLINK_NOFOLLOW` and uses plain `renameat` only if absent.
+Existing files and dangling symlinks are refused. Private directory admission
+excludes other UIDs; same-UID processes remain trusted. File and directory
+synchronization is unchanged. Journal and claim opens refuse symlinks;
 multiply linked stop generation records are refused. Filesystems that discard
 these permissions, and mounts with incompatible ownership mapping, require
 operator correction rather than an automatic fallback. Path safety refusals
@@ -146,6 +151,20 @@ T/I/Q/U/L and marker/ACK, no capsule/release/file lease, no completed marker
 and no active insert hook. It durably preserves the live source and pending Q
 while retiring only that observation and its pending hook key. Unknown work
 stays held; cancellation never acknowledges tracker processing.
+`d.retrackers.defer_original(H,T,I,Q,expected,retry)` adds an exact compare-and-set
+of `retrackers-retry` to that same durable cancellation. Its receipt is
+`r1:Q:count:due:reason`: counts 1 through 5 have a positive Unix due time, count 6
+has due 0 and a visible exhaustion message. `d.message` projects that terminal
+status from the exact durable Q whenever its ordinary message is empty, including
+after tracker success clears the message or after a cold restart. Reasons are `capture-refused`,
+`transport-unavailable`, `source-not-ready` or `preflight-refused`. Each update
+advances one attempt and retains Q unfinished; stale values are refused before
+mutation. Native enqueue restores the application `wp:L` pending receipt while
+preserving hook receipts. A new Q clears only its inherited retry state and the
+exact native exhaustion message. Direct user erase may cancel an exact queued
+uncaptured claim synchronously; any capsule file, including partial publication,
+keeps the source held. Normal and quick shutdown flush session saves before
+tracker stop requests can consume the service timeout.
 
 Trusted `d.retrackers.preflight_stage` reads only canonical procfd capabilities
 held by the exact live registered H/T/I worker. It verifies anonymous regular
@@ -169,8 +188,11 @@ python3 test/integration/native_regressions.py BUILDER_IMAGE BUILD_TREE SCRATCH
 `BUILD_TREE/src/rtorrent` must contain the exact candidate binary. The runner
 uses disposable network-isolated containers, a synthetic local metadata peer,
 and a separate Unix UID for asynchronous path refusal. For a dedicated test-cut
-build, also select `owner-cut-before owner-cut-after owner-cut-retry` as trailing
-arguments. These cuts are excluded from the default production run.
+build, select `owner-cut-before owner-cut-after owner-cut-retry rename-einval
+rename-enosys rename-eopnotsupp captured-remove defer-crash shutdown-early-save
+shutdown-hook-save` as trailing arguments. These cuts are excluded from the
+default production run. Every daemon scenario explicitly retains session mode
+02700 and the unsafe-path actor uses a different Unix UID.
 
 The older integration fixture in `test/integration/native_state.py` also uses
 an isolated container and synthetic local peer. Supply a runtime image with the
