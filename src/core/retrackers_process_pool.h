@@ -46,12 +46,28 @@ inline void initialize_policy() {
 }
 
 
+// Identities of reaped worker children, oldest first. A reaped exit of the
+// exact native-owned child is the only proof that its worker is gone; the
+// retrackers recovery takes them from here. The dispatcher slot is no worker.
+inline std::vector<std::string> exited_workers;
+
 inline void reap() {
-  for (auto& child : children) {
+  for (size_t slot = 0; slot < children.size(); ++slot) {
+    auto& child = children[slot];
     if (child.pid <= 0) continue;
     const pid_t result = ::waitpid(child.pid, nullptr, WNOHANG);
-    if (result == child.pid || (result < 0 && errno == ECHILD)) child = {};
+    if (result == child.pid || (result < 0 && errno == ECHILD)) {
+      if (slot < 8 && !shutting_down) exited_workers.push_back(child.identity);
+      child = {};
+    }
   }
+}
+
+// Whether any worker slot holds a child or a launch reservation.
+inline bool workers_running() {
+  for (size_t slot = 0; slot < 8; ++slot)
+    if (children[slot].pid != 0) return true;
+  return false;
 }
 
 inline pid_t worker_pid(const std::string& identity) {
@@ -60,6 +76,14 @@ inline pid_t worker_pid(const std::string& identity) {
     if (children[slot].pid > 0 && children[slot].identity == identity)
       return children[slot].pid;
   return 0;
+}
+
+// Whether a worker launch could take a slot now; exited children are reaped.
+inline bool worker_slot_free() {
+  reap();
+  for (size_t slot = 0; slot < 8; ++slot)
+    if (children[slot].pid == 0) return true;
+  return false;
 }
 
 inline bool active(const std::string& identity) {

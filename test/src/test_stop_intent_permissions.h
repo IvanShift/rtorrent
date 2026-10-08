@@ -22,9 +22,16 @@ class TestStopIntentPermissions : public test_fixture {
   CPPUNIT_TEST(test_malformed_claim_names_document_and_hash);
   CPPUNIT_TEST(test_claim_publication_never_creates_hardlink);
   CPPUNIT_TEST(test_claim_publication_collision_preserves_both_files);
+  CPPUNIT_TEST(test_rename_cuts_follow_the_build_switch);
+  CPPUNIT_TEST(test_link_publication_never_replaces);
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  CPPUNIT_TEST(test_link_publication_kept_staging_is_still_published);
+  // These inject rename errors through RR_MIG_TEST_CUT, which only builds
+  // configured with --enable-rr-migration-test-cuts honor.
   CPPUNIT_TEST(test_claim_publication_falls_back_for_unsupported_rename_flags);
   CPPUNIT_TEST(test_claim_fallback_refuses_existing_and_dangling_targets);
   CPPUNIT_TEST(test_claim_publication_does_not_fall_back_for_permission_failure);
+#endif
   CPPUNIT_TEST(test_interrupted_claim_pair_recovers_exact_staging_link);
   CPPUNIT_TEST(test_unexplained_claim_link_is_refused);
   CPPUNIT_TEST(test_interrupted_claim_wrong_nonce_is_refused);
@@ -63,11 +70,18 @@ public:
   void test_claim_publication_never_creates_hardlink();
   void test_claim_publication_collision_preserves_both_files();
 
+  void test_rename_cuts_follow_the_build_switch();
+  void test_link_publication_never_replaces();
+
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  void test_link_publication_kept_staging_is_still_published();
+
   void test_claim_publication_falls_back_for_unsupported_rename_flags();
 
   void test_claim_fallback_refuses_existing_and_dangling_targets();
 
   void test_claim_publication_does_not_fall_back_for_permission_failure();
+#endif
 
   void test_interrupted_claim_pair_recovers_exact_staging_link();
   void test_unexplained_claim_link_is_refused();

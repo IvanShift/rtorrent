@@ -261,8 +261,73 @@ void TestStopIntentPermissions::test_claim_publication_collision_preserves_both_
   CPPUNIT_ASSERT_EQUAL(std::string(32, 'b') + ":0000000000000001", stop_intent::read_lease(m_session, hash).token);
 }
 
-void TestStopIntentPermissions::test_claim_publication_falls_back_for_unsupported_rename_flags() {
+// RR_MIG_TEST_CUT must reach the rename helper only in a test-cut build; a
+// production build ignores it and publishes normally.
+void TestStopIntentPermissions::test_rename_cuts_follow_the_build_switch() {
+  ScopedRenameCut inject("rename-noreplace-eacces");
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  write_file(m_session + "/.rutorrent-stop-intents/staging", complete_claim(), 0600);
+  const int result = core::rename_session_entry_noreplace(dir.get(), "staging", "target");
+  const int error = errno;
+  struct stat st{};
 #ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+  CPPUNIT_ASSERT(core::migration_test_cut("rename-noreplace-eacces"));
+  CPPUNIT_ASSERT_EQUAL(-1, result);
+  CPPUNIT_ASSERT_EQUAL(EACCES, error);
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
+#else
+  CPPUNIT_ASSERT(!core::migration_test_cut("rename-noreplace-eacces"));
+  CPPUNIT_ASSERT_EQUAL_MESSAGE(std::strerror(error), 0, result);
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "target", &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(nlink_t(1), st.st_nlink);
+#endif
+}
+
+// The link primitive used outside Linux, compiled and exercised here.
+void TestStopIntentPermissions::test_link_publication_never_replaces() {
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  const std::string prefix = m_session + "/.rutorrent-stop-intents/";
+  write_file(prefix + "staging", complete_claim(), 0600);
+  CPPUNIT_ASSERT_EQUAL(0, core::link_session_entry_noreplace(dir.get(), "staging", "target"));
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "target", &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(nlink_t(1), st.st_nlink);
+  CPPUNIT_ASSERT_EQUAL(-1, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
+  for (int kind = 0; kind != 2; ++kind) {
+    write_file(prefix + "staging", complete_claim(), 0600);
+    if (kind == 0) write_file(prefix + "existing", "retain", 0600);
+    else CPPUNIT_ASSERT_EQUAL(0, ::symlinkat("missing-target", dir.get(), "existing"));
+    struct stat before{}, after{};
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "existing", &before, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(-1, core::link_session_entry_noreplace(dir.get(), "staging", "existing"));
+    CPPUNIT_ASSERT_EQUAL(EEXIST, errno);
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "existing", &after, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(before.st_ino, after.st_ino);
+    CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &after, AT_SYMLINK_NOFOLLOW));
+    CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), "existing", 0));
+    CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), "staging", 0));
+  }
+}
+
+#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
+// A staging name that survives its link is still a publication: the claim
+// reader recovers the exact nonce-named pair instead of refusing it.
+void TestStopIntentPermissions::test_link_publication_kept_staging_is_still_published() {
+  ScopedRenameCut inject("link-publication-keep-staging");
+  stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
+  const std::string staging = hash + ".claim." + std::string(32, 'b') + ".tmp";
+  write_file(m_session + "/.rutorrent-stop-intents/" + staging, complete_claim(), 0600);
+  CPPUNIT_ASSERT_EQUAL(0, core::link_session_entry_noreplace(dir.get(), staging, hash + ".claim"));
+  struct stat st{};
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), staging.c_str(), &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(nlink_t(2), st.st_nlink);
+  CPPUNIT_ASSERT_EQUAL(std::string(32, 'b') + ":0000000000000001", stop_intent::read_lease(m_session, hash).token);
+  CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), (hash + ".claim").c_str(), &st, AT_SYMLINK_NOFOLLOW));
+  CPPUNIT_ASSERT_EQUAL(nlink_t(1), st.st_nlink);
+  CPPUNIT_ASSERT_EQUAL(-1, ::fstatat(dir.get(), staging.c_str(), &st, AT_SYMLINK_NOFOLLOW));
+}
+
+void TestStopIntentPermissions::test_claim_publication_falls_back_for_unsupported_rename_flags() {
   stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
   const std::string prefix = m_session + "/.rutorrent-stop-intents/";
   for (const char* cut : {"rename-noreplace-einval", "rename-noreplace-enosys", "rename-noreplace-eopnotsupp"}) {
@@ -276,11 +341,9 @@ void TestStopIntentPermissions::test_claim_publication_falls_back_for_unsupporte
     CPPUNIT_ASSERT_EQUAL(std::string(32, 'b') + ":0000000000000001", stop_intent::read_lease(m_session, hash).token);
     CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), (hash + ".claim").c_str(), 0));
   }
-#endif
 }
 
 void TestStopIntentPermissions::test_claim_fallback_refuses_existing_and_dangling_targets() {
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
   ScopedRenameCut inject("rename-noreplace-einval");
   stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
   const std::string prefix = m_session + "/.rutorrent-stop-intents/";
@@ -299,11 +362,9 @@ void TestStopIntentPermissions::test_claim_fallback_refuses_existing_and_danglin
     CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &after, AT_SYMLINK_NOFOLLOW));
     CPPUNIT_ASSERT_EQUAL(0, ::unlinkat(dir.get(), "existing", kind == 2 ? AT_REMOVEDIR : 0));
   }
-#endif
 }
 
 void TestStopIntentPermissions::test_claim_publication_does_not_fall_back_for_permission_failure() {
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
   ScopedRenameCut inject("rename-noreplace-eacces");
   stop_intent::Fd dir(stop_intent::open_directory(m_session, true));
   write_file(m_session + "/.rutorrent-stop-intents/staging", complete_claim(), 0600);
@@ -313,8 +374,9 @@ void TestStopIntentPermissions::test_claim_publication_does_not_fall_back_for_pe
   CPPUNIT_ASSERT_EQUAL(0, ::fstatat(dir.get(), "staging", &st, AT_SYMLINK_NOFOLLOW));
   CPPUNIT_ASSERT_EQUAL(-1, ::fstatat(dir.get(), "target", &st, AT_SYMLINK_NOFOLLOW));
   CPPUNIT_ASSERT_EQUAL(ENOENT, errno);
-#endif
 }
+
+#endif
 
 void TestStopIntentPermissions::test_interrupted_claim_pair_recovers_exact_staging_link() {
   const std::string prefix = m_session + "/.rutorrent-stop-intents/";

@@ -3,8 +3,10 @@
 #include "download_storer.h"
 
 #include <cerrno>
+#include <chrono>
 #include <fcntl.h>
 #include <fstream>
+#include <thread>
 #include <unistd.h>
 #include <torrent/exceptions.h>
 #include <torrent/object.h>
@@ -15,6 +17,7 @@
 
 #include "globals.h"
 #include "core/download.h"
+#include "core/migration_test_cut.h"
 #include "core/retrackers_migration_limits.h"
 #include "rpc/parse_commands.h"
 #include "utils/directory.h"
@@ -215,6 +218,10 @@ DownloadStorer::save_and_move_streams(const std::string& path, bool use_fsyncdis
 
   save_stream(libtorrent_path + ".new", use_fsyncdisk, *libtorrent_stream);
   save_stream(rtorrent_path + ".new", use_fsyncdisk, *rtorrent_stream);
+
+  // Test builds can hold a save between staging and renames to expose overlap.
+  if (core::migration_test_cut("slow-session-save"))
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
   if (torrent_stream) {
     if (::rename((torrent_path + ".new").c_str(), torrent_path.c_str()) == -1)

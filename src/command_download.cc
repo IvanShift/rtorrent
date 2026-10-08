@@ -5,6 +5,7 @@
 #include <limits>
 #include <charconv>
 #include <chrono>
+#include <ctime>
 #include <memory>
 #include <cerrno>
 #include <fcntl.h>
@@ -18,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -49,6 +51,8 @@
 #include "core/retrackers_migration_limits.h"
 #include "core/retrackers_migration_creation.h"
 #include "core/retrackers_migration_pending.h"
+#include "core/retrackers_queue_receipts.h"
+#include "core/migration_test_cut.h"
 #include "core/session_path.h"
 #include "core/retrackers_process_pool.h"
 #include "core/manager.h"
@@ -714,20 +718,6 @@ thread_local std::string rr_native_release_start_hash;
 
 // The private journal is the durable authority until same-hash release and finalization.
 namespace {
-// Migration failpoints are available only in an explicitly enabled test build.
-bool rr_migration_test_cut(const char* name) {
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
-  static const std::string selected = [] {
-    const char* value = ::getenv("RR_MIG_TEST_CUT");
-    return value ? std::string(value) : std::string();
-  }();
-  return selected == name;
-#else
-  (void)name;
-  return false;
-#endif
-}
-
 struct RrMigrationFile {
   std::string path;
   int64_t size;
@@ -765,6 +755,9 @@ std::string rr_original_v2_marker(const RrOriginalClaim& claim);
 bool rr_original_claim_read(const std::string& hash, RrOriginalClaim* claim);
 bool rr_journal_exists(const std::string& name,
                        const char* error_message = "RR journal presence cannot be checked.");
+bool rr_capture_intent_present(const std::string& hash);
+bool rr_queue_valid(const std::string& q);
+void rr_log_refusal(const std::string& message);
 uint64_t rr_late_save_to_prefix(core::Download* download, const std::string& prefix,
                                 const std::string& hash, const std::string& incarnation);
 
@@ -796,6 +789,9 @@ struct RrMigrationCapsule {
   int64_t down_total;
   int64_t state_counter;
   int64_t stop_generation;
+  // Whether a v2 source was open before capture closed it: a paused (open,
+  // stopped) original is reopened after release. Older capsules lack it (0).
+  int64_t source_open = 0;
 };
 
 bool rr_capsule_v2(const RrMigrationCapsule& state) {
@@ -881,6 +877,7 @@ torrent::Object rr_migration_encode(const RrMigrationCapsule& state) {
   root.insert_key("down_total", state.down_total);
   root.insert_key("state_counter", state.state_counter);
   root.insert_key("stop_generation", state.stop_generation);
+  root.insert_key("source_open", state.source_open);
   root.insert_key("views", state.views);
   auto& limits = root.insert_key("limits", torrent::Object::create_map());
   for (const auto& setting : state.limits)
@@ -926,6 +923,72 @@ std::vector<std::pair<std::string, std::string>> rr_migration_snapshot(core::Dow
           {".rollback.torrent.libtorrent_resume", resume->str()}};
 }
 
+// Unpublished private temporaries are ".<final>.tmp.<pid>.<sequence>". A
+// killed writer can leave one behind. O_EXCL with a process-wide sequence
+// skips such a name even when a restarted daemon reuses the PID (it is PID 1
+// in a container), and startup removes them; a temporary is never authority.
+int rr_migration_create_temporary(int dir, const std::string& name, std::string* temporary) {
+  static unsigned long sequence = 0;
+  for (unsigned attempt = 0; attempt < 1000; ++attempt) {
+    *temporary = "." + name + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(++sequence);
+    const int fd = ::openat(dir, temporary->c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0 || errno != EEXIST) return fd;
+  }
+  errno = EEXIST;
+  return -1;
+}
+
+// Names written by rr_migration_create_temporary for an info-hash entry. The
+// journal also holds the earlier capsule form ".<final>.tmp.<pid>"; in the
+// shared session directory only our exact ordinary triple names qualify.
+bool rr_migration_temporary_name(const std::string& name, bool session) {
+  if (name.size() < 42 || name[0] != '.' || name[41] != '.' ||
+      !std::all_of(name.begin() + 1, name.begin() + 41, [](unsigned char c) {
+        return std::isxdigit(c) && !std::islower(c); }))
+    return false;
+  const size_t marker = name.rfind(".tmp.");
+  if (marker == std::string::npos || marker < 41) return false;
+  const std::string tail = name.substr(marker + 5);
+  const size_t dot = tail.find('.');
+  auto decimal = [](const std::string& value) {
+    return !value.empty() && value.size() <= 20 && value.find_first_not_of("0123456789") == std::string::npos;
+  };
+  if (!decimal(tail.substr(0, dot)) || (dot != std::string::npos && !decimal(tail.substr(dot + 1))))
+    return false;
+  if (!session) return true;
+  const std::string final_suffix = name.substr(41, marker - 41);
+  return dot != std::string::npos && (final_suffix == ".torrent" ||
+      final_suffix == ".torrent.rtorrent" || final_suffix == ".torrent.libtorrent_resume");
+}
+
+// Removes our regular, single-link, owner-only temporaries from one attested
+// private directory. Anything else carrying such a name is reported, not touched.
+unsigned rr_migration_remove_temporaries(int dir, bool session, std::vector<std::string>* kept) {
+  const int scan = ::dup(dir);
+  DIR* entries = scan < 0 ? nullptr : ::fdopendir(scan);
+  if (!entries) {
+    if (scan >= 0) ::close(scan);
+    throw torrent::input_error("RR migration temporary scan failed.");
+  }
+  std::vector<std::string> names;
+  while (auto* entry = ::readdir(entries))
+    if (rr_migration_temporary_name(entry->d_name, session)) names.emplace_back(entry->d_name);
+  ::closedir(entries);
+  unsigned removed = 0;
+  for (const auto& name : names) {
+    struct stat st{};
+    if (::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+    if (S_ISREG(st.st_mode) && st.st_uid == ::geteuid() && (st.st_mode & 07777) == 0600 &&
+        st.st_nlink == 1 && ::unlinkat(dir, name.c_str(), 0) == 0)
+      ++removed;
+    else
+      kept->push_back(name);
+  }
+  if (removed != 0 && ::fsync(dir) != 0)
+    throw torrent::input_error("RR migration temporary cleanup directory fsync failed.");
+  return removed;
+}
+
 void rr_migration_publish(const RrMigrationCapsule& state, core::Download* source) {
   auto encoded = rr_migration_encode(state);
   std::ostringstream stream;
@@ -947,8 +1010,8 @@ void rr_migration_publish(const RrMigrationCapsule& state, core::Download* sourc
   bool okay = true;
   for (const auto& file : files) {
     const std::string final_name = (file.first == ".target" ? state.expected_new_hash : state.hash) + file.first;
-    const std::string temp_name = "." + final_name + ".tmp." + std::to_string(::getpid());
-    const int fd = ::openat(dir, temp_name.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    std::string temp_name;
+    const int fd = rr_migration_create_temporary(dir, final_name, &temp_name);
     if (fd < 0) { okay = false; break; }
     for (size_t offset = 0; okay && offset < file.second.size();) {
       const ssize_t n = ::write(fd, file.second.data() + offset, file.second.size() - offset);
@@ -959,8 +1022,11 @@ void rr_migration_publish(const RrMigrationCapsule& state, core::Download* sourc
     if (::close(fd) < 0) okay = false;
     if (okay && core::rename_session_entry_noreplace(dir, temp_name, final_name) < 0)
       okay = false;
-    ::unlinkat(dir, temp_name.c_str(), 0);
-    if (!okay) break;
+    if (!okay) {
+      // A published temporary no longer exists under its own name.
+      ::unlinkat(dir, temp_name.c_str(), 0);
+      break;
+    }
   }
   if (okay && ::fsync(dir) < 0) okay = false;
   ::close(dir);
@@ -994,14 +1060,8 @@ std::string rr_migration_read_bytes(const std::string& filename, size_t max_size
 
 
 void rr_migration_write_file(int dir, const std::string& name, const std::string& bytes) {
-  static unsigned long sequence = 0;
   std::string temporary;
-  int fd = -1;
-  for (unsigned attempt = 0; attempt < 1000; ++attempt) {
-    temporary = "." + name + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(++sequence);
-    fd = ::openat(dir, temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd >= 0 || errno != EEXIST) break;
-  }
+  const int fd = rr_migration_create_temporary(dir, name, &temporary);
   if (fd < 0)
     throw torrent::input_error("RR migration durable write could not create temporary file.");
   bool okay = true;
@@ -1013,9 +1073,10 @@ void rr_migration_write_file(int dir, const std::string& name, const std::string
   if (::fsync(fd) < 0) okay = false;
   if (::close(fd) < 0) okay = false;
   if (okay && ::renameat(dir, temporary.c_str(), dir, name.c_str()) < 0) okay = false;
-  ::unlinkat(dir, temporary.c_str(), 0);
-  if (!okay)
+  if (!okay) {
+    ::unlinkat(dir, temporary.c_str(), 0);
     throw torrent::input_error("RR migration durable write failed.");
+  }
 }
 
 bool rr_quiesced_read(const RrMigrationCapsule& state, uint64_t* generation) {
@@ -1148,6 +1209,7 @@ RrMigrationCapsule rr_migration_read_one(const std::string& hash, const char* su
     state.down_total = root.get_key_value("down_total");
     state.state_counter = root.get_key_value("state_counter");
     state.stop_generation = root.get_key_value("stop_generation");
+    state.source_open = root.has_key_value("source_open") ? root.get_key_value("source_open") : 0;
     state.views = root.get_key("views");
     const bool v2 = rr_capsule_v2(state);
     if (state.source_local_id.size() != 40 || state.expected_new_hash.size() != 40 ||
@@ -1161,6 +1223,7 @@ RrMigrationCapsule rr_migration_read_one(const std::string& hash, const char* su
         (v2 && state.expected_new_hash != hash) ||
         state.up_total < 0 || state.down_total < 0 || state.state_counter < 0 ||
         state.stop_generation < 0 || (!state.tx.empty() && !v2 && state.stop_generation == 0) ||
+        (state.source_open != 0 && state.source_open != 1) ||
         state.views.as_list().size() > 128)
       throw torrent::input_error("RR migration journal values invalid.");
     if (v2) {
@@ -1270,10 +1333,10 @@ torrent::Object rr_migration_rollback(const std::string& hash) {
         rr_migration_finish_rollback(hash);
         control->core()->push_log_std("RR rollback receipt durable: " + hash);
       } catch (const torrent::input_error& e) {
-        control->core()->push_log_std("RR rollback receipt failed: " + hash + ": " + e.what());
+        rr_log_refusal("RR rollback receipt failed: " + hash + ": " + e.what());
       }
     } else {
-      control->core()->push_log_std("RR rollback load failed; pending snapshot retained: " + hash);
+      rr_log_refusal("RR rollback load failed; pending snapshot retained: " + hash);
     }
     delete factory;
   });
@@ -1334,9 +1397,10 @@ torrent::Object rr_migration_capture(core::Download* source,
         rr_original_v2_marker(original) != claim ||
         retrieve_d_custom(source, "retrackers-recovery").as_string() != claim ||
         rr_journal_exists(hash + ".released.receipt") ||
-        rr_journal_exists(hash + ".benc") ||
         (rpc::call_command_value("d.state", target) != 0) != (original.run == "1"))
       throw torrent::input_error("RR v2 capture original authority changed.");
+    if (rr_capture_intent_present(hash))
+      throw torrent::input_error("RR v2 capture blocked by an existing capture; source retained.");
     uint64_t generation;
     try { generation = stop_intent::counter(session_thread::manager()->path(), hash, false); }
     catch (const std::exception& e) {
@@ -1383,6 +1447,7 @@ torrent::Object rr_migration_capture(core::Download* source,
   state.up_total = source->info()->up_rate()->total();
   state.down_total = source->info()->down_rate()->total();
   state.state_counter = source->bencode()->get_key("rtorrent").get_key_value("state_counter");
+  state.source_open = v2 && source->is_open() ? 1 : 0;
   try {
     state.stop_generation = v2 ? static_cast<int64_t>(original.stop_generation) :
         static_cast<int64_t>(stop_intent::counter(
@@ -1395,8 +1460,8 @@ torrent::Object rr_migration_capture(core::Download* source,
                            hash, original.incarnation);
   rr_migration_publish(state, source); // Full rollback and T-bound intent precede owned stop.
   if (v2) {
-    if (rr_migration_test_cut("after-capture-intent")) ::_exit(137);
-    if (rr_migration_test_cut("after-capture-intent-throw"))
+    if (core::migration_test_cut("after-capture-intent")) ::_exit(137);
+    if (core::migration_test_cut("after-capture-intent-throw"))
       throw torrent::input_error("RR test captured intent held before quiesce.");
     stop_intent::record(source, true);
     {
@@ -1414,14 +1479,14 @@ torrent::Object rr_migration_capture(core::Download* source,
         source->is_open() || source->is_active())
       throw torrent::input_error("RR v2 owned quiesce did not close source.");
     rr_quiesced_publish(state, quiesced);
-    if (rr_migration_test_cut("after-capture-quiesced-throw"))
+    if (core::migration_test_cut("after-capture-quiesced-throw"))
       throw torrent::input_error("RR test quiesced receipt before source erase.");
-    if (rr_migration_test_cut("after-capture-quiesced")) ::_exit(137);
+    if (core::migration_test_cut("after-capture-quiesced")) ::_exit(137);
     rr_native_capture_erase_hash = hash;
     try { rpc::call_command("d.erase", torrent::Object(), target); }
     catch (...) { rr_native_capture_erase_hash.clear(); throw; }
     rr_native_capture_erase_hash.clear();
-    if (rr_migration_test_cut("after-capture-erase")) ::_exit(137);
+    if (core::migration_test_cut("after-capture-erase")) ::_exit(137);
   } else {
     rpc::call_command("d.erase", torrent::Object(), target);
   }
@@ -1896,24 +1961,39 @@ std::map<std::string, std::pair<std::string, std::string>> rr_released_owners;
 std::set<std::string> rr_retired_hold_hashes;
 std::set<std::string> rr_owner_hold_hashes;
 
-bool rr_journal_exists(const std::string& name, const char* error_message) {
-  const int dir = rr_migration_dir();
+// A daemon without a UI shows only its log files: holds and refusals go to
+// the error log as well as to the UI log, with the hash and reason they name.
+void rr_log_refusal(const std::string& message) {
+  lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+  control->core()->push_log_std(message);
+}
+
+bool rr_journal_exists_at(int dir, const std::string& name, const char* error_message) {
   struct stat st;
-  const int found = ::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW);
-  const int error = errno;
-  ::close(dir);
-  if (found == 0) return true;
-  if (error == ENOENT) return false;
+  if (::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) return true;
+  if (errno == ENOENT) return false;
   throw torrent::input_error(error_message);
 }
 
+bool rr_journal_exists(const std::string& name, const char* error_message) {
+  const core::SessionPathFd dir(rr_migration_dir());
+  return rr_journal_exists_at(dir.get(), name, error_message);
+}
+
 // A failed publication may leave its first durable file before .benc exists.
-// Every such entry is uncertain capture until explicit migration recovery.
+// Every such entry is uncertain capture until explicit migration recovery, so
+// every guard and status that decides whether capture may exist uses this one
+// predicate: v2 capture, original begin and enqueue, the dispatcher status and
+// finish/cancel/defer/erase. Code that reads the capsule journal itself, or
+// asks whether a newer transaction owns it, still tests .benc. One attested
+// directory descriptor answers all probes.
 bool rr_capture_intent_present(const std::string& hash) {
+  const core::SessionPathFd dir(rr_migration_dir());
   for (const char* suffix : {".benc", ".backup.benc", ".rollback.torrent",
                             ".rollback.torrent.rtorrent", ".rollback.torrent.libtorrent_resume",
                             ".target", ".quiesced.receipt", ".prepared.receipt"})
-    if (rr_journal_exists(hash + suffix)) return true;
+    if (rr_journal_exists_at(dir.get(), hash + suffix, "RR journal presence cannot be checked."))
+      return true;
   return false;
 }
 
@@ -2176,7 +2256,7 @@ torrent::Object rr_begin_original(core::Download* owner,
     }
     return marker;
   }
-  if (!stop_intent::held(owner).empty() || rr_journal_exists(hash + ".benc") ||
+  if (!stop_intent::held(owner).empty() || rr_capture_intent_present(hash) ||
       rr_journal_exists(hash + ".released.receipt") ||
       !retrieve_d_custom(owner, "retrackers-recovery").as_string().empty() ||
       !retrieve_d_custom(owner, "retrackers-recovery-ack").as_string().empty())
@@ -2187,9 +2267,7 @@ torrent::Object rr_begin_original(core::Download* owner,
                         user_digest, run, 0, rr_committed_digest(files), std::string()};
   const std::string queued_job = retrieve_d_custom(owner, "retrackers-queued").as_string();
   if (!queued_job.empty()) {
-    if (queued_job.size() != 100 || queued_job.compare(0, 3, "q1:") != 0 ||
-        queued_job[67] != ':' || queued_job.substr(3, 64) != user_digest ||
-        !rr_lower_hex(queued_job.substr(68), 32))
+    if (!rr_queue_valid(queued_job) || queued_job.substr(3, 64) != user_digest)
       throw torrent::input_error("RR original queue identity invalid.");
     claim.queue_token = queued_job.substr(68);
   }
@@ -2209,7 +2287,7 @@ torrent::Object rr_begin_original(core::Download* owner,
       throw torrent::input_error("RR original preclaim directory fsync failed.");
   } catch (...) { ::close(dir); throw; }
   ::close(dir);
-  if (rr_migration_test_cut("after-original-claim")) ::_exit(137);
+  if (core::migration_test_cut("after-original-claim")) ::_exit(137);
   const std::string marker = rr_original_v2_marker(claim);
   auto& custom = owner->bencode()->get_key("rtorrent").insert_preserve_copy(
           "custom", torrent::Object::create_map()).first->second;
@@ -2572,7 +2650,8 @@ void rr_prepare_publish(const std::string& hash, const std::string& tx,
 bool rr_finalized_read(const std::string& hash, std::string* tx,
                        std::string* incarnation);
 void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
-                         const std::string& incarnation);
+                         const std::string& incarnation,
+                         const std::vector<std::string>* entries = nullptr);
 std::string rr_finalize_owner(core::Download* owner,
                               const torrent::Object::list_type& args);
 
@@ -2581,7 +2660,7 @@ void rr_complete_same_hash_release(core::Download* owner,
                                    const std::string& tx,
                                    const std::string& incarnation) {
   rr_prepare_publish(hash, tx, incarnation);
-  if (rr_migration_test_cut("after-samehash-prepared")) ::_exit(137);
+  if (core::migration_test_cut("after-samehash-prepared")) ::_exit(137);
   // This RPC runs on the daemon main thread. After the durable prepare,
   // removing wa fences every later callback owned by this worker.
   auto* storage = control->object_storage();
@@ -2670,12 +2749,35 @@ torrent::Object rr_finish_original(core::Download* owner,
     }
     throw;
   }
-  if (rr_migration_test_cut("after-original-release")) ::_exit(137);
-  if (rr_migration_test_cut("after-original-release-throw"))
+  if (core::migration_test_cut("after-original-release")) ::_exit(137);
+  if (core::migration_test_cut("after-original-release-throw"))
     throw torrent::input_error("RR test release-repair failure after durable receipt.");
   rr_original_release_repair(hash);
   rr_complete_same_hash_release(owner, hash, tx, incarnation);
   return std::string("finalized");
+}
+
+// Capture closed a paused original (open and stopped); once its transaction
+// is released, the owner is reopened unless a user Stop followed the owned
+// quiesce. A started original is restarted by its release instead. Open is
+// runtime state, as upstream: a daemon restart does not restore it.
+void rr_reopen_paused_owner(core::Download* owner, const RrMigrationCapsule& state,
+                            bool quiesced, uint64_t owned_generation) {
+  if (!quiesced || !rr_capsule_v2(state) || state.source_open != 1 ||
+      state.claim.compare(0, 14, "v2:original:0:") != 0)
+    return;
+  const auto target = rpc::make_target(owner);
+  const std::string hash = rpc::call_command_string("d.hash", target);
+  try {
+    if (owner->is_open() || rpc::call_command_value("d.state", target) != 0 ||
+        stop_intent::counter(session_thread::manager()->path(), hash, false) != owned_generation)
+      return;
+    rpc::call_command("d.open", torrent::Object(), target);  // A file-operation lease refuses it.
+  } catch (const torrent::local_error& e) {
+    rr_log_refusal("RR released paused owner not reopened: " + hash + ": " + e.what());
+  } catch (const std::runtime_error& e) {
+    rr_log_refusal("RR released paused owner not reopened: " + hash + ": " + e.what());
+  }
 }
 
 torrent::Object rr_release_owner(core::Download* owner,
@@ -2696,9 +2798,13 @@ torrent::Object rr_release_owner(core::Download* owner,
            incarnation != state.source_incarnation)))
     throw torrent::input_error("RR release owner or receipt mismatch.");
   if (rr_release_present(old_hash)) {
+    uint64_t quiesced_generation = 0;
+    const bool quiesced = rr_capsule_v2(state) && rr_quiesced_read(state, &quiesced_generation);
     rr_release_repair(old_hash);
-    if (owner_hash == old_hash)
+    if (owner_hash == old_hash) {
       rr_complete_same_hash_release(owner, old_hash, state.tx, incarnation);
+      rr_reopen_paused_owner(owner, state, quiesced, quiesced_generation);
+    }
     return std::string("released");
   }
   if (committed) {
@@ -2790,7 +2896,7 @@ torrent::Object rr_release_owner(core::Download* owner,
           ":" + state.tx + ":" + rr_committed_digest(files) + ":" +
           std::to_string(baseline) + "\n");
       static bool release_rename_test_cut_fired = false;
-      if (rr_migration_test_cut("after-committed-release-rename-throw") &&
+      if (core::migration_test_cut("after-committed-release-rename-throw") &&
           !release_rename_test_cut_fired) {
         release_rename_test_cut_fired = true;
         throw torrent::input_error("RR test released receipt before directory fsync.");
@@ -2808,8 +2914,10 @@ torrent::Object rr_release_owner(core::Download* owner,
     throw;
   }
   rr_release_repair(old_hash);
-  if (owner_hash == old_hash)
+  if (owner_hash == old_hash) {
     rr_complete_same_hash_release(owner, old_hash, state.tx, incarnation);
+    rr_reopen_paused_owner(owner, state, v2, owned_generation);
+  }
   return std::string("released");
 }
 
@@ -2905,9 +3013,33 @@ bool rr_finalized_read(const std::string& hash, std::string* tx,
   return true;
 }
 
+// One journal scan names every "<HASH>.*" entry, grouped by info hash. With
+// only_hash set, entries of other hashes are skipped.
+std::map<std::string, std::vector<std::string>> rr_journal_entries(const std::string& only_hash = std::string()) {
+  const int fd = rr_migration_dir();
+  DIR* directory = ::fdopendir(fd);
+  if (!directory) { ::close(fd); throw torrent::input_error("RR journal scan failed."); }
+  std::map<std::string, std::vector<std::string>> entries;
+  while (auto* entry = ::readdir(directory)) {
+    const std::string name = entry->d_name;
+    if (name.size() <= 41 || name[40] != '.' ||
+        (!only_hash.empty() && name.compare(0, 40, only_hash) != 0) ||
+        !std::all_of(name.begin(), name.begin() + 40, [](unsigned char c) {
+          return std::isxdigit(c) && !std::islower(c); }))
+      continue;
+    entries[name.substr(0, 40)].push_back(name);
+  }
+  ::closedir(directory);
+  return entries;
+}
+
 // The finalized receipt is durable before any old transaction name is removed.
+// Startup passes the listing of its single scan; otherwise one scan lists
+// this hash. Pruning never creates "<HASH>.*" names, so one listing serves
+// both passes.
 void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
-                         const std::string& incarnation) {
+                         const std::string& incarnation,
+                         const std::vector<std::string>* entries) {
   RrOriginalClaim active;
   if (rr_original_claim_read(hash, &active) && active.tx != tx)
     return; // A newer T owns the fixed H-scoped preclaim and its private baseline.
@@ -2953,8 +3085,8 @@ void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
     ::close(session);
     // Ordinary persistence owns the durably saved triple from this point.
     // Publishing this before pruning backups makes interrupted cleanup replayable.
-    if (rr_migration_test_cut("before-owner-ordinary")) ::_exit(137);
-    if (rr_migration_test_cut("before-owner-ordinary-throw")) {
+    if (core::migration_test_cut("before-owner-ordinary")) ::_exit(137);
+    if (core::migration_test_cut("before-owner-ordinary-throw")) {
       static bool injected = false;
       if (!injected) {
         injected = true;
@@ -2962,44 +3094,26 @@ void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
       }
     }
     rr_owner_publish(hash, incarnation, false, true);
-    if (rr_migration_test_cut("after-owner-ordinary")) ::_exit(137);
+    if (core::migration_test_cut("after-owner-ordinary")) ::_exit(137);
     ordinary = true;
   }
   if (rr_journal_exists(hash + ".benc")) {
     const auto state = rr_migration_read(hash);
     if (state.tx != tx) return; // A newer transaction owns these fixed names.
   }
-  const int fd = rr_migration_dir();
-  DIR* directory = ::fdopendir(fd);
-  if (!directory) { ::close(fd); throw torrent::input_error("RR final cleanup scan failed."); }
-  const std::string head = hash + ".";
-  std::vector<std::string> obsolete;
-  while (auto* entry = ::readdir(directory)) {
-    const std::string name = entry->d_name;
-    if (name.compare(0, head.size(), head) == 0 &&
-        name.compare(0, hash.size() + 6, hash + ".owner") != 0 &&
-        name != hash + ".finalized.receipt")
-      obsolete.push_back(name);
+  std::vector<std::string> scanned;
+  if (entries == nullptr) {
+    scanned = std::move(rr_journal_entries(hash)[hash]);
+    entries = &scanned;
   }
-  for (const auto& name : obsolete) {
-    if (::unlinkat(fd, name.c_str(), 0) < 0 && errno != ENOENT) {
-      ::closedir(directory);
-      throw torrent::input_error("RR final cleanup removal failed.");
-    }
-    if (rr_migration_test_cut("after-finalize-prune-first")) ::_exit(137);
-  }
-  if (!obsolete.empty() && ::fsync(fd) < 0) {
-    ::closedir(directory);
-    throw torrent::input_error("RR final cleanup directory fsync failed.");
-  }
-  ::closedir(directory);
-  const int prune_fd = rr_migration_dir();
-  DIR* prune_directory = ::fdopendir(prune_fd);
-  if (!prune_directory) { ::close(prune_fd); throw torrent::input_error("RR owner prune scan failed."); }
   const std::string owner_head = hash + ".owner.";
+  std::vector<std::string> obsolete;
   std::vector<std::string> old_owner_files;
-  while (auto* entry = ::readdir(prune_directory)) {
-    const std::string name = entry->d_name;
+  for (const auto& name : *entries) {
+    if (name.compare(0, hash.size() + 6, hash + ".owner") != 0) {
+      if (name != hash + ".finalized.receipt") obsolete.push_back(name);
+      continue;
+    }
     if (name.compare(0, owner_head.size(), owner_head) != 0 ||
         name.size() <= owner_head.size() + 32 ||
         name[owner_head.size() + 32] != '.') continue;
@@ -3008,55 +3122,117 @@ void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
         (ordinary || other_incarnation != incarnation))
       old_owner_files.push_back(name);
   }
-  for (const auto& name : old_owner_files)
-    if (::unlinkat(prune_fd, name.c_str(), 0) < 0 && errno != ENOENT) {
-      ::closedir(prune_directory);
-      throw torrent::input_error("RR old owner prune removal failed.");
-    }
-  if (!old_owner_files.empty() && ::fsync(prune_fd) < 0) {
-    ::closedir(prune_directory);
-    throw torrent::input_error("RR old owner prune directory fsync failed.");
+  const core::SessionPathFd dir(rr_migration_dir());
+  for (const auto& name : obsolete) {
+    if (::unlinkat(dir.get(), name.c_str(), 0) < 0 && errno != ENOENT)
+      throw torrent::input_error("RR final cleanup removal failed.");
+    if (core::migration_test_cut("after-finalize-prune-first")) ::_exit(137);
   }
-  ::closedir(prune_directory);
+  if (!obsolete.empty() && ::fsync(dir.get()) < 0)
+    throw torrent::input_error("RR final cleanup directory fsync failed.");
+  if (core::migration_test_cut("after-finalize-prune-throw")) {
+    static bool injected = false;
+    if (!injected) {
+      injected = true;
+      throw torrent::input_error("RR test final cleanup failure after prune.");
+    }
+  }
+  for (const auto& name : old_owner_files)
+    if (::unlinkat(dir.get(), name.c_str(), 0) < 0 && errno != ENOENT)
+      throw torrent::input_error("RR old owner prune removal failed.");
+  if (!old_owner_files.empty() && ::fsync(dir.get()) < 0)
+    throw torrent::input_error("RR old owner prune directory fsync failed.");
   rr_owner_hold_hashes.erase(hash);
 }
 
+// One scan serves every finalized receipt: per-receipt rescans made startup
+// quadratic in the number of receipts.
 void rr_finalize_repair_startup() {
-  const int fd = rr_migration_dir();
-  DIR* directory = ::fdopendir(fd);
-  if (!directory) { ::close(fd); throw torrent::input_error("RR final receipt scan failed."); }
-  const std::string suffix = ".finalized.receipt";
-  while (auto* entry = ::readdir(directory)) {
-    const std::string name = entry->d_name;
-    if (name.size() != 40 + suffix.size() || name.compare(40, suffix.size(), suffix) != 0)
+  auto entries = rr_journal_entries();
+  for (auto& [hash, names] : entries) {
+    if (std::find(names.begin(), names.end(), hash + ".finalized.receipt") == names.end())
       continue;
-    const std::string hash = name.substr(0, 40);
-    if (!std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
-          return std::isxdigit(c) && !std::islower(c); })) continue;
     try {
       std::string tx, incarnation;
       rr_finalized_read(hash, &tx, &incarnation);
-      rr_finalize_cleanup(hash, tx, incarnation);
+      rr_finalize_cleanup(hash, tx, incarnation, &names);
     } catch (const torrent::input_error& e) {
       rr_owner_hold_hashes.insert(hash);
-      control->core()->push_log_std("RR finalized owner held: " + hash + ": " + e.what());
+      rr_log_refusal("RR finalized owner held: " + hash + ": " + e.what());
     }
   }
-  ::closedir(directory);
+}
+
+// Retires the tombstones of erased owners, and the pointers of ordinary
+// owners whose triple is gone, once no ordinary triple of their incarnation
+// can return, in three steps shared by all of them so startup
+// pays three directory syncs rather than three per hash: the absence of the
+// triples, then finalized receipts and owner backups, then the pointers. A
+// later startup must never meet a finalized receipt without its owner
+// pointer; a crash between steps leaves tombstones that the next startup
+// retires. A receipt of another incarnation, or any other journal entry of
+// the hash, keeps everything for the existing owner checks. Failures keep the
+// remaining tombstones, logged, for the next startup.
+void rr_retire_owner_tombstones(const std::vector<std::pair<std::string, std::string>>& erased,
+                                const std::map<std::string, std::vector<std::string>>& entries) try {
+  if (erased.empty()) return;
+  {
+    // DownloadList::erase unlinks the ordinary triple without a directory sync.
+    const core::SessionPathFd session(rr_session_dir());
+    if (::fsync(session.get()) < 0) {
+      rr_log_refusal("RR erased owner tombstones kept: session directory fsync failed.");
+      return;
+    }
+  }
+  const core::SessionPathFd dir(rr_migration_dir());
+  std::vector<std::string> pointers;
+  for (const auto& [hash, incarnation] : erased) {
+    try {
+      std::string finalized_tx, finalized_incarnation;
+      if (rr_finalized_read(hash, &finalized_tx, &finalized_incarnation) &&
+          finalized_incarnation != incarnation) continue;
+      const std::string owner_files = rr_owner_prefix(hash, incarnation) + ".";
+      const auto listed = entries.find(hash);
+      if (listed == entries.end()) continue;
+      const auto& names = listed->second;
+      // Any other journal entry is an obligation this tombstone may protect.
+      if (!std::all_of(names.begin(), names.end(), [&](const std::string& name) {
+            return name == hash + ".finalized.receipt" || name == hash + ".owner.current" ||
+                name.compare(0, owner_files.size(), owner_files) == 0; }))
+        continue;
+      for (const auto& name : names) {
+        if (name != hash + ".finalized.receipt" &&
+            name.compare(0, owner_files.size(), owner_files) != 0) continue;
+        if (::unlinkat(dir.get(), name.c_str(), 0) < 0 && errno != ENOENT)
+          throw torrent::input_error("RR erased owner receipt removal failed.");
+      }
+      pointers.push_back(hash + ".owner.current");
+    } catch (const torrent::input_error& e) {
+      // The tombstone and whatever is left keep their meaning; retried later.
+      rr_log_refusal("RR erased owner tombstone kept: " + hash + ": " + e.what());
+    }
+  }
+  if (pointers.empty()) return;
+  if (::fsync(dir.get()) < 0) {
+    rr_log_refusal("RR erased owner tombstones kept: journal fsync failed after receipt removal.");
+    return;
+  }
+  if (core::migration_test_cut("after-owner-tombstone-receipts")) ::_exit(137);
+  for (const auto& pointer : pointers)
+    if (::unlinkat(dir.get(), pointer.c_str(), 0) < 0 && errno != ENOENT)
+      rr_log_refusal("RR erased owner tombstone kept: " + pointer.substr(0, 40) + ": removal failed.");
+  if (::fsync(dir.get()) < 0)
+    rr_log_refusal("RR erased owner tombstones: journal fsync failed after pointer removal.");
+} catch (const torrent::input_error& e) {
+  rr_log_refusal(std::string("RR erased owner tombstones kept: ") + e.what());
 }
 
 void rr_owner_repair_startup() {
-  const int fd = rr_migration_dir();
-  DIR* directory = ::fdopendir(fd);
-  if (!directory) { ::close(fd); throw torrent::input_error("RR owner pointer scan failed."); }
-  const std::string suffix = ".owner.current";
-  while (auto* entry = ::readdir(directory)) {
-    const std::string name = entry->d_name;
-    if (name.size() != 40 + suffix.size() || name.compare(40, suffix.size(), suffix) != 0)
+  auto entries = rr_journal_entries();
+  std::vector<std::pair<std::string, std::string>> erased;
+  for (const auto& [hash, names] : entries) {
+    if (std::find(names.begin(), names.end(), hash + ".owner.current") == names.end())
       continue;
-    const std::string hash = name.substr(0, 40);
-    if (!std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
-          return std::isxdigit(c) && !std::islower(c); })) continue;
     if (rr_owner_hold_hashes.count(hash)) continue;
     try {
       RrOriginalClaim active_claim;
@@ -3067,7 +3243,17 @@ void rr_owner_repair_startup() {
       bool retired = false;
       bool ordinary = false;
       if (!rr_owner_read(hash, &incarnation, &retired, &ordinary)) continue;
-      if (ordinary) continue;
+      if (ordinary) {
+        // Ordinary persistence owns a loaded triple. Without one the hash is
+        // not loaded and its pointer and receipt protect nothing any more.
+        const core::SessionPathFd session(rr_session_dir());
+        struct stat st;
+        if (::fstatat(session.get(), (hash + ".torrent").c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) continue;
+        if (errno != ENOENT)
+          throw torrent::input_error("RR owner ordinary presence cannot be checked.");
+        erased.emplace_back(hash, incarnation);
+        continue;
+      }
       const int session = rr_session_dir();
       try {
         bool ordinary_exists = false;
@@ -3094,9 +3280,8 @@ void rr_owner_repair_startup() {
             for (const char* ext : {".torrent", ".torrent.rtorrent", ".torrent.libtorrent_resume"})
               if (::unlinkat(session, (hash + ext).c_str(), 0) < 0 && errno != ENOENT)
                 throw torrent::input_error("RR retired owner ordinary removal failed.");
-            if (::fsync(session) < 0)
-              throw torrent::input_error("RR retired owner directory fsync failed.");
           }
+          erased.emplace_back(hash, incarnation);
         } else {
           if (ordinary_exists && !ordinary_incarnation.empty() &&
               ordinary_incarnation != incarnation)
@@ -3128,10 +3313,10 @@ void rr_owner_repair_startup() {
       ::close(session);
     } catch (const torrent::input_error& e) {
       rr_owner_hold_hashes.insert(hash);
-      control->core()->push_log_std("RR owner backup held: " + hash + ": " + e.what());
+      rr_log_refusal("RR owner backup held: " + hash + ": " + e.what());
     }
   }
-  ::closedir(directory);
+  rr_retire_owner_tombstones(erased, entries);
 }
 
 std::string rr_finalize_owner(core::Download* owner,
@@ -3194,8 +3379,7 @@ std::string rr_finalize_owner(core::Download* owner,
       !retrieve_d_custom(owner, "retrackers-recovery-ack").as_string().empty())
     throw torrent::input_error("RR finalize marker still active.");
   const std::string queued = retrieve_d_custom(owner, "retrackers-queued").as_string();
-  if (queued.size() == 100 && queued.compare(0, 3, "q1:") == 0 && queued[67] == ':' &&
-      rr_lower_hex(queued.substr(3, 64), 64) && rr_lower_hex(queued.substr(68), 32)) {
+  if (rr_queue_valid(queued)) {
     RrOriginalClaim queued_claim;
     if (!rr_original_claim_read(old_hash, &queued_claim) || queued_claim.tx != tx ||
         queued_claim.user_digest != queued.substr(3, 64))
@@ -3268,9 +3452,89 @@ bool rr_prepared_repair_loaded(core::Download* owner) {
     return true;
   } catch (const torrent::input_error& e) {
     rr_owner_hold_hashes.insert(hash);
-    control->core()->push_log_std("RR session migration replay held: " + hash + ": " + e.what());
+    rr_log_refusal("RR session migration replay held: " + hash + ": " + e.what());
     return false;
   }
+}
+
+// Restores an unloaded same-hash original from its claim's durable state, as
+// a released owner: the latest T-bound save, markers cleared, its run state
+// when no user Stop followed the owned quiesce. A session load of the written
+// ordinary triple then completes the release (prepared receipt). amend may
+// change the released sidecar, which is published in that same durable step.
+// Returns false when there is no claim or a commit owns the hash; refusals
+// throw.
+bool rr_original_restore_claim(const std::string& hash,
+                               const std::function<void(torrent::Object&)>& amend = {}) {
+  RrOriginalClaim claim;
+  if (!rr_original_claim_read(hash, &claim)) return false;
+  bool captured = false;
+  bool quiesced = false;
+  uint64_t owned_generation = claim.stop_generation;
+  if (rr_journal_exists(hash + ".benc")) {
+    const auto state = rr_migration_read(hash);
+    if (!rr_capsule_v2(state) || state.hash != hash ||
+        state.source_incarnation != claim.incarnation ||
+        state.source_local_id != claim.local_id || state.tx != claim.tx ||
+        state.claim != rr_original_v2_marker(claim))
+      throw torrent::input_error("RR original capture authority changed.");
+    if (rr_migration_any_commit_receipt(hash)) return false;
+    if (rr_migration_receipt_present(hash) && !rr_migration_rollback_receipt(hash))
+      throw torrent::input_error("RR original capture receipt unrecognized.");
+    quiesced = rr_quiesced_read(state, &owned_generation);
+    captured = true;
+  }
+  RrOriginalReleased released;
+  if (!rr_original_released_read(hash, &released)) {
+    auto files = rr_original_read_triple(hash + ".preclaim",
+        claim.baseline_digest, hash, claim.incarnation);
+    uint64_t baseline = 0;
+    const std::string prefix = hash + ".claim." + claim.tx;
+    RrLateReceipt late;
+    if (rr_late_read_receipt(prefix, &late)) {
+      if (late.new_hash != hash || late.incarnation != claim.incarnation)
+        throw torrent::input_error("RR original claim later-save identity changed.");
+      files = rr_late_select(prefix, hash, late, false);
+      baseline = late.sequence;
+    }
+    auto sidecar = rr_committed_map(files[1].second);
+    auto& custom = sidecar.insert_preserve_copy(
+        "custom", torrent::Object::create_map()).first->second;
+    const std::string current = custom.has_key_string("retrackers-recovery") ?
+        custom.get_key_string("retrackers-recovery") : std::string();
+    const std::string ack = custom.has_key_string("retrackers-recovery-ack") ?
+        custom.get_key_string("retrackers-recovery-ack") : std::string();
+    const std::string marker = rr_original_v2_marker(claim);
+    if ((!current.empty() && current != marker) || (!ack.empty() && ack != marker))
+      throw torrent::input_error("RR original claim saved marker changed.");
+    custom.insert_key("retrackers-recovery", std::string());
+    custom.insert_key("retrackers-recovery-ack", std::string());
+    uint64_t current_generation;
+    try { current_generation = stop_intent::counter(session_thread::manager()->path(), hash, false); }
+    catch (const std::exception& e) {
+      throw torrent::input_error(std::string("RR original claim stop generation unavailable: ") + e.what());
+    }
+    const int64_t saved_generation = sidecar.has_key_value("stop_generation") ?
+        sidecar.get_key_value("stop_generation") : static_cast<int64_t>(claim.stop_generation);
+    if (saved_generation < 0 || current_generation < static_cast<uint64_t>(saved_generation) ||
+        current_generation < claim.stop_generation ||
+        (quiesced && current_generation < owned_generation))
+      throw torrent::input_error("RR original claim stop generation regressed.");
+    if (captured && quiesced && current_generation == owned_generation) {
+      // Only the fsynced quiesce receipt attributes Gq to the daemon.
+      sidecar.insert_key("state", int64_t(claim.run == "1"));
+    } else if (current_generation > static_cast<uint64_t>(saved_generation)) {
+      sidecar.insert_key("state", int64_t(0));
+    }
+    // Before quiesce, the latest T-bound sidecar owns later Start/Open/Close.
+    sidecar.insert_key("stop_generation", static_cast<int64_t>(current_generation));
+    if (amend) amend(sidecar);
+    files[1].second = rr_bencode(sidecar);
+    rr_original_publish_released(claim, files, baseline);
+  }
+  rr_original_release_repair(hash);
+  rr_prepare_publish(hash, claim.tx, claim.incarnation);
+  return true;
 }
 
 void rr_original_repair_preload() {
@@ -3286,76 +3550,10 @@ void rr_original_repair_preload() {
     if (!std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
           return std::isxdigit(c) && !std::islower(c); })) continue;
     try {
-      RrOriginalClaim claim;
-      if (!rr_original_claim_read(hash, &claim)) continue;
-      bool captured = false;
-      bool quiesced = false;
-      uint64_t owned_generation = claim.stop_generation;
-      if (rr_journal_exists(hash + ".benc")) {
-        const auto state = rr_migration_read(hash);
-        if (!rr_capsule_v2(state) || state.hash != hash ||
-            state.source_incarnation != claim.incarnation ||
-            state.source_local_id != claim.local_id || state.tx != claim.tx ||
-            state.claim != rr_original_v2_marker(claim))
-          throw torrent::input_error("RR original capture authority changed.");
-        if (rr_migration_any_commit_receipt(hash)) continue;
-        if (rr_migration_receipt_present(hash) && !rr_migration_rollback_receipt(hash))
-          throw torrent::input_error("RR original capture receipt unrecognized.");
-        quiesced = rr_quiesced_read(state, &owned_generation);
-        captured = true;
-      }
-      RrOriginalReleased released;
-      if (!rr_original_released_read(hash, &released)) {
-        auto files = rr_original_read_triple(hash + ".preclaim",
-            claim.baseline_digest, hash, claim.incarnation);
-        uint64_t baseline = 0;
-        const std::string prefix = hash + ".claim." + claim.tx;
-        RrLateReceipt late;
-        if (rr_late_read_receipt(prefix, &late)) {
-          if (late.new_hash != hash || late.incarnation != claim.incarnation)
-            throw torrent::input_error("RR original claim later-save identity changed.");
-          files = rr_late_select(prefix, hash, late, false);
-          baseline = late.sequence;
-        }
-        auto sidecar = rr_committed_map(files[1].second);
-        auto& custom = sidecar.insert_preserve_copy(
-            "custom", torrent::Object::create_map()).first->second;
-        const std::string current = custom.has_key_string("retrackers-recovery") ?
-            custom.get_key_string("retrackers-recovery") : std::string();
-        const std::string ack = custom.has_key_string("retrackers-recovery-ack") ?
-            custom.get_key_string("retrackers-recovery-ack") : std::string();
-        const std::string marker = rr_original_v2_marker(claim);
-        if ((!current.empty() && current != marker) || (!ack.empty() && ack != marker))
-          throw torrent::input_error("RR original claim saved marker changed.");
-        custom.insert_key("retrackers-recovery", std::string());
-        custom.insert_key("retrackers-recovery-ack", std::string());
-        uint64_t current_generation;
-        try { current_generation = stop_intent::counter(session_thread::manager()->path(), hash, false); }
-        catch (const std::exception& e) {
-          throw torrent::input_error(std::string("RR original claim stop generation unavailable: ") + e.what());
-        }
-        const int64_t saved_generation = sidecar.has_key_value("stop_generation") ?
-            sidecar.get_key_value("stop_generation") : static_cast<int64_t>(claim.stop_generation);
-        if (saved_generation < 0 || current_generation < static_cast<uint64_t>(saved_generation) ||
-            current_generation < claim.stop_generation ||
-            (quiesced && current_generation < owned_generation))
-          throw torrent::input_error("RR original claim stop generation regressed.");
-        if (captured && quiesced && current_generation == owned_generation) {
-          // Only the fsynced quiesce receipt attributes Gq to the daemon.
-          sidecar.insert_key("state", int64_t(claim.run == "1"));
-        } else if (current_generation > static_cast<uint64_t>(saved_generation)) {
-          sidecar.insert_key("state", int64_t(0));
-        }
-        // Before quiesce, the latest T-bound sidecar owns later Start/Open/Close.
-        sidecar.insert_key("stop_generation", static_cast<int64_t>(current_generation));
-        files[1].second = rr_bencode(sidecar);
-        rr_original_publish_released(claim, files, baseline);
-      }
-      rr_original_release_repair(hash);
-      rr_prepare_publish(hash, claim.tx, claim.incarnation);
+      rr_original_restore_claim(hash);
     } catch (const torrent::input_error& e) {
       rr_owner_hold_hashes.insert(hash);
-      control->core()->push_log_std("RR original preclaim held: " + hash + ": " + e.what());
+      rr_log_refusal("RR original preclaim held: " + hash + ": " + e.what());
     }
   }
   ::closedir(directory);
@@ -3414,7 +3612,7 @@ void rr_repair_released_startup_impl() {
       }
     } catch (const torrent::input_error& e) {
       rr_release_hold.insert(hash);
-      control->core()->push_log_std("RR released source held: " + hash + ": " + e.what());
+      rr_log_refusal("RR released source held: " + hash + ": " + e.what());
     }
   }
   ::closedir(directory);
@@ -3507,6 +3705,220 @@ void retrackers_migration_retire_released(core::Download* download) {
   rr_retire_released(download);
 }
 
+namespace {
+// Erases retire their owners' tombstones a few seconds later in one batch:
+// three directory syncs per burst of erases instead of three per erase. The
+// tombstone is durable before the erase returns, so a crash before the batch
+// only leaves it to startup.
+std::set<std::string> rr_erased_owner_hashes;
+// Never destroyed: a scheduled entry must not outlive the main scheduler.
+torrent::system::SchedulerEntry* const rr_erased_owner_task = new torrent::system::SchedulerEntry;
+
+void rr_retire_erased_owners_now() {
+  std::set<std::string> hashes;
+  hashes.swap(rr_erased_owner_hashes);
+  if (hashes.empty() || rpc::call_command_string("session.path").empty()) return;
+  std::vector<std::pair<std::string, std::string>> erased;
+  for (const auto& hash : hashes) {
+    try {
+      // A re-added hash with a new claim or owner keeps its journal entries.
+      RrOriginalClaim claim;
+      std::string incarnation;
+      bool retired = false;
+      if (rr_owner_hold_hashes.count(hash) || rr_original_claim_read(hash, &claim) ||
+          !rr_owner_read(hash, &incarnation, &retired) || !retired)
+        continue;
+      erased.emplace_back(hash, incarnation);
+    } catch (const torrent::local_error& e) {
+      rr_log_refusal("RR erased owner tombstone kept: " + hash + ": " + e.what());
+    }
+  }
+  if (erased.empty()) return;
+  // A scheduled task: refusals and storage failures alike are logged, not
+  // thrown into the scheduler; startup retries.
+  try {
+    rr_retire_owner_tombstones(erased, rr_journal_entries());
+  } catch (const torrent::local_error& e) {
+    rr_log_refusal(std::string("RR erased owner tombstones kept: ") + e.what());
+  }
+}
+}
+
+// Called after DownloadList::erase removed the ordinary triple; startup also
+// retires tombstones left by older daemons or a crash.
+void retrackers_migration_retire_erased_owner(const std::string& hash) {
+  if (rpc::call_command_string("session.path").empty()) return;
+  rr_erased_owner_hashes.insert(hash);
+  if (!rr_erased_owner_task->is_valid())
+    rr_erased_owner_task->slot() = [] { rr_retire_erased_owners_now(); };
+  if (!rr_erased_owner_task->is_scheduled())
+    torrent::this_thread::scheduler()->wait_for_ceil_seconds(rr_erased_owner_task, std::chrono::seconds(2));
+}
+
+void retrackers_migration_flush_erased_owners() {
+  torrent::this_thread::scheduler()->erase(rr_erased_owner_task);
+  rr_retire_erased_owners_now();
+}
+
+namespace {
+// The job's pending receipt belonged to the dead worker's claim (keyed by the
+// original's local ID, which no loaded download carries any more); a later
+// enqueue publishes a new one, as after a cancellation.
+void rr_retire_dead_worker_pending(const std::string& local_id) {
+  auto* storage = control->object_storage();
+  const auto ledger = storage->find(rpc::object_storage::key_type::from_c_str("rr.receipts.v1"));
+  if (ledger != storage->end() && (ledger->second.flags & rpc::object_storage::flag_multi_type))
+    storage->erase_str_multi_key("rr.receipts.v1", core::retrackers_pending_receipt_key(local_id));
+}
+
+// A worker that exits after capture leaves a transaction no other process can
+// continue: worker_start answers held for a captured claim. Only the reaped
+// exit of the exact native-owned worker H/T/I proves the worker gone; neither
+// a timeout nor an absent PID does. The daemon then finishes what the worker
+// cannot, as startup would: a committed candidate is released, anything else
+// is restored from the claim's durable original and released with Q owed.
+// That rollback spends one counted attempt (capture-refused) in the released
+// state itself, so the dispatcher waits 2^count seconds and a worker that
+// always dies after capture ends terminal after six cycles rather than
+// looping Stop/Start. A commit is not counted. Before capture nothing was
+// taken from the original, so Q stays owed and the dispatcher relaunches the
+// job.
+void rr_recover_exited_worker(const std::string& identity) {
+  if (core::retrackers_process_pool::shutting_down || identity.size() != 7 + 40 + 1 + 32 + 1 + 32 ||
+      identity.compare(0, 7, "worker:") != 0)
+    return;
+  const std::string hash = identity.substr(7, 40);
+  const std::string tx = identity.substr(48, 32);
+  const std::string incarnation = identity.substr(81);
+  const auto held = [hash](const char* why) {
+    rr_log_refusal("RR worker exit recovery held: " + hash + ": " + why);
+  };
+  try {
+    RrOriginalClaim claim;
+    if (!rr_original_claim_read(hash, &claim) || claim.tx != tx || claim.incarnation != incarnation)
+      return;
+    if (!rr_journal_exists(hash + ".benc")) {
+      // Uncaptured: the original was never taken. A partial capsule keeps the
+      // claim held until startup sorts it out; say so rather than wait mutely.
+      if (rr_capture_intent_present(hash))
+        throw torrent::input_error("partial capture publication; startup recovers it");
+      return;
+    }
+    if (rr_owner_hold_hashes.count(hash) || rr_release_hold.count(hash) || rr_committed_hold.count(hash))
+      throw torrent::input_error("hash already held for startup recovery");
+    const auto state = rr_migration_read(hash);
+    if (!rr_capsule_v2(state) || state.tx != tx || state.source_incarnation != incarnation)
+      throw torrent::input_error("capture authority changed");
+    auto* live = control->core()->download_list()->find_hex_ptr(hash.c_str());
+    const std::string live_incarnation = live ?
+        rpc::call_command_string("d.incarnation", rpc::make_target(live)) : std::string();
+    if (rr_migration_any_commit_receipt(hash)) {
+      if (!live || live_incarnation == incarnation)
+        throw torrent::input_error("committed candidate is not loaded");
+      torrent::Object::list_type args{torrent::Object(tx), torrent::Object(live_incarnation)};
+      rr_release_committed(live, args);
+      rr_retire_dead_worker_pending(state.source_local_id);
+      rr_log_refusal("RR worker exit recovery: " + hash + ": finished");
+      return;
+    }
+    if (rr_migration_receipt_present(hash) || rr_release_present(hash) ||
+        rr_journal_exists(hash + ".prepared.receipt"))
+      throw torrent::input_error("an uncommitted transaction receipt is present");
+    if (live) {
+      // Only an uncommitted, never opened candidate of this transaction goes;
+      // the daemon erases it as capture erased the source.
+      if (live_incarnation == incarnation || live->is_open() || live->is_active() ||
+          !retrackers_migration_uncommitted_candidate(hash))
+        throw torrent::input_error("loaded owner is not an idle uncommitted candidate");
+      rr_native_capture_erase_hash = hash;
+      try { control->core()->download_list()->erase_ptr(live); }
+      catch (...) { rr_native_capture_erase_hash.clear(); throw; }
+      rr_native_capture_erase_hash.clear();
+      if (control->core()->download_list()->find_hex_ptr(hash.c_str()))
+        throw torrent::input_error("uncommitted candidate erase refused");
+    }
+    uint64_t owned_generation = 0;
+    const bool quiesced = rr_quiesced_read(state, &owned_generation);
+    std::string counted = "attempt not counted: released state already published";
+    const auto count_attempt = [&claim, &counted](torrent::Object& sidecar) {
+      auto& custom = sidecar.insert_preserve_copy("custom", torrent::Object::create_map()).first->second;
+      const std::string q = custom.has_key_string("retrackers-queued") ?
+          custom.get_key_string("retrackers-queued") : std::string();
+      const std::string prior_wire = custom.has_key_string("retrackers-retry") ?
+          custom.get_key_string("retrackers-retry") : std::string();
+      core::RetrackersRetry prior, next;
+      if (!rr_queue_valid(q) || q.substr(68) != claim.queue_token) {
+        counted = "attempt not counted: Q changed";
+      } else if (!prior_wire.empty() && !core::retrackers_retry_parse(prior_wire, claim.queue_token, &prior)) {
+        counted = "attempt not counted: retry receipt invalid";
+      } else if (!core::retrackers_retry_counted_next(prior_wire.empty() ? nullptr : &prior,
+                     static_cast<uint64_t>(std::max<time_t>(::time(nullptr), 0)), "capture-refused", &next)) {
+        counted = "retries already exhausted";
+      } else {
+        custom.insert_key("retrackers-retry", core::retrackers_retry_format(claim.queue_token, next));
+        counted = "attempt " + std::to_string(next.count) + " of " +
+            std::to_string(core::retrackers_retry_max_attempts) + (next.terminal() ? ", retries exhausted" : "");
+      }
+    };
+    if (!rr_original_restore_claim(hash, count_attempt))
+      throw torrent::input_error("claim restoration found no original");
+    // The session load of the restored ordinary triple completes the release.
+    std::string path = rpc::call_command_string("session.path");
+    if (path.back() != '/') path += '/';
+    auto* factory = new core::DownloadFactory(control->core());
+    factory->set_session(true);
+    factory->slot_finished([factory, hash, tx, state, quiesced, owned_generation, held, counted]() {
+      auto* restored = control->core()->download_list()->find_hex_ptr(hash.c_str());
+      std::string finalized_tx, finalized_incarnation;
+      try {
+        if (!restored || !rr_finalized_read(hash, &finalized_tx, &finalized_incarnation) ||
+            finalized_tx != tx)
+          throw torrent::input_error("restored original was not released");
+        rr_reopen_paused_owner(restored, state, quiesced, owned_generation);
+        rr_retire_dead_worker_pending(state.source_local_id);
+        rr_log_refusal("RR worker exit recovery: " + hash + ": rolled back; " + counted);
+      } catch (const torrent::local_error& e) {
+        held(e.what());
+      }
+      delete factory;
+    });
+    factory->load(path + hash + ".torrent");
+    factory->commit();
+  } catch (const torrent::local_error& e) {
+    // Refusals and storage failures alike; startup repeats the recovery.
+    held(e.what());
+  } catch (const std::runtime_error& e) {
+    held(e.what());
+  }
+}
+
+// Runs while workers live: reaps them and recovers each exited one.
+torrent::system::SchedulerEntry* const rr_worker_watch_task = new torrent::system::SchedulerEntry;
+
+void rr_watch_workers_schedule();
+
+void rr_watch_workers() {
+  core::retrackers_process_pool::reap();
+  std::vector<std::string> exited;
+  exited.swap(core::retrackers_process_pool::exited_workers);
+  for (const auto& identity : exited)
+    rr_recover_exited_worker(identity);
+  if (core::retrackers_process_pool::workers_running())
+    rr_watch_workers_schedule();
+}
+
+void rr_watch_workers_schedule() {
+  if (!rr_worker_watch_task->is_valid())
+    rr_worker_watch_task->slot() = [] { rr_watch_workers(); };
+  if (!rr_worker_watch_task->is_scheduled())
+    torrent::this_thread::scheduler()->wait_for_ceil_seconds(rr_worker_watch_task, std::chrono::seconds(1));
+}
+}
+
+void retrackers_migration_stop_worker_watch() {
+  torrent::this_thread::scheduler()->erase(rr_worker_watch_task);
+}
+
 void retrackers_migration_repair_released_startup() {
   rr_repair_released_startup_impl();
 }
@@ -3530,7 +3942,7 @@ void retrackers_migration_repair_committed_startup() {
     if (rr_migration_rollback_receipt(old_hash) || rr_release_present(old_hash)) continue;
     if (!rr_migration_any_commit_receipt(old_hash)) {
       rr_committed_hold.insert(old_hash);
-      control->core()->push_log_std("RR migration receipt invalid; both owners held: " + old_hash);
+      rr_log_refusal("RR migration receipt invalid; both owners held: " + old_hash);
       continue;
     }
     const std::string receipt = rr_migration_receipt(old_hash);
@@ -3542,7 +3954,7 @@ void retrackers_migration_repair_committed_startup() {
       }
     } catch (const torrent::input_error& e) {
       rr_committed_hold.insert(old_hash);
-      control->core()->push_log_std("RR late committed owner held: " + old_hash + ": " + e.what());
+      rr_log_refusal("RR late committed owner held: " + old_hash + ": " + e.what());
       continue;
     }
     try {
@@ -3583,7 +3995,7 @@ void retrackers_migration_repair_committed_startup() {
                                       ": " + e.what());
       } catch (const torrent::input_error& fallback) {
         rr_committed_hold.insert(old_hash);
-        control->core()->push_log_std("RR committed owner held: " + old_hash + ": " +
+        rr_log_refusal("RR committed owner held: " + old_hash + ": " +
                                       e.what() + "; " + fallback.what());
       }
     }
@@ -3613,10 +4025,42 @@ void retrackers_migration_recover_startup() {
     try {
       rr_migration_rollback(hash);
     } catch (const torrent::input_error& e) {
-      control->core()->push_log_std("RR startup rollback refused: " + hash + ": " + e.what());
+      rr_log_refusal("RR startup rollback refused: " + hash + ": " + e.what());
     }
   }
   ::closedir(directory);
+}
+
+void retrackers_migration_remove_temporaries_startup() {
+  if (rpc::call_command_string("session.path").empty()) return;
+  try {
+    std::vector<std::string> kept;
+    unsigned removed = 0;
+    {
+      const core::SessionPathFd journal(rr_migration_dir());
+      removed += rr_migration_remove_temporaries(journal.get(), false, &kept);
+    }
+    {
+      const core::SessionPathFd session(rr_session_dir());
+      removed += rr_migration_remove_temporaries(session.get(), true, &kept);
+    }
+    if (removed != 0) {
+      const std::string message = "RR migration startup removed " + std::to_string(removed) +
+          " unpublished temporary files.";
+      lt_log_print(torrent::LOG_INFO, "%s", message.c_str());
+      control->core()->push_log_std(message);
+    }
+    if (!kept.empty()) {
+      const std::string message = "RR migration startup kept " + std::to_string(kept.size()) +
+          " temporary-named entries that are not owner-only single-link files, first: " + kept.front();
+      lt_log_print(torrent::LOG_WARN, "%s", message.c_str());
+      control->core()->push_log_std(message);
+    }
+  } catch (const std::exception& e) {
+    const std::string message = std::string("RR migration temporary cleanup held: ") + e.what();
+    lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+    control->core()->push_log_std(message);
+  }
 }
 
 std::string retrackers_migration_target_source(const std::string& hash) {
@@ -3662,17 +4106,24 @@ bool retrackers_migration_prepared_session(core::Download* download,
   } catch (const torrent::input_error&) { return false; }
 }
 
+// Whether migration authority still owns identity H, so a load of H must be
+// proven (committed, restored, prepared, candidate or daemon rollback) and its
+// stop record is no orphan. This is not rr_capture_intent_present(), which
+// asks whether a live original's capture may have begun and so knows no
+// resolution. Here an active original claim reserves H whatever capsule parts
+// exist. Otherwise the restorable source snapshot .rollback.torrent, always
+// published first, reserves H until its rollback receipt or a release without
+// a successor reservation resolves it, so later capsule parts cannot appear
+// without it. A successor's .target is checked by the load path separately.
+// Unknown presence refuses rather than grants a load.
 bool retrackers_migration_source_reserved(const std::string& hash) {
   if (retrackers_migration_original_claim_active(hash)) return true;
   if (rr_retired_hold_hashes.count(hash) || rr_owner_hold_hashes.count(hash) ||
       rr_release_hold.count(hash)) return true;
   if (rpc::call_command_string("session.path").empty()) return false;
   if (rr_journal_exists(hash + ".prepared.receipt")) return true;
-  const int dir = rr_migration_dir();
-  struct stat st;
-  const bool found = ::fstatat(dir, (hash + ".rollback.torrent").c_str(), &st,
-                               AT_SYMLINK_NOFOLLOW) == 0;
-  ::close(dir);
+  const bool found = rr_journal_exists(hash + ".rollback.torrent",
+                                       "RR migration reservation presence cannot be checked.");
   if (found && rr_release_present(hash) && !rr_release_hold.count(hash) &&
       retrackers_migration_target_source(rr_migration_read(hash).expected_new_hash).empty())
     return false;
@@ -3831,12 +4282,15 @@ std::string rr_queued_original(const std::string& h) {
   const std::string q=retrieve_d_custom(owner,"retrackers-queued").as_string();
   if(!active) {
     std::string t,i; const std::string done=retrieve_d_custom(owner,"retrackers-queue-finished").as_string();
+    // Finalized T/I proves this job's outcome; only a newer capsule journal
+    // (.benc, as in rr_finalize_cleanup) could own the fixed names again.
     if(rr_queue_valid(q) && rr_finalized_read(h,&t,&i) && done=="qd1:"+t+":"+i+":"+q.substr(68) && rpc::call_command_string("d.incarnation",target)==i &&
        !rr_journal_exists(h+".benc") && stop_intent::held(owner).empty() && retrieve_d_custom(owner,"retrackers-recovery").as_string().empty() && retrieve_d_custom(owner,"retrackers-recovery-ack").as_string().empty())
       return "finalized:"+t+":"+i+":"+rpc::call_command_string("d.local_id",target)+":"+q.substr(3,64)+":"+std::to_string(rpc::call_command_value("d.state",target))+":"+q.substr(68);
     return "none";
   }
-  if(rr_journal_exists(h+".benc") || rr_release_present(h) || rr_owner_hold_hashes.count(h) || !stop_intent::held(owner).empty()) return "held";
+  // Any capsule part is uncertain capture: answer held, as every guard refuses.
+  if(rr_capture_intent_present(h) || rr_release_present(h) || rr_owner_hold_hashes.count(h) || !stop_intent::held(owner).empty()) return "held";
   const std::string marker=rr_original_v2_marker(c);
   if(rpc::call_command_string("d.incarnation",target)!=c.incarnation || rpc::call_command_string("d.local_id",target)!=c.local_id || !rr_queue_valid(q) || q.substr(3,64)!=c.user_digest || q.substr(68)!=c.queue_token ||
      retrieve_d_custom(owner,"retrackers-recovery").as_string()!=marker || retrieve_d_custom(owner,"retrackers-recovery-ack").as_string()!=marker) return "held";
@@ -3922,7 +4376,7 @@ torrent::Object rr_preflight_stage(core::Download* owner, const torrent::Object:
   throw torrent::input_error("RR stage preflight descriptor proof is unavailable.");
 }
 
-torrent::Object rr_enqueue_original(core::Download* owner,const torrent::Object::list_type& args) {
+torrent::Object rr_enqueue_original_unchecked(core::Download* owner,const torrent::Object::list_type& args) {
   if(args.size()!=3 || !std::all_of(args.begin(),args.end(),[](const auto& a){return a.is_string();})) throw torrent::input_error("RR enqueue needs local ID, user digest and run bit.");
   const auto target=rpc::make_target(owner); const std::string h=rpc::call_command_string("d.hash",target),u=args[1].as_string(),run=args[2].as_string();
   if(args[0].as_string()!=rpc::call_command_string("d.local_id",target) || !rr_lower_hex(u,64) || (run!="0" && run!="1") || (rpc::call_command_value("d.state",target)!=0)!=(run=="1")) throw torrent::input_error("RR enqueue identity invalid.");
@@ -3933,20 +4387,58 @@ torrent::Object rr_enqueue_original(core::Download* owner,const torrent::Object:
     throw torrent::input_error("RR enqueue receipt ledger has wrong type.");
   std::string q=retrieve_d_custom(owner,"retrackers-queued").as_string(); RrOriginalClaim prior;
   if(q.empty()) {
-    if(rr_original_claim_read(h,&prior) || rr_journal_exists(h+".benc") || !retrieve_d_custom(owner,"retrackers-recovery").as_string().empty() || !retrieve_d_custom(owner,"retrackers-recovery-ack").as_string().empty()) throw torrent::input_error("RR enqueue prior authority must be retired.");
+    if(rr_original_claim_read(h,&prior) || rr_capture_intent_present(h) || !retrieve_d_custom(owner,"retrackers-recovery").as_string().empty() || !retrieve_d_custom(owner,"retrackers-recovery-ack").as_string().empty()) throw torrent::input_error("RR enqueue prior authority must be retired.");
     q="q1:"+u+":"+rr_original_mint_tx();
     auto& custom=owner->bencode()->get_key("rtorrent").insert_preserve_copy("custom",torrent::Object::create_map()).first->second;
+    // Q exists only once it is durable: a failed save restores these values.
+    std::vector<std::pair<std::string, std::optional<std::string>>> prior_values;
+    for (const char* key : {"retrackers-queued", "retrackers-queue-finished", "retrackers-retry"})
+      prior_values.emplace_back(key, custom.has_key_string(key) ?
+          std::optional<std::string>(custom.get_key_string(key)) : std::nullopt);
+    const std::string prior_message = owner->message();
     custom.insert_key("retrackers-queued",q); custom.insert_key("retrackers-queue-finished",std::string());
     custom.insert_key("retrackers-retry", std::string());
     if (owner->message() == rr_retry_exhausted_message) owner->set_message(std::string());
-    session_thread::manager()->save_full_download_durable(owner);
+    try {
+      session_thread::manager()->save_full_download_durable(owner);
+    } catch (...) {
+      for (const auto& [key, value] : prior_values) {
+        if (value) custom.insert_key(key, *value);
+        else custom.erase_key(key);
+      }
+      owner->set_message(prior_message);
+      throw;
+    }
   } else if(!rr_queue_valid(q) || q.substr(3,64)!=u) throw torrent::input_error("RR queue belongs to another owner.");
   // Requeue and its application pending receipt are one main-thread action.
   // Preserve hook receipts and publish the same value as the insert callback.
   if (receipts != ledger->end())
-    ledger->set_str_multi_key("rr.receipts.v1", "wp:" + args[0].as_string(), "1");
+    ledger->set_str_multi_key("rr.receipts.v1", core::retrackers_pending_receipt_key(args[0].as_string()),
+                              core::retrackers_pending_receipt_value);
   return rr_begin_original(owner,args);
 }
+
+constexpr const char* rr_enqueue_storage_refused_message =
+    "retrackers: enqueue refused: session-storage-failed; a later insert or recovery retries";
+
+// The insert hook runs enqueue through call_catch, which catches only input
+// errors: a storage error (EACCES, ENOSPC) escaping there would end the
+// daemon. Such a failure refuses the enqueue like any other refusal, visibly
+// in the error log and d.message; Q is not left behind half-published.
+torrent::Object rr_enqueue_original(core::Download* owner, const torrent::Object::list_type& args) {
+  try {
+    return rr_enqueue_original_unchecked(owner, args);
+  } catch (const torrent::input_error&) {
+    throw;
+  } catch (const torrent::local_error& e) {
+    const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
+    lt_log_print(torrent::LOG_ERROR, "RR enqueue refused: session-storage-failed: %s: %s",
+                 hash.c_str(), e.what());
+    owner->set_message(rr_enqueue_storage_refused_message);
+    throw torrent::input_error(std::string("RR enqueue refused: session-storage-failed: ") + e.what());
+  }
+}
+
 torrent::Object rr_finish_queued_original(core::Download* owner,const torrent::Object::list_type& args) {
   const auto target=rpc::make_target(owner); const std::string q=retrieve_d_custom(owner,"retrackers-queued").as_string(); RrOriginalClaim c;
   if(args.size()==2 && args[0].is_string() && args[1].is_string() && rr_queue_valid(q) && rr_original_claim_read(rpc::call_command_string("d.hash",target),&c) && c.tx==args[0].as_string() && c.incarnation==args[1].as_string() && q.substr(3,64)==c.user_digest) {
@@ -3956,33 +4448,24 @@ torrent::Object rr_finish_queued_original(core::Download* owner,const torrent::O
   }
   return rr_finish_original(owner,args);
 }
-bool rr_retry_valid(const std::string& retry, const std::string& queue_token) {
-  const std::string prefix = "r1:" + queue_token + ":";
-  if (retry.compare(0, prefix.size(), prefix) != 0 || retry.size() > 100) return false;
-  const size_t count = prefix.size(), due = count + 2;
-  if (retry.size() <= due || retry[count] < '1' || retry[count] > '6' || retry[count + 1] != ':')
-    return false;
-  const size_t end = retry.find(':', due);
-  if (end == std::string::npos || end == due || end - due > 10) return false;
-  const std::string when = retry.substr(due, end - due);
-  if (when.find_first_not_of("0123456789") != std::string::npos ||
-      (when.size() > 1 && when[0] == '0') || (retry[count] == '6') != (when == "0"))
-    return false;
-  const std::string reason = retry.substr(end + 1);
-  return reason == "capture-refused" || reason == "transport-unavailable" ||
-         reason == "source-not-ready" || reason == "preflight-refused";
-}
+// The exact expected and next retrackers-retry receipts of a deferral.
+struct RrRetryCas {
+  std::string expected;
+  std::string next;
+};
 
 // Retire only a proven uncaptured observation, while its durable Q stays owed.
 // No payload erase, completed-marker clearing or unknown ownership is allowed.
-torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object::list_type& args) {
-  if ((args.size() != 3 && args.size() != 5) || !std::all_of(args.begin(), args.end(), [](const auto& a) { return a.is_string(); }) ||
-      !rr_lower_hex(args[0].as_string(), 32) || !core::valid_incarnation(args[1].as_string()) ||
-      !rr_lower_hex(args[2].as_string(), 32))
-    throw torrent::input_error("RR original cancel needs exact transaction, incarnation and queue token.");
+// A deferral also publishes its retry CAS in the same durable release.
+torrent::Object rr_retire_uncaptured(core::Download* owner, const std::string& t,
+                                     const std::string& i, const std::string& q,
+                                     const RrRetryCas* retry) {
+  const char* operation = retry != nullptr ? "defer" : "cancel";
+  if (!rr_lower_hex(t, 32) || !core::valid_incarnation(i) || !rr_lower_hex(q, 32))
+    throw torrent::input_error(std::string("RR original ") + operation +
+                               " needs exact transaction, incarnation and queue token.");
   const auto target = rpc::make_target(owner);
   const std::string h = rpc::call_command_string("d.hash", target);
-  const std::string t = args[0].as_string(), i = args[1].as_string(), q = args[2].as_string();
   const std::string queued = retrieve_d_custom(owner, "retrackers-queued").as_string();
   RrOriginalClaim claim;
   if (!rr_queue_valid(queued) || queued.substr(68) != q ||
@@ -3991,44 +4474,150 @@ torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object:
       rpc::call_command_string("d.local_id", target) != claim.local_id ||
       retrieve_d_custom(owner, "retrackers-recovery").as_string() != rr_original_v2_marker(claim) ||
       retrieve_d_custom(owner, "retrackers-recovery-ack").as_string() != rr_original_v2_marker(claim))
-    throw torrent::input_error("RR original cancel preclaim authority changed.");
-  if (args.size() == 5 &&
-      (retrieve_d_custom(owner, "retrackers-retry").as_string() != args[3].as_string() ||
-       (!args[3].as_string().empty() && !rr_retry_valid(args[3].as_string(), q)) ||
-       !rr_retry_valid(args[4].as_string(), q)))
-    throw torrent::input_error("RR original cancel retry state changed or is invalid.");
-  if (args.size() == 5) {
-    const char prior_count = args[3].as_string().empty() ? '0' : args[3].as_string()[36];
-    if (prior_count >= '6' || args[4].as_string()[36] != prior_count + 1)
-      throw torrent::input_error("RR original cancel retry count must advance once.");
+    throw torrent::input_error(std::string("RR original ") + operation + " preclaim authority changed.");
+  core::RetrackersRetry next;
+  if (retry != nullptr) {
+    core::RetrackersRetry prior;
+    if (retrieve_d_custom(owner, "retrackers-retry").as_string() != retry->expected ||
+        (!retry->expected.empty() && !core::retrackers_retry_parse(retry->expected, q, &prior)) ||
+        !core::retrackers_retry_parse(retry->next, q, &next))
+      throw torrent::input_error("RR original defer retry state changed or is invalid.");
+    if (!core::retrackers_retry_transition_valid(retry->expected.empty() ? nullptr : &prior, next))
+      throw torrent::input_error("RR original defer retry count must advance once or wait.");
   }
   // Explicit refusals precede every mutation. Partial publication is uncertain
   // capture too; absence of only the final .benc cannot prove it uncaptured.
   if (rr_capture_intent_present(h) || rr_journal_exists(h + ".released.receipt") ||
       rr_release_present(h) || !stop_intent::held(owner).empty() || rr_owner_hold_hashes.count(h) ||
       !retrieve_d_custom(owner, "retrackers-queue-finished").as_string().empty())
-    throw torrent::input_error("RR original cancel is blocked by capture, release, lease or completion.");
+    throw torrent::input_error(std::string("RR original ") + operation +
+                               " is blocked by capture, release, lease or completion.");
   auto* storage = control->object_storage();
   const auto entry = storage->find(rpc::object_storage::key_type::from_c_str("rr.receipts.v1"));
   if (entry != storage->end() &&
       (!(entry->second.flags & rpc::object_storage::flag_multi_type) ||
        entry->second.object.has_key("wh:" + claim.local_id)))
-    throw torrent::input_error("RR original cancel hook or ledger is active.");
+    throw torrent::input_error(std::string("RR original ") + operation + " hook or ledger is active.");
   // Publish retry state in the same durable owner release as cancellation.
   // A dispatcher cannot observe retired authority with no backoff receipt.
-  if (args.size() == 5) {
-    owner->bencode()->get_key("rtorrent").get_key("custom").insert_key("retrackers-retry", args[4]);
-    if (args[4].as_string().compare(36, 4, "6:0:") == 0 && owner->message().empty())
+  auto& custom = owner->bencode()->get_key("rtorrent").get_key("custom");
+  const bool had_retry = custom.has_key("retrackers-retry");
+  const torrent::Object prior_retry = had_retry ? custom.get_key("retrackers-retry") : torrent::Object();
+  const std::string prior_message = owner->message();
+  if (retry != nullptr) {
+    custom.insert_key("retrackers-retry", retry->next);
+    // UI-only volatile status for direct message() readers such as ncurses;
+    // RPC d.message derives the same status from the durable retry and Q.
+    if (next.terminal() && owner->message().empty())
       owner->set_message(rr_retry_exhausted_message);
   }
   // The existing release path snapshots the live owner and durably hands
   // ownership to its ordinary session. It leaves Q unchanged and unfinished.
   torrent::Object::list_type finish{torrent::Object(t), torrent::Object(i)};
-  if (rr_finish_original(owner, finish, false).as_string() != "finalized")
-    throw torrent::input_error("RR original cancel retirement is unconfirmed.");
-  if (entry != storage->end()) storage->erase_str_multi_key("rr.receipts.v1", "wp:" + claim.local_id);
-  if (args.size() == 5 && rr_migration_test_cut("after-original-defer")) ::_exit(137);
+  try {
+    if (rr_finish_original(owner, finish, false).as_string() != "finalized")
+      throw torrent::input_error(std::string("RR original ") + operation + " retirement is unconfirmed.");
+  } catch (...) {
+    // Like the recovery markers restored inside rr_finish_original: before the
+    // release is durable, a failed retirement leaves the exact expected CAS
+    // state, so the same deferral succeeds once storage is repaired. After it,
+    // the released snapshot carries the published retry, which stays. Final
+    // cleanup prunes the release receipt only after the finalized receipt of
+    // this T/I is durable, so one of the two proves the release; a failure in
+    // that cleanup keeps the published retry. Unknown presence keeps it too.
+    bool released = true;
+    try {
+      std::string finalized_tx, finalized_incarnation;
+      released = rr_journal_exists(h + ".released.receipt") ||
+          (rr_finalized_read(h, &finalized_tx, &finalized_incarnation) &&
+           finalized_tx == t && finalized_incarnation == i);
+    } catch (...) {}
+    if (retry != nullptr && !released) {
+      if (had_retry) custom.insert_key("retrackers-retry", prior_retry);
+      else custom.erase_key("retrackers-retry");
+      owner->set_message(prior_message);
+    }
+    throw;
+  }
+  if (entry != storage->end())
+    storage->erase_str_multi_key("rr.receipts.v1", core::retrackers_pending_receipt_key(claim.local_id));
+  if (retry != nullptr && core::migration_test_cut("after-original-defer")) ::_exit(137);
   return std::string("cancelled");
+}
+
+// d.retrackers.cancel_original(H,T,I,Q) takes exactly three arguments.
+torrent::Object rr_cancel_original(core::Download* owner, const torrent::Object::list_type& args) {
+  if (args.size() != 3 || !std::all_of(args.begin(), args.end(), [](const auto& a) { return a.is_string(); }))
+    throw torrent::input_error("RR original cancel needs exact transaction, incarnation and queue token.");
+  return rr_retire_uncaptured(owner, args[0].as_string(), args[1].as_string(), args[2].as_string(), nullptr);
+}
+
+// d.retrackers.defer_original(H,T,I,Q,expected,retry) takes exactly five.
+torrent::Object rr_defer_original(core::Download* owner, const torrent::Object::list_type& args) {
+  if (args.size() != 5 || !std::all_of(args.begin(), args.end(), [](const auto& a) { return a.is_string(); }))
+    throw torrent::input_error("RR original defer needs transaction, incarnation, queue and retry CAS.");
+  const RrRetryCas retry{args[3].as_string(), args[4].as_string()};
+  return rr_retire_uncaptured(owner, args[0].as_string(), args[1].as_string(), args[2].as_string(), &retry);
+}
+
+// One pass of ruTorrent's plugins/retrackers/dispatch.php visits the queued
+// jobs (q1:<sha256(user)>:<qid>) of its user. It dequeues a finalized claim;
+// for a none or original claim whose retry receipt is empty or due, it
+// enqueues and starts a worker. A waiting (future due) or terminal job, a held
+// claim, an original claim whose worker is alive, a none claim under a
+// file-operation stop lease (enqueue is refused) and any job when all worker
+// slots are busy give it nothing to do; dequeue needs no slot. It also reports
+// anomalies: a malformed Q of any user, an invalid retry, recovery markers on
+// a none claim, an unreadable claim. Its log keeps one line per reason a
+// minute, so a pass for them alone runs at most once a minute. Recomputed on
+// every call; when in doubt, the pass runs.
+enum class RrDispatchNeed { none, anomaly, work };
+std::map<std::string, std::chrono::steady_clock::time_point> rr_dispatch_anomaly_passes;
+
+RrDispatchNeed rr_dispatch_need(const std::string& user_digest) {
+  auto need = RrDispatchNeed::none;
+  const auto now = static_cast<uint64_t>(std::max<time_t>(::time(nullptr), 0));
+  const bool worker_slot = core::retrackers_process_pool::worker_slot_free();
+  for (const auto& entry : *control->core()->download_list()) {
+    core::Download* owner = entry.get();
+    const std::string q = retrieve_d_custom(owner, "retrackers-queued").as_string();
+    if (q.empty()) continue;
+    if (!rr_queue_valid(q)) { need = RrDispatchNeed::anomaly; continue; }
+    if (q.compare(3, 64, user_digest) != 0) continue;
+    const std::string retry = retrieve_d_custom(owner, "retrackers-retry").as_string();
+    core::RetrackersRetry parsed;
+    const bool retry_valid = retry.empty() || core::retrackers_retry_parse(retry, q.substr(68), &parsed);
+    const bool retry_blocks = !retry.empty() && retry_valid && (parsed.terminal() || parsed.due > now);
+    // Without its completion marker the claim cannot be finalized, so a
+    // waiting or terminal job needs no claim probe (journal I/O) this tick;
+    // an unreadable claim of such a job is reported once it is due.
+    if (retry_blocks && retrieve_d_custom(owner, "retrackers-queue-finished").as_string().empty())
+      continue;
+    const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
+    std::string claim;
+    try { claim = rr_queued_original(hash); }
+    catch (const std::exception&) { need = RrDispatchNeed::anomaly; continue; }
+    if (claim.compare(0, 10, "finalized:") == 0) return RrDispatchNeed::work;
+    if (claim == "held") continue;
+    const bool original = claim.size() > 75 && claim.compare(0, 9, "original:") == 0;
+    if (claim != "none" && !original) { need = RrDispatchNeed::anomaly; continue; }
+    if (!retry_valid) { need = RrDispatchNeed::anomaly; continue; }
+    if (retry_blocks) continue; // Terminal or waiting.
+    if (!original) {
+      if (!retrieve_d_custom(owner, "retrackers-recovery").as_string().empty() ||
+          !retrieve_d_custom(owner, "retrackers-recovery-ack").as_string().empty()) {
+        need = RrDispatchNeed::anomaly;
+        continue;
+      }
+      if (!stop_intent::held(owner).empty()) continue; // Enqueue waits for the lease.
+      if (worker_slot) return RrDispatchNeed::work;
+      continue;
+    }
+    if (worker_slot &&
+        !core::retrackers_process_pool::active(rr_worker_identity(hash, claim.substr(9, 32), claim.substr(42, 32))))
+      return RrDispatchNeed::work;
+  }
+  return need;
 }
 
 torrent::Object rr_dequeue_original(core::Download* owner,const torrent::Object::list_type& args) {
@@ -4037,17 +4626,19 @@ torrent::Object rr_dequeue_original(core::Download* owner,const torrent::Object:
   if(!rr_lower_hex(args[0].as_string(),32) || !core::valid_incarnation(args[1].as_string()) || !rr_lower_hex(args[2].as_string(),32) || !rr_queue_valid(q) || q.substr(68)!=args[2].as_string() ||
      rr_queued_original(h).compare(0,76,"finalized:"+args[0].as_string()+":"+args[1].as_string()+":")!=0) throw torrent::input_error("RR dequeue finalized authority changed.");
   auto& custom=owner->bencode()->get_key("rtorrent").get_key("custom");custom.insert_key("retrackers-queued",std::string());custom.insert_key("retrackers-queue-finished",std::string());
+  // A completed job owes nothing: a wait it went through leaves no receipt.
+  custom.insert_key("retrackers-retry",std::string());
+  if(owner->message()==rr_retry_exhausted_message) owner->set_message(std::string());
   session_thread::manager()->save_full_download_durable(owner);return std::string("dequeued");
 }
 }
 
-bool retrackers_migration_cancel_uncaptured_for_erase(core::Download* owner) {
+bool retrackers_migration_cancel_queued_original(core::Download* owner) {
   const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
   RrOriginalClaim claim;
   if (!rr_original_claim_read(hash, &claim) || claim.queue_token.empty()) return false;
-  torrent::Object::list_type args{torrent::Object(claim.tx), torrent::Object(claim.incarnation),
-                                torrent::Object(claim.queue_token)};
-  return rr_cancel_original(owner, args).as_string() == "cancelled";
+  rr_retire_uncaptured(owner, claim.tx, claim.incarnation, claim.queue_token, nullptr);
+  return true;
 }
 
 void
@@ -4056,10 +4647,9 @@ initialize_command_download() {
   CMD2_DL_LIST("d.retrackers.enqueue_original",rr_enqueue_original);
   CMD2_DL_LIST("d.retrackers.dequeue_original",rr_dequeue_original);
   CMD2_DL_LIST("d.retrackers.cancel_original", rr_cancel_original);
-  CMD2_DL_LIST("d.retrackers.defer_original", [](core::Download* owner, const torrent::Object::list_type& args) {
-    if (args.size() != 5) throw torrent::input_error("RR original defer needs transaction, incarnation, queue and retry CAS.");
-    return rr_cancel_original(owner, args);
-  });
+  CMD2_DL_LIST("d.retrackers.defer_original", rr_defer_original);
+  // Capability: defer_original accepts a same-count wait for a wait reason.
+  CMD2_ANY("system.retrackers.retry_waits", [](auto, auto) { return int64_t(1); });
   CMD2_ANY_STRING("system.retrackers.original_claim",[](auto,const auto& h){return rr_queued_original(h);});
   CMD2_ANY_LIST("system.retrackers.worker_start",[](auto,const torrent::Object::list_type& a){
     if(a.size()!=4 || !std::all_of(a.begin(),a.end(),[](const auto& v){return v.is_string();})) throw torrent::input_error("RR worker needs hash, transaction, incarnation and user.");
@@ -4073,13 +4663,25 @@ initialize_command_download() {
     if(rr_queued_original(h).compare(0,75,"original:"+t+":"+i+":")!=0) return std::string("held");
     RrOriginalClaim c;
     if(!rr_original_claim_read(h,&c) || c.user_digest!=rr_user_digest(user) || !rr_profile_allows_worker(c.user_digest)) return std::string("held");
-    return core::retrackers_process_pool::launch(identity,{core::retrackers_process_pool::php_executable,core::retrackers_process_pool::application_root+"/plugins/retrackers/update.php",h,user,rr_original_v2_marker(c),i},false);
+    const std::string result=core::retrackers_process_pool::launch(identity,{core::retrackers_process_pool::php_executable,core::retrackers_process_pool::application_root+"/plugins/retrackers/update.php",h,user,rr_original_v2_marker(c),i},false);
+    if(result=="spawned") rr_watch_workers_schedule();
+    return result;
   });
   CMD2_ANY_LIST("system.retrackers.dispatcher_start",[](auto,const torrent::Object::list_type& a){
     if(a.size()!=1 || !a[0].is_string() || a[0].as_string().size()>128 || a[0].as_string().find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_-")!=std::string::npos) throw torrent::input_error("RR dispatcher user invalid.");
     const std::string user=a[0].as_string();
-    if(!rr_profile_allows_worker(rr_user_digest(user))) return std::string("held");
-    return core::retrackers_process_pool::launch("dispatcher:"+user,{core::retrackers_process_pool::php_executable,core::retrackers_process_pool::application_root+"/plugins/retrackers/dispatch.php",user},true);
+    const std::string digest=rr_user_digest(user);
+    if(!rr_profile_allows_worker(digest)) return std::string("held");
+    // The 1 s schedule calls this every tick; launch PHP only for work.
+    const auto need=rr_dispatch_need(digest);
+    if(need==RrDispatchNeed::none) return std::string("idle");
+    const auto now=std::chrono::steady_clock::now();
+    const auto last=rr_dispatch_anomaly_passes.find(digest);
+    if(need==RrDispatchNeed::anomaly && last!=rr_dispatch_anomaly_passes.end() &&
+       now-last->second<std::chrono::seconds(60)) return std::string("idle");
+    const std::string result=core::retrackers_process_pool::launch("dispatcher:"+user,{core::retrackers_process_pool::php_executable,core::retrackers_process_pool::application_root+"/plugins/retrackers/dispatch.php",user},true);
+    if(need==RrDispatchNeed::anomaly && result=="spawned") rr_dispatch_anomaly_passes[digest]=now;
+    return result;
   });
   CMD2_ANY_STRING("system.retrackers.queue_cursor",[](auto,const auto& u){if(!rr_lower_hex(u,64)) throw torrent::input_error("RR cursor user invalid.");return rr_queue_cursors[u];});
   CMD2_ANY_LIST("system.retrackers.queue_cursor.set",[](auto,const torrent::Object::list_type& a){if(a.size()!=2 || !a[0].is_string() || !a[1].is_string() || !rr_lower_hex(a[0].as_string(),64) || (!a[1].as_string().empty() && !stop_intent::valid_hash(a[1].as_string()))) throw torrent::input_error("RR cursor identity invalid.");return rr_queue_cursors[a[0].as_string()]=a[1].as_string();});
@@ -4513,8 +5115,9 @@ initialize_command_download() {
     // Tracker success clears the volatile message; exact durable Q still owns
     // an exhausted retry after that callback and after a cold restart.
     // Our own volatile status is derived too: clearing retry/Q clears its view.
-    if (rr_queue_valid(queue) && rr_retry_valid(retry, queue.substr(68)) &&
-        retry.compare(36, 4, "6:0:") == 0) return std::string(rr_retry_exhausted_message);
+    core::RetrackersRetry parsed;
+    if (rr_queue_valid(queue) && core::retrackers_retry_parse(retry, queue.substr(68), &parsed) &&
+        parsed.terminal()) return std::string(rr_retry_exhausted_message);
     return std::string();
   });
   CMD2_DL_STRING_V("d.message.set", std::bind(&core::Download::set_message, std::placeholders::_1, std::placeholders::_2));

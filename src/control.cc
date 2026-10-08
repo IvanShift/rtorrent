@@ -1,12 +1,8 @@
 #include "config.h"
 
 #include "control.h"
-#include "core/retrackers_process_pool.h"
 
 #include <unistd.h>
-#include <cstdlib>
-#include <cstring>
-#include "core/download_list.h"
 #include <sys/stat.h>
 #include <torrent/net/http_stack.h>
 #include <torrent/runtime/network_manager.h>
@@ -14,8 +10,12 @@
 #include <torrent/utils/directory_events.h>
 
 #include "core/dht_manager.h"
+#include "core/download_list.h"
 #include "core/http_queue.h"
 #include "core/manager.h"
+#include "core/migration_test_cut.h"
+#include "core/retrackers_migration_pending.h"
+#include "core/retrackers_process_pool.h"
 #include "core/view_manager.h"
 #include "display/canvas.h"
 #include "display/window.h"
@@ -84,7 +84,11 @@ Control::initialize() {
 
 void
 Control::cleanup() {
+  // Shutdown kills live workers; their transactions are left to startup.
+  retrackers_migration_stop_worker_watch();
   core::retrackers_process_pool::shutdown();
+  // Unschedule and run a pending tombstone batch while commands still work.
+  retrackers_migration_flush_erased_owners();
   rpc::rpc.cleanup();
 
   torrent::this_thread::scheduler()->erase(&m_task_shutdown);
@@ -145,13 +149,14 @@ Control::handle_shutdown() {
 
   if (!m_shutdown_session_saved) {
     // Persist user state before stopped announces can consume the stop timeout.
+    // The docker-rutorrent rc hook may already have run session.save= in the
+    // shutdown event above; it remains for 0.9.8 and unpatched daemons. Its
+    // resume builds are still pending here, so this call queues none again and
+    // the flush writes each download once.
     m_core->download_list()->session_save();
     session_thread::manager()->flush_shutdown_saves();
     m_shutdown_session_saved = true;
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
-    const char* cut = ::getenv("RR_MIG_TEST_CUT");
-    if (cut && std::strcmp(cut, "after-shutdown-session-save") == 0) ::_exit(137);
-#endif
+    if (core::migration_test_cut("after-shutdown-session-save")) ::_exit(137);
   }
 
   if (!m_shutdown_quick) {

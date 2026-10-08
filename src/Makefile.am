@@ -17,9 +17,11 @@ libsub_root_a_SOURCES = \
 	core/http_queue.h \
 	core/incarnation.h \
 	core/manager.cc \
+	core/migration_test_cut.h \
 	core/retrackers_migration_creation.h \
 	core/retrackers_migration_limits.h \
 	core/retrackers_migration_pending.h \
+	core/retrackers_queue_receipts.h \
 	core/manager.h \
 	core/view.cc \
 	core/view.h \

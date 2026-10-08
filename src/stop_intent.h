@@ -12,9 +12,6 @@
 #include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef __linux__
-#include <sys/syscall.h>
-#endif
 #include <torrent/exceptions.h>
 #include <torrent/utils/log.h>
 #include "control.h"
@@ -492,17 +489,12 @@ inline Lease finish_claim(core::Download* download, const std::string& expected,
 }
 
 inline void publish_claim_file(int directory, const std::string& staging, const std::string& name) {
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
-  const char* cut = ::getenv("RR_MIG_TEST_CUT");
-  if (cut && std::strcmp(cut, "before-stop-claim-publication") == 0) ::_exit(137);
-#endif
+  if (core::migration_test_cut("before-stop-claim-publication")) ::_exit(137);
   if (core::rename_session_entry_noreplace(directory, staging, name) != 0)
     throw std::runtime_error("cannot exclusively publish stop claim receipt: " + std::string(std::strerror(errno)));
   if (::fsync(directory) != 0)
     throw std::runtime_error("cannot durably publish stop claim receipt");
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
-  if (cut && std::strcmp(cut, "after-stop-claim-publication") == 0) ::_exit(137);
-#endif
+  if (core::migration_test_cut("after-stop-claim-publication")) ::_exit(137);
 }
 
 inline Lease create_lease(core::Download* download, const std::string& stop_token,

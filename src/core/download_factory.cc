@@ -496,6 +496,13 @@ DownloadFactory::receive_success() {
     bool session_event_ready = true;
     if (m_session) {
       session_event_ready = retrackers_migration_repair_prepared_loaded(download);
+      // A completed same-hash release retires the reservation. The restored
+      // owner then gets the ordinary session event, which starts a saved
+      // started download; skipping it left state=1 but closed and inactive.
+      if (session_event_ready && !rr_target_source.empty()) {
+        try { rr_target_source = retrackers_migration_target_source(rr_hash); }
+        catch (const torrent::input_error&) { /* Unknown: keep the event withheld. */ }
+      }
       if (session_event_ready) {
         try {
           const auto claim = stop_intent::lease(download);

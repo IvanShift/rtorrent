@@ -84,7 +84,7 @@ private:
 
   void                process_pending_builds(bool is_flushing);
   void                process_save_request();
-  void                process_next_save_request_unsafe();
+  bool                process_next_save_request_unsafe();
   void                process_finished_saves();
 
   // Requires a higher number of open sockets, and should only be used during shutdown.
@@ -94,6 +94,10 @@ private:
   bool                remove_completely_unsafe(core::Download* download, std::unique_lock<std::mutex>& lock);
 
   using ProcessingSave = std::pair<std::future<void>, SaveRequest>;
+
+  bool                consume_finished_save_unsafe(ProcessingSave& request);
+  bool                report_storage_error_unsafe(const std::string& what);
+  bool                redirect_late_save(core::Download* download);
 
   torrent::system::Thread*     m_thread;
   torrent::system::callback_id m_callback_id;

@@ -79,6 +79,8 @@ rtorrent_Test_Src_SOURCES = $(rtorrent_Test_Common) \
 	src/test_download_list.h \
 	src/test_input_path_input.cc \
 	src/test_input_path_input.h \
+	src/test_retrackers_queue_receipts.cc \
+	src/test_retrackers_queue_receipts.h \
 	src/test_session_commit.cc \
 	src/test_session_commit.h \
 	src/test_stop_intent_permissions.cc \

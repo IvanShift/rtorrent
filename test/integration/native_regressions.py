@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """Run native review regressions against exact locally built daemon bytes.
 
-Usage: native_regressions.py BUILDER_IMAGE BUILD_TREE SCRATCH [CASE ...]
+Usage: native_regressions.py [OPTION ...] BUILDER_IMAGE BUILD_TREE SCRATCH [CASE ...]
 The image must supply the matching libtorrent ABI and a C++ compiler. Each case
 runs in a disposable network-isolated container; no public trackers are used.
+
+Without CASE arguments every case that needs no test cut runs. Options:
+  --cuts          also run the cases that need a build configured with
+                  --enable-rr-migration-test-cuts (the CUTS table below)
+  --ninep         emulate WSL drvfs over 9p: a seccomp profile makes every
+                  flagged renameat2 fail with EINVAL
+  --prefix=NAME   container name prefix (default rr-remediation-)
+  --label=K=V     extra container label; may repeat
 """
+import datetime
 import hashlib
+import json
 import os
+import re
 import pathlib
 import socket
 import subprocess
@@ -31,19 +42,40 @@ def docker(*args, check=True):
     return subprocess.run(['docker', *args], check=check, capture_output=True, text=True, timeout=65)
 
 
+SETTINGS = {'prefix': 'rr-remediation-', 'labels': [], 'seccomp': ''}
+# The one list of cases that need a test-cut build, with the RR_MIG_TEST_CUT
+# each sets. Only --cuts (or naming the case) runs them.
+CUTS = {'owner-cut-before': 'before-owner-ordinary',
+        'owner-cut-after': 'after-owner-ordinary',
+        'owner-cut-retry': 'before-owner-ordinary-throw',
+        'shutdown-early-save': 'after-shutdown-session-save',
+        'shutdown-hook-save': 'after-shutdown-session-save',
+        'captured-remove': 'after-capture-intent-throw',
+        'defer-crash': 'after-original-defer',
+        'owner-tombstone-cut': 'after-owner-tombstone-receipts',
+        'defer-late-failure-cut': 'after-finalize-prune-throw',
+        'capture-crash-intent': 'after-capture-intent',
+        'capture-crash-quiesced': 'after-capture-quiesced',
+        'session-save-overlap-held': 'slow-session-save',
+        **{'rename-' + error: 'rename-noreplace-' + error
+           for error in ('einval', 'enosys', 'eopnotsupp')}}
+# Flagged renameat2 fails with EINVAL, as WSL drvfs over 9p answers it.
+NINEP_SECCOMP = {'defaultAction': 'SCMP_ACT_ALLOW', 'syscalls': [{
+    'names': ['renameat2'], 'action': 'SCMP_ACT_ERRNO', 'errnoRet': 22,
+    'args': [{'index': 4, 'value': 0, 'op': 'SCMP_CMP_NE'}]}]}
+
+
+def container_options():
+    return [option for label in SETTINGS['labels'] for option in ('--label', label)]
+
+
 class Daemon:
     def __init__(self, image, tree, scratch, case):
         self.image, self.tree = image, pathlib.Path(tree).resolve()
-        self.name = 'rr-remediation-' + uuid.uuid4().hex[:12]
-        self.cut = {'owner-cut-before': 'before-owner-ordinary',
-                    'owner-cut-after': 'after-owner-ordinary',
-                    'owner-cut-retry': 'before-owner-ordinary-throw',
-                    'shutdown-early-save': 'after-shutdown-session-save',
-                    'shutdown-hook-save': 'after-shutdown-session-save',
-                    'captured-remove': 'after-capture-intent-throw',
-                    'defer-crash': 'after-original-defer',
-                    **{'rename-' + error: 'rename-noreplace-' + error
-                       for error in ('einval', 'enosys', 'eopnotsupp')}}.get(case, '')
+        self.name = SETTINGS['prefix'] + uuid.uuid4().hex[:12]
+        self.cut = CUTS.get(case, '')
+        self.environment = {}
+        self.options = []  # Extra docker run options, such as a tmpfs session.
         self.directory = pathlib.Path(scratch).resolve() / (case + '-' + uuid.uuid4().hex[:8])
         self.directory.mkdir(mode=0o755, parents=True)
         self.session = self.directory / '.session'
@@ -61,14 +93,21 @@ class Daemon:
             'log.add_output="torrent_error","native"', 'log.add_output="warn","native"', '']))
 
     def start(self):
+        self.run()
+        self.wait(lambda: self.call('system.pid') > 0, 'SCGI readiness')
+
+    def run(self):
         self.socket.unlink(missing_ok=True)
         (self.session / 'rtorrent.lock').unlink(missing_ok=True)
+        seccomp = ['--security-opt', 'seccomp=' + SETTINGS['seccomp']] if SETTINGS['seccomp'] else []
         docker('run', '-d', '--pull=never', '--name', self.name, '--network', 'none',
+               *container_options(), *seccomp,
                '--stop-timeout', '60', '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'HOME=/tmp',
                '-e', 'RR_MIG_TEST_CUT=' + self.cut,
+               *[option for key, value in self.environment.items() for option in ('-e', key + '=' + value)],
+               *self.options,
                '-v', str(self.tree) + ':/w:ro', '-v', str(self.directory) + ':/data',
                '--entrypoint', '/w/src/rtorrent', self.image, '-n', '-o', 'import=/data/test.rc')
-        self.wait(lambda: self.call('system.pid') > 0, 'SCGI readiness')
 
     def stop(self, kill=False):
         result = docker('kill' if kill else 'stop', *([] if kill else ['-t', '60']), self.name)
@@ -157,6 +196,7 @@ def claim_finish(daemon):
 
 def owner_finalize(daemon):
     hash_ = daemon.fixture('owner-finalize')
+    raw = (daemon.directory / 'owner-finalize.torrent').read_bytes()
     tx, incarnation = daemon.begin(hash_)
     assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
     pointer = daemon.session / '.retrackers-migration' / (hash_ + '.owner.current')
@@ -170,17 +210,118 @@ def owner_finalize(daemon):
     assert daemon.call('d.custom', hash_, 'after-finalize') == 'kept'
     assert pointer.read_text().startswith('ordinary:')
     daemon.call('d.erase', hash_)
+    # A batch shortly after the erase retires the owner's tombstone and
+    # finalized receipt once the ordinary triple is durably gone, so erased
+    # hashes do not accumulate.
+    journal = daemon.session / '.retrackers-migration'
+    try:
+        daemon.wait(lambda: not any(x.name.startswith(hash_) for x in journal.iterdir()),
+                    'erased owner retirement batch', timeout=10)
+    except AssertionError:
+        left = sorted(x.name for x in journal.iterdir() if x.name.startswith(hash_))
+        raise AssertionError('erased owner state kept: ' + repr(left))
+    assert not (daemon.session / '.rutorrent-stop-intents' / hash_).exists(), 'stop intent kept'
     daemon.stop()
     daemon.start()
     assert not daemon.call('d.multicall2', '', 'main', 'd.hash='), 'retired owner resurrected'
+    # The same metainfo can return and finish a fresh claim.
+    daemon.call('load.raw_start', '', xmlrpc.client.Binary(raw))
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_, 're-added owner')
+    tx, incarnation = daemon.begin(hash_)
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    assert pointer.read_text().startswith('ordinary:'), pointer.read_text()
+
+
+def startup_hold_visible(daemon):
+    # A daemon without a UI shows only its log files: a startup hold names its
+    # hash and reason in the error log, not just in the UI log buffer.
+    hash_ = daemon.fixture('startup-hold')
+    tx, incarnation = daemon.begin(hash_)
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    daemon.stop()
+    receipt = daemon.session / '.retrackers-migration' / (hash_ + '.finalized.receipt')
+    receipt.write_text('finalized:malformed\n')
+    daemon.start()
+    log = (daemon.directory / 'native.log').read_text()
+    assert 'RR finalized owner held: ' + hash_ + ': ' in log, log[-2000:]
+
+
+def owner_tombstone_cut(daemon):
+    # A crash after the finalized receipt went, before the tombstone did,
+    # leaves a tombstone alone; the next startup completes the retirement.
+    hash_ = daemon.fixture('owner-tombstone')
+    tx, incarnation = daemon.begin(hash_)
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    journal = daemon.session / '.retrackers-migration'
+    pointer = journal / (hash_ + '.owner.current')
+    receipt = journal / (hash_ + '.finalized.receipt')
+    try:
+        daemon.call('d.erase', hash_)
+    except (OSError, RuntimeError):
+        pass
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                'tombstone retirement cut')
+    assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '137'
+    docker('rm', daemon.name)
+    assert not receipt.exists() and pointer.read_text().startswith('retired:')
+    daemon.cut = ''
+    daemon.start()
+    assert not daemon.call('d.multicall2', '', 'main', 'd.hash='), 'retired owner resurrected'
+    left = sorted(x.name for x in journal.iterdir() if x.name.startswith(hash_))
+    assert not left, 'interrupted tombstone retirement left: ' + repr(left)
+    assert daemon.call('system.retrackers.status', '', hash_) == 'none'
+
+
+def owner_tombstone_startup(daemon):
+    # Tombstones that older daemons left for erased owners, and pointers of
+    # ordinary owners without a triple, are retired at startup; a tombstone
+    # whose hash another journal entry still names stays.
+    journal = daemon.session / '.retrackers-migration'
+    daemon.stop()
+
+    def tombstone(hash_, extra=None):
+        incarnation, tx = uuid.uuid4().hex, uuid.uuid4().hex
+        files = {hash_ + '.owner.current': f'retired:{hash_}:{incarnation}\n',
+                 hash_ + '.owner.' + incarnation + '.late.receipt': 'stale backup\n'}
+        if extra:
+            files[hash_ + extra[0]] = extra[1]
+        else:
+            files[hash_ + '.finalized.receipt'] = f'finalized:{hash_}:{tx}:{incarnation}\n'
+        for name, text in files.items():
+            (journal / name).write_text(text)
+            (journal / name).chmod(0o600)
+        return sorted(files)
+
+    erased = [hashlib.sha1(str(index).encode()).hexdigest().upper() for index in range(3)]
+    for hash_ in erased:
+        tombstone(hash_)
+    # An ordinary owner whose triple is gone is not loaded and owes nothing.
+    orphan = hashlib.sha1(b'orphan').hexdigest().upper()
+    for name in tombstone(orphan):
+        if name.endswith('.owner.current'):
+            text = (journal / name).read_text().replace('retired:', 'ordinary:', 1)
+            (journal / name).write_text(text)
+    erased.append(orphan)
+    # A successor reservation still names this hash: its tombstone stays.
+    kept_hash = hashlib.sha1(b'kept').hexdigest().upper()
+    kept = tombstone(kept_hash, ('.target', erased[0] + '\n'))
+    daemon.start()
+    left = sorted(x.name for x in journal.iterdir() if x.name[:40] in erased)
+    assert not left, 'erased owner tombstones survived startup: ' + repr(left)
+    assert sorted(x.name for x in journal.iterdir() if x.name.startswith(kept_hash)) == kept
+
+
+def compile_fixture(daemon, source, output, libraries=''):
+    path = pathlib.Path(__file__).with_name(source)
+    docker('run', '--rm', '--pull=never', '--network', 'none',
+           '--name', SETTINGS['prefix'] + 'compile-' + uuid.uuid4().hex[:8], *container_options(),
+           '--user', f'{os.getuid()}:{os.getgid()}', '-v', str(path) + ':/fixture.cc:ro',
+           '-v', str(daemon.directory) + ':/data', '--entrypoint', '/bin/sh', daemon.image,
+           '-c', 'g++ -std=c++20 -Wall -Wextra -Werror /fixture.cc ' + libraries + ' -o /data/' + output)
 
 
 def compile_peer(daemon):
-    peer_source = pathlib.Path(__file__).with_name('metadata-peer.cc')
-    docker('run', '--rm', '--pull=never', '--network', 'none',
-           '--user', f'{os.getuid()}:{os.getgid()}', '-v', str(peer_source) + ':/peer.cc:ro',
-           '-v', str(daemon.directory) + ':/data', '--entrypoint', '/bin/sh', daemon.image,
-           '-c', 'g++ -std=c++20 -Wall -Wextra -Werror /peer.cc -lcrypto -o /data/metadata-peer')
+    compile_fixture(daemon, 'metadata-peer.cc', 'metadata-peer', '-lcrypto')
 
 
 def metadata_start(daemon):
@@ -399,6 +540,13 @@ def rename_fallback(daemon):
         assert (journal / (hash_ + suffix)).stat().st_nlink == 1
     assert daemon.call('d.hash', unrelated) == unrelated
     assert daemon.session.stat().st_mode & 0o7777 == 0o2700
+    # Seven publications above; the classified fallback report appears once.
+    reports = [line for line in (daemon.directory / 'native.log').read_text().splitlines()
+               if 'checked rename fallback' in line]
+    fallback = bool(daemon.cut) or bool(SETTINGS['seccomp'])
+    assert len(reports) == (1 if fallback else 0), reports
+    if fallback:
+        assert reports[0].endswith('reported once per process'), reports
 
 
 def uncaptured_remove(daemon):
@@ -473,6 +621,46 @@ def retry_cancel(daemon):
     daemon.call('d.erase', hash_)
 
 
+def retry_wait(daemon):
+    # Temporary unreadiness is a wait: a wait reason may keep the attempt count
+    # with a future due. Counted reasons, the +1 step of applications without
+    # waits, and the terminal sixth attempt keep their rules.
+    assert daemon.call('system.retrackers.retry_waits', '') == 1
+    assert 'system.retrackers.retry_waits' in daemon.call('system.listMethods')
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('retry-wait', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    later = lambda seconds=60: int(time.time()) + seconds
+
+    def defer(expected, new):
+        return daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue, expected, new)
+
+    previous = f'r1:{queue}:1:{later()}:transport-unavailable'
+    assert defer('', previous) == 'cancelled'
+    for reason in ('source-not-ready', 'transport-unavailable'):
+        local, marker, tx, incarnation, _ = enqueue(daemon, hash_)
+        wait = f'r1:{queue}:1:{later(90)}:{reason}'
+        assert defer(previous, wait) == 'cancelled', 'wait refused: ' + reason
+        assert daemon.call('d.custom', hash_, 'retrackers-retry') == wait
+        previous = wait
+    local, marker, tx, incarnation, _ = enqueue(daemon, hash_)
+    for reason in ('capture-refused', 'preflight-refused'):
+        expect_fault(lambda: defer(previous, f'r1:{queue}:1:{later(120)}:{reason}'), 'advance once or wait')
+    expect_fault(lambda: defer(previous, f'r1:{queue}:1:0:source-not-ready'), 'retry state')
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == previous
+    for count in range(2, 7):
+        if count > 2:
+            local, marker, tx, incarnation, _ = enqueue(daemon, hash_)
+        new = f'r1:{queue}:{count}:{0 if count == 6 else later()}:capture-refused'
+        assert defer(previous, new) == 'cancelled', 'counted step refused at ' + str(count)
+        previous = new
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+    local, marker, tx, incarnation, _ = enqueue(daemon, hash_)
+    expect_fault(lambda: defer(previous, f'r1:{queue}:6:{later()}:source-not-ready'), 'retry state')
+    expect_fault(lambda: defer(previous, f'r1:{queue}:5:{later()}:source-not-ready'), 'advance once or wait')
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == previous
+
+
 def retry_new_queue(daemon):
     hash_ = daemon.fixture('retry-new-queue', start=False)
     stale = 'r1:' + 'f' * 32 + ':6:0:source-not-ready'
@@ -498,9 +686,17 @@ def captured_remove(daemon):
     expect_fault(lambda: daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_,
                                     tx, '0' * 64), 'captured intent held')
     retry = f'r1:{queue}:1:{int(time.time()) + 60}:capture-refused'
+    # cancel_original keeps exactly three arguments; a retry CAS is defer_original.
     expect_fault(lambda: daemon.call('d.retrackers.cancel_original', hash_, tx, incarnation,
-                                    queue, '', retry), 'blocked by capture')
-    expect_fault(lambda: daemon.call('d.erase', hash_), 'blocked by capture')
+                                    queue, '', retry), 'needs exact transaction')
+    expect_fault(lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation,
+                                    queue), 'defer needs')
+    expect_fault(lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation,
+                                    queue, '', retry), 'RR original defer is blocked by capture')
+    expect_fault(lambda: daemon.call('d.retrackers.cancel_original', hash_, tx, incarnation,
+                                    queue), 'RR original cancel is blocked by capture')
+    expect_fault(lambda: daemon.call('d.erase', hash_),
+                 'RR original claim blocks direct erase: RR original cancel is blocked by capture')
     assert daemon.call('d.custom', hash_, 'retrackers-retry') == ''
     assert daemon.call('d.hash', hash_) == hash_
     assert daemon.call('d.custom', hash_, 'retrackers-recovery') == marker
@@ -510,20 +706,62 @@ def captured_remove(daemon):
 def partial_capture_remove(daemon):
     hash_ = daemon.fixture('partial-capture-remove')
     local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
-    partial = daemon.session / '.retrackers-migration' / (hash_ + '.rollback.torrent')
+    journal = daemon.session / '.retrackers-migration'
+    partial = journal / (hash_ + '.rollback.torrent')
     partial.write_bytes(b'partial captured snapshot')
     partial.chmod(0o600)
+    # The dispatcher status agrees with every guard: partial publication is held.
+    status = daemon.call('system.retrackers.original_claim', '', hash_)
+    assert status == 'held', 'partial publication reported as ' + status[:9]
+    before = sorted(x.name for x in journal.iterdir())
+    expect_fault(lambda: daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_,
+                                    tx, '0' * 64), 'blocked by an existing capture')
+    assert sorted(x.name for x in journal.iterdir()) == before, 'refused capture changed the journal'
     retry = f'r1:{queue}:1:{int(time.time()) + 60}:capture-refused'
     expect_fault(lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation,
                                     queue, '', retry), 'blocked by capture')
     expect_fault(lambda: daemon.call('d.retrackers.finish_original', hash_, tx, incarnation),
                  'blocked by capture')
-    expect_fault(lambda: daemon.call('d.erase', hash_), 'blocked by capture')
+    expect_fault(lambda: daemon.call('d.erase', hash_),
+                 'RR original claim blocks direct erase: RR original cancel is blocked by capture')
     assert daemon.call('d.custom', hash_, 'retrackers-retry') == ''
     assert partial.read_bytes() == b'partial captured snapshot'
     assert daemon.call('d.hash', hash_) == hash_
     assert daemon.call('d.custom', hash_, 'retrackers-recovery') == marker
+    # A capsule part without any claim refuses a new queued claim too.
+    other = daemon.fixture('partial-capture-enqueue')
+    orphan = journal / (other + '.backup.benc')
+    orphan.write_bytes(b'orphan capsule part')
+    orphan.chmod(0o600)
+    expect_fault(lambda: enqueue(daemon, other), 'prior authority must be retired')
+    assert daemon.call('d.custom', other, 'retrackers-queued') == ''
+    assert daemon.call('system.retrackers.original_claim', '', other) == 'none'
     # Unknown capture stays held; only migration recovery can resolve it.
+
+
+def capture_existing_capsule(daemon):
+    # Same-hash capsule names that already exist are refused before any side
+    # effect: an existing file and a dangling symlink stay byte-for-byte.
+    journal = daemon.session / '.retrackers-migration'
+    for kind, suffix in (('file', '.backup.benc'), ('symlink', '.target')):
+        hash_ = daemon.fixture('capture-existing-' + kind)
+        local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+        victim = journal / (hash_ + suffix)
+        if kind == 'file':
+            victim.write_bytes(b'retain-me')
+            victim.chmod(0o600)
+        else:
+            os.symlink('missing-target', victim)
+        before = sorted(x.name for x in journal.iterdir())
+        expect_fault(lambda: daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_,
+                                        tx, '0' * 64), 'blocked by an existing capture')
+        if kind == 'file':
+            assert victim.read_bytes() == b'retain-me', 'existing capsule file overwritten'
+        else:
+            assert victim.is_symlink() and os.readlink(victim) == 'missing-target'
+        assert sorted(x.name for x in journal.iterdir()) == before, 'refused capture changed the journal'
+        assert daemon.call('d.hash', hash_) == hash_
+        assert daemon.call('system.retrackers.original_claim', '', hash_) == 'held'
 
 
 def defer_crash(daemon):
@@ -549,7 +787,7 @@ def defer_crash(daemon):
     daemon.call('d.erase', hash_)
 
 
-def shutdown_early_save(daemon):
+def shutdown_early_save(daemon, hook=False):
     witness = {}
     for index in range(29):
         hash_ = daemon.fixture('shutdown-save-' + str(index), start=False)
@@ -559,7 +797,8 @@ def shutdown_early_save(daemon):
     daemon.call('session.save')
     daemon.wait(lambda: all((daemon.session / (h + '.torrent.rtorrent')).exists() for h in witness),
                 'initial save triples')
-    if daemon.cut == 'after-shutdown-session-save' and 'shutdown-hook-save-' in daemon.directory.name:
+    if hook:
+        # The docker-rutorrent rc hook, kept for 0.9.8 and unpatched daemons.
         daemon.call('method.set_key', '', 'event.system.shutdown', 'docker_rutorrent_early_save', 'session.save=')
     for hash_, value in witness.items():
         daemon.call('d.custom1.set', hash_, value)
@@ -576,29 +815,990 @@ def shutdown_early_save(daemon):
     print('  latest shutdown labels restored: 29/29', flush=True)
 
 
+def dispatcher_gate(daemon):
+    # The 1 s dispatcher schedule launches dispatch.php only when a queue of
+    # its user has work (rr_dispatch_need in src/command_download.cc).
+    compile_fixture(daemon, 'fake-php.cc', 'fake-php')
+    scripts = daemon.directory / 'app' / 'plugins' / 'retrackers'
+    scripts.mkdir(parents=True)
+    for path in (daemon.directory, daemon.directory / 'app', scripts.parent, scripts):
+        path.chmod(0o755)
+    for script in ('dispatch.php', 'update.php'):
+        (scripts / script).write_text('<?php\n')
+        (scripts / script).chmod(0o644)
+    (daemon.directory / 'fake-php').chmod(0o755)
+    daemon.stop()
+    daemon.environment = {'RUTORRENT_NATIVE_PHP': '/data/fake-php', 'RUTORRENT_NATIVE_APP_ROOT': '/data/app'}
+    daemon.start()
+    user = 'gateuser'
+    digest = hashlib.sha256(user.encode()).hexdigest()
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pv:' + 'a' * 32, '1')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pf:' + digest + ':' + 'b' * 64, '1')
+    actors = daemon.directory / 'actor.log'
+    passes = lambda: [line for line in (actors.read_text().splitlines() if actors.exists() else [])
+                      if '/dispatch.php ' in line]
+    dispatch = lambda: daemon.call('system.retrackers.dispatcher_start', '', user)
+
+    def settle():
+        # The previous pass exits at once; the next launch reaps it first.
+        time.sleep(.5)
+
+    # Idle: the PHP-armed 1 s schedule spawns nothing.
+    key = 'rr.queue.' + digest
+    daemon.call('schedule.if_absent', '', key, '1', '1', 'system.retrackers.dispatcher_start=' + user)
+    time.sleep(5)
+    assert passes() == [], 'idle ticks spawned dispatch.php: ' + repr(passes())
+    # A new queued job is dispatched within one tick.
+    hash_ = daemon.fixture('gate-job', start=False)
+    local = daemon.call('d.local_id', hash_)
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, local, digest, '0')
+    tx, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+    queue = daemon.call('d.custom', hash_, 'retrackers-queued')[68:]
+    daemon.wait(lambda: passes(), 'dispatch within one tick', timeout=3)
+    daemon.call('schedule.remove', '', key)
+    time.sleep(1.5)
+    # A live worker owns its original claim.
+    assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'spawned'
+    settle()
+    assert dispatch() == 'idle', 'pass launched for a job with a live worker'
+    # A wait with a future due needs no pass until the due time.
+    due = int(time.time()) + 4
+    assert daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue, '',
+                       f'r1:{queue}:1:{due}:source-not-ready') == 'cancelled'
+    assert dispatch() == 'idle', 'pass launched before the wait was due'
+    while time.time() <= due:
+        time.sleep(.2)
+    assert dispatch() == 'spawned', 'due wait was not dispatched'
+    settle()
+    # A terminal retry needs no pass.
+    daemon.call('d.custom.set', hash_, 'retrackers-retry', f'r1:{queue}:6:0:capture-refused')
+    assert dispatch() == 'idle', 'pass launched for a terminal retry'
+    # A finalized claim needs a pass to dequeue; afterwards nothing is left.
+    local = daemon.call('d.local_id', hash_)
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, local, digest, '0')
+    tx, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    assert dispatch() == 'spawned', 'finalized claim was not dispatched'
+    settle()
+    assert daemon.call('d.retrackers.dequeue_original', hash_, tx, incarnation, queue) == 'dequeued'
+    assert dispatch() == 'idle'
+    # Anomalies need a visible pass, at most one a minute.
+    other = daemon.fixture('gate-anomaly', start=False)
+    daemon.call('d.custom.set', other, 'retrackers-queued', 'q1:malformed')
+    assert dispatch() == 'spawned', 'anomaly was not dispatched'
+    settle()
+    assert dispatch() == 'idle', 'anomaly dispatched twice within a minute'
+    print('  dispatch passes: ' + str(len(passes())), flush=True)
+
+
+def defer_late_failure(daemon):
+    # A storage failure in the final cleanup comes after the durable release
+    # and finalization, which prunes the release receipt: the published retry
+    # stays, so neither the step nor a terminal exhaustion is lost.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    journal = daemon.session / '.retrackers-migration'
+    kept = []
+    for index in range(8):
+        hash_ = daemon.fixture('late-failure-' + str(index), start=False)
+        local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+        prior = f'r1:{queue}:5:{int(time.time()) + 60}:capture-refused'
+        terminal = f'r1:{queue}:6:0:capture-refused'
+        daemon.call('d.custom.set', hash_, 'retrackers-retry', prior)
+        # A directory under the hash's prefix fails the cleanup's unlink.
+        plant = journal / (hash_ + '.unremovable')
+        plant.mkdir(mode=0o700)
+        expect_fault(lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue,
+                                        prior, terminal), 'final cleanup removal failed')
+        finalized = journal / (hash_ + '.finalized.receipt')
+        assert finalized.exists() and finalized.read_text().split(':')[2] == tx, 'release did not finalize'
+        retry = daemon.call('d.custom', hash_, 'retrackers-retry')
+        assert retry == terminal, f'try {index}: the finalized step was rolled back to {retry[36:]}'
+        assert 'retries exhausted' in daemon.call('d.message', hash_)
+        plant.rmdir()
+        kept.append((hash_, terminal))
+    daemon.call('session.save')
+    time.sleep(1)
+    daemon.stop()
+    daemon.start()
+    for hash_, terminal in kept:
+        assert daemon.call('d.custom', hash_, 'retrackers-retry') == terminal
+        assert 'retries exhausted' in daemon.call('d.message', hash_)
+
+
+def defer_late_failure_cut(daemon):
+    # The same rule with the failure placed deterministically after the
+    # release receipt was pruned.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('late-failure-cut', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    journal = daemon.session / '.retrackers-migration'
+    prior = f'r1:{queue}:5:{int(time.time()) + 60}:capture-refused'
+    terminal = f'r1:{queue}:6:0:capture-refused'
+    daemon.call('d.custom.set', hash_, 'retrackers-retry', prior)
+    expect_fault(lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue,
+                                    prior, terminal), 'final cleanup failure after prune')
+    assert not (journal / (hash_ + '.released.receipt')).exists()
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == terminal, 'finalized step rolled back'
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+    assert daemon.call('system.retrackers.original_claim', '', hash_) == 'none'
+    daemon.call('session.save')
+    time.sleep(1)
+    daemon.stop()
+    daemon.cut = ''
+    daemon.start()
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == terminal
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+
+
+def erase_storage_refusal(daemon):
+    # A storage failure while erase cancels a queued claim refuses the erase
+    # with its context and keeps the download, its claim and marker.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('erase-storage', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    journal = daemon.session / '.retrackers-migration'
+    prefix = hash_ + '.claim.' + tx
+    receipt = journal / (prefix + '.late.receipt')
+    sequence = int(receipt.read_text().split(':')[4]) + 1 if receipt.exists() else 1
+    blocker = journal / (prefix + '.late.' + str(sequence) + '.a.torrent')
+    blocker.mkdir(mode=0o700)
+    expect_fault(lambda: daemon.call('d.erase', hash_),
+                 'RR original claim blocks direct erase: failed to rename torrent file')
+    assert daemon.call('d.hash', hash_) == hash_
+    assert daemon.call('system.retrackers.original_claim', '', hash_).startswith('original:' + tx + ':')
+    assert daemon.call('d.custom', hash_, 'retrackers-recovery') == marker
+    blocker.rmdir()
+    daemon.call('d.erase', hash_)
+    assert hash_ not in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')]
+
+
+def enqueue_storage_check(daemon, hash_, digest, restore):
+    # The insert hook's enqueue was refused: the daemon lives, Q and the claim
+    # were not left behind, and the refusal is visible and classified. Once
+    # storage is back, a later enqueue of the same torrent succeeds.
+    assert daemon.call('system.pid') > 0
+    assert daemon.call('d.custom', hash_, 'retrackers-queued') == '', 'Q kept without a durable save'
+    assert daemon.call('system.retrackers.original_claim', '', hash_) == 'none'
+    assert 'session-storage-failed' in daemon.call('d.message', hash_), daemon.call('d.message', hash_)
+    log = (daemon.directory / 'native.log').read_text()
+    assert 'RR enqueue refused: session-storage-failed: ' + hash_ in log, log[-2000:]
+    restore()
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, daemon.call('d.local_id', hash_), digest,
+                         str(daemon.call('d.state', hash_)))
+    assert marker.startswith('v2:original:'), marker
+    assert daemon.call('d.custom', hash_, 'retrackers-queued').startswith('q1:' + digest + ':')
+
+
+def enqueue_hook(daemon, digest):
+    # The retrackers insert hook's native call inside cat=, as plugins/retrackers
+    # installs it (retrackersNativeEnqueueExpression).
+    daemon.call('method.set_key', '', 'event.download.inserted_new', 'rr_enqueue_test',
+                'cat="$d.retrackers.enqueue_original={$d.local_id=,' + digest + ',$cat=$d.state=}"')
+
+
+def enqueue_storage_refusal(daemon):
+    # A public torrent added while the session directory refuses writes
+    # (EACCES): the hook's durable Q save fails, which once ended the daemon.
+    digest = 'c' * 64
+    other = daemon.fixture('storage-other')
+    enqueue_hook(daemon, digest)
+    daemon.session.chmod(0o2500)
+    try:
+        hash_ = daemon.fixture('storage-eacces')
+        assert daemon.call('d.hash', other) == other
+        enqueue_storage_check(daemon, hash_, digest, lambda: daemon.session.chmod(0o2700))
+    finally:
+        daemon.session.chmod(0o2700)  # Scratch cleanup needs a writable directory.
+
+
+def enqueue_storage_full(daemon):
+    # The same with a full session file system (ENOSPC): a small tmpfs.
+    daemon.stop()
+    daemon.options = ['--tmpfs', f'/data/.session:rw,size=2m,mode=2700,uid={os.getuid()},gid={os.getgid()}']
+    daemon.start()
+    digest = 'd' * 64
+    other = daemon.fixture('full-other')
+    enqueue_hook(daemon, digest)
+    docker('exec', daemon.name, 'sh', '-c', 'cat /dev/zero > /data/.session/fill; true')
+    hash_ = daemon.fixture('storage-enospc')
+    assert daemon.call('d.hash', other) == other
+    enqueue_storage_check(daemon, hash_, digest,
+                          lambda: docker('exec', daemon.name, 'rm', '/data/.session/fill'))
+
+
+def late_save_schedule(daemon):
+    # A failed migration late save inside an asynchronous save is reported and
+    # skipped: a scheduled session.save neither ends the daemon nor stops
+    # saving the downloads after the failing one.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('late-save-claimed', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    other = daemon.fixture('late-save-other', start=False)
+    journal = daemon.session / '.retrackers-migration'
+    prefix = hash_ + '.claim.' + tx
+    receipt = journal / (prefix + '.late.receipt')
+    sequence = int(receipt.read_text().split(':')[4]) + 1 if receipt.exists() else 1
+    blocker = journal / (prefix + '.late.' + str(sequence) + '.a.torrent')
+    blocker.mkdir(mode=0o700)
+    daemon.call('d.custom.set', other, 'late-probe', 'saved-after-failure')
+    daemon.call('schedule', '', 'rr_late_save_test', '1', '0', 'session.save=')
+    sidecar = daemon.session / (other + '.torrent.rtorrent')
+    daemon.wait(lambda: sidecar.exists() and b'saved-after-failure' in sidecar.read_bytes(),
+                'the download after the failing one saved', timeout=15)
+    assert daemon.call('system.pid') > 0
+    log = (daemon.directory / 'native.log').read_text()
+    assert 'RR late save ' + hash_ + ': ' in log, log[-2000:]
+    blocker.rmdir()
+
+
+def fixture_info(name):
+    # The info dictionary Daemon.fixture() loads under this name.
+    return {'length': 8, 'name': name, 'piece length': 16384,
+            'pieces': hashlib.sha1(b'xxxxxxxx').digest()}
+
+
+def same_hash_job(daemon, name, paused=False, worker=True, user='txuser', prior=False, crash=False):
+    # A queued same-hash job as the retrackers plugin starts it, optionally
+    # with a live native-owned worker (the fake php85 sleeping in update.php),
+    # after an earlier completed job of the same torrent (prior), or with a
+    # test cut ending the daemon inside the capture (crash).
+    digest = dispatcher_actor(daemon, user) if worker else '0' * 64
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')  # Complete data: a seeding original.
+    hash_ = daemon.fixture(name)
+    if paused:
+        daemon.call('d.stop', hash_)
+    assert [daemon.call(m, hash_) for m in ('d.state', 'd.is_open', 'd.is_active')] == (
+        [0, 1, 0] if paused else [1, 1, 1])
+    daemon.call('d.custom1.set', hash_, 'label-' + name)
+    if prior:
+        # A finished no-change job leaves an ordinary owner pointer behind.
+        local = daemon.call('d.local_id', hash_)
+        marker = daemon.call('d.retrackers.enqueue_original', hash_, local, digest,
+                             str(daemon.call('d.state', hash_)))
+        first, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+        assert daemon.call('d.retrackers.finish_original', hash_, first, incarnation) == 'finalized'
+        queue = daemon.call('d.custom', hash_, 'retrackers-queued')[68:]
+        assert daemon.call('d.retrackers.dequeue_original', hash_, first, incarnation, queue) == 'dequeued'
+        pointer = daemon.session / '.retrackers-migration' / (hash_ + '.owner.current')
+        assert pointer.read_text().startswith('ordinary:'), pointer.read_text()
+    local = daemon.call('d.local_id', hash_)
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, local, digest,
+                         str(daemon.call('d.state', hash_)))
+    tx, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+    queue = daemon.call('d.custom', hash_, 'retrackers-queued')
+    pid = None
+    if worker:
+        assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'spawned'
+        pid = worker_pid(daemon, marker)
+    # The candidate differs only outside the info dictionary, as a retracker
+    # insertion does; capture binds its exact bytes.
+    raw = encode({'announce': 'http://retracker.invalid/announce', 'info': fixture_info(name)})
+    (daemon.directory / ('candidate-' + name + '.torrent')).write_bytes(raw)
+    capture = lambda: daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_, tx,
+                                  hashlib.sha256(raw).hexdigest())
+    if crash:
+        try:
+            capture()
+        except (OSError, RuntimeError):
+            pass
+        else:
+            raise AssertionError('the capture cut did not end the daemon')
+    else:
+        capture()
+        assert hash_ not in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')]
+    return {'hash': hash_, 'local': local, 'tx': tx, 'incarnation': incarnation, 'pid': pid,
+            'name': name, 'paused': paused, 'queue': queue}
+
+
+def worker_pid(daemon, marker):
+    # The fake worker's pid from its actor.log line; its argv carries the marker.
+    actors = daemon.directory / 'actor.log'
+    def find():
+        for line in actors.read_text().splitlines() if actors.exists() else []:
+            if '/update.php ' in line and ' ' + marker + ' ' in line:
+                return re.search(r' pid=(\d+)$', line).group(1)
+    daemon.wait(find, 'worker launch')
+    return find()
+
+
+def same_hash_again(daemon, job, user):
+    # The dispatcher's next pass for the same Q: a new claim, worker and capture.
+    hash_ = job['hash']
+    local = daemon.call('d.local_id', hash_)
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, local, hashlib.sha256(user.encode()).hexdigest(),
+                         str(daemon.call('d.state', hash_)))
+    tx, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+    assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'spawned'
+    pid = worker_pid(daemon, marker)
+    raw = (daemon.directory / ('candidate-' + job['name'] + '.torrent')).read_bytes()
+    daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_, tx, hashlib.sha256(raw).hexdigest())
+    return dict(job, local=local, tx=tx, incarnation=incarnation, pid=pid)
+
+
+def load_candidate(daemon, job):
+    # The worker's candidate load: stopped, carrying the source's custom values
+    # (its Q among them), applied and marked ready inside its creation scope,
+    # the only place a same-hash candidate's markers change.
+    hash_, tx = job['hash'], job['tx']
+    daemon.call('load.normal', '', '/data/candidate-' + job['name'] + '.torrent',
+                'd.custom.set=retrackers-recovery,v2:candidate-claim:' + tx,
+                'd.custom.set=retrackers-queued,' + job['queue'],
+                'd.custom1.set=label-' + job['name'],
+                'd.retrackers.apply=' + hash_ + ',' + job['local'] + ',' + tx,
+                'd.custom.set=retrackers-recovery,v2:candidate-ready:' + tx,
+                'd.custom.set=retrackers-recovery-ack,v2:candidate-ready:' + tx)
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_, 'candidate load')
+    assert daemon.call('d.custom', hash_, 'retrackers-recovery-ack') == 'v2:candidate-ready:' + tx
+    return daemon.call('d.incarnation', hash_)
+
+
+def kill_worker(daemon, job):
+    docker('exec', daemon.name, 'sh', '-c', 'kill -9 ' + job['pid'])
+
+
+def owner_restored(daemon, job, completed, counted=0):
+    # The original's run and open state and its label; its claim retired with
+    # Q completed (commit: dequeue next) or owed (rollback: enqueue again).
+    # A worker-exit rollback spends one counted attempt (capture-refused, due
+    # 2^count seconds later); a commit or a startup restoration spends none.
+    hash_ = job['hash']
+    retry = daemon.call('d.custom', hash_, 'retrackers-retry')
+    if counted:
+        fields = retry.split(':')
+        assert retry.startswith('r1:' + job['queue'][68:] + ':' + str(counted) + ':') and \
+            fields[4] == 'capture-refused', retry
+        assert -3 <= int(fields[3]) - time.time() <= (1 << counted) + 1, retry
+    else:
+        assert retry == '', 'retry changed: ' + retry
+    state = [daemon.call(m, hash_) for m in ('d.state', 'd.is_open', 'd.is_active')]
+    assert state == ([0, 1, 0] if job['paused'] else [1, 1, 1]), 'state/open/active ' + repr(state)
+    assert daemon.call('d.custom1', hash_) == 'label-' + job['name']
+    assert daemon.call('system.retrackers.status', '', hash_) == 'finalized'
+    assert daemon.call('d.custom', hash_, 'retrackers-queued') == job['queue'], 'Q lost'
+    claim = daemon.call('system.retrackers.original_claim', '', hash_)
+    finished = daemon.call('d.custom', hash_, 'retrackers-queue-finished')
+    if completed:
+        assert claim.startswith('finalized:' + job['tx'] + ':'), claim
+        assert finished.startswith('qd1:' + job['tx'] + ':'), finished
+    else:
+        assert claim == 'none' and finished == '', (claim, finished)
+
+
+def recovered(daemon, job, outcome):
+    # The classified line, the owner listed and no pending receipt of the dead
+    # worker's job left for the plugin to read as an abandoned transaction.
+    hash_ = job['hash']
+    log = daemon.directory / 'native.log'
+    line = 'RR worker exit recovery: ' + hash_ + ': ' + outcome
+    daemon.wait(lambda: line in log.read_text(), 'recovery after the worker died', timeout=20)
+    assert hash_ in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')]
+    keys = daemon.call('method.list_keys', '', 'rr.receipts.v1')
+    assert 'wp:' + job['local'] not in keys and not [k for k in keys if k.endswith(':' + job['tx'])], keys
+
+
+def worker_death_erased(daemon):
+    # The worker died after capture erased the source and before the
+    # candidate load: the daemon restores the original without a restart.
+    job = same_hash_job(daemon, 'death-erased')
+    kill_worker(daemon, job)
+    recovered(daemon, job, 'rolled back; attempt 1 of 6')
+    owner_restored(daemon, job, completed=False, counted=1)
+
+
+def worker_death_candidate(daemon):
+    # The worker died after the candidate load, before commit: the daemon
+    # erases the uncommitted candidate and restores the paused original.
+    job = same_hash_job(daemon, 'death-candidate', paused=True)
+    load_candidate(daemon, job)
+    kill_worker(daemon, job)
+    recovered(daemon, job, 'rolled back; attempt 1 of 6')
+    owner_restored(daemon, job, completed=False, counted=1)
+    assert daemon.call('d.tracker_size', job['hash']) == 0, 'the uncommitted candidate stayed'
+
+
+def worker_death_committed(daemon):
+    # The worker died after commit: the daemon finishes the candidate.
+    job = same_hash_job(daemon, 'death-committed')
+    load_candidate(daemon, job)
+    assert daemon.call('d.retrackers.commit', job['hash'], job['hash'], job['local'], job['tx']) == 'committed'
+    kill_worker(daemon, job)
+    recovered(daemon, job, 'finished')
+    owner_restored(daemon, job, completed=True)
+    assert daemon.call('d.tracker_size', job['hash']) == 1, 'the committed candidate was not kept'
+
+
+def worker_death_restart(daemon):
+    # The daemon died with its worker after the candidate load: startup
+    # restores the original, and its saved started state really starts it.
+    job = same_hash_job(daemon, 'death-restart')
+    load_candidate(daemon, job)
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: job['hash'] in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')],
+                'startup restoration')
+    daemon.wait(lambda: daemon.call('d.is_active', job['hash']) == 1, 'restored original started', timeout=10)
+    owner_restored(daemon, job, completed=False)
+
+
+def worker_death_loop(daemon):
+    # A worker that always dies after capture: each rollback spends one counted
+    # attempt with the application's backoff, the gate waits for it, and the
+    # sixth makes the job terminal, so no seventh capture stops the torrent.
+    user = 'loopuser'
+    job = same_hash_job(daemon, 'death-loop', user=user)
+    hash_, queue = job['hash'], job['queue'][68:]
+    dispatch = lambda: daemon.call('system.retrackers.dispatcher_start', '', user)
+    for attempt in range(1, 7):
+        if attempt > 1:
+            job = same_hash_again(daemon, job, user)
+        kill_worker(daemon, job)
+        recovered(daemon, job, 'rolled back; attempt %d of 6' % attempt)
+        assert [daemon.call(m, hash_) for m in ('d.state', 'd.is_open', 'd.is_active')] == [1, 1, 1]
+        retry = daemon.call('d.custom', hash_, 'retrackers-retry')
+        if attempt == 6:
+            assert retry == f'r1:{queue}:6:0:capture-refused', retry
+            break
+        assert retry.startswith(f'r1:{queue}:{attempt}:') and retry.endswith(':capture-refused'), retry
+        due = int(retry.split(':')[3])
+        if time.time() < due - .5:
+            assert dispatch() == 'idle', f'attempt {attempt}: pass launched before the counted retry was due'
+        while time.time() <= due:
+            time.sleep(.2)
+        daemon.wait(lambda: dispatch() == 'spawned', f'attempt {attempt}: pass after the due time', timeout=5)
+    log = (daemon.directory / 'native.log').read_text()
+    assert 'rolled back; attempt 6 of 6, retries exhausted' in log, log[-2000:]
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+    # Terminal: the gate launches nothing more and the torrent keeps seeding.
+    for _ in range(3):
+        assert dispatch() == 'idle', 'terminal job dispatched again'
+        time.sleep(1)
+    assert [daemon.call(m, hash_) for m in ('d.state', 'd.is_open', 'd.is_active')] == [1, 1, 1]
+    assert log.count('RR worker exit recovery: ' + hash_) == 6
+
+
+def worker_death_partial(daemon):
+    # A worker that dies with a partial capsule leaves its claim held for
+    # startup: the daemon says so instead of waiting mutely.
+    user = 'partialuser'
+    digest = dispatcher_actor(daemon, user)
+    hash_ = daemon.fixture('death-partial')
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, daemon.call('d.local_id', hash_), digest, '1')
+    tx, incarnation = marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)
+    assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'spawned'
+    partial = daemon.session / '.retrackers-migration' / (hash_ + '.rollback.torrent')
+    partial.write_bytes(b'partial captured snapshot')
+    partial.chmod(0o600)
+    actors = daemon.directory / 'actor.log'
+    daemon.wait(lambda: actors.exists() and '/update.php ' + hash_ in actors.read_text(), 'worker launch')
+    pid = re.search(r' pid=(\d+)$', [line for line in actors.read_text().splitlines()
+                                      if '/update.php ' + hash_ in line][0]).group(1)
+    docker('exec', daemon.name, 'sh', '-c', 'kill -9 ' + pid)
+    log = daemon.directory / 'native.log'
+    line = 'RR worker exit recovery held: ' + hash_ + ': partial capture publication'
+    daemon.wait(lambda: line in log.read_text(), 'a visible hold', timeout=20)
+    assert daemon.call('d.hash', hash_) == hash_
+    assert daemon.call('system.retrackers.original_claim', '', hash_) == 'held'
+
+
+def worker_death_reprocessed(daemon):
+    # The same after an earlier completed job left an ordinary owner pointer:
+    # the uncommitted candidate is no owner, so its erase leaves the pointer.
+    job = same_hash_job(daemon, 'death-reprocessed', prior=True)
+    load_candidate(daemon, job)
+    kill_worker(daemon, job)
+    recovered(daemon, job, 'rolled back; attempt 1 of 6')
+    owner_restored(daemon, job, completed=False, counted=1)
+
+
+def capture_phase(daemon, phase, stop):
+    # A stop or crash at one phase of a same-hash capture: shutdown neither
+    # crashes nor loses another torrent's unsaved change, and after one start
+    # the original has its prior state, or the committed candidate is active.
+    others = []
+    for index in range(6):
+        name = 'phase-other-' + str(index)
+        (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+        others.append(daemon.fixture(name))
+    crash = phase in ('intent', 'quiesced')
+    job = same_hash_job(daemon, 'phase-' + phase, crash=crash)
+    if phase in ('candidate', 'committed'):
+        load_candidate(daemon, job)
+    if phase == 'committed':
+        assert daemon.call('d.retrackers.commit', job['hash'], job['hash'], job['local'], job['tx']) == 'committed'
+    if stop:
+        for index, hash_ in enumerate(others):
+            daemon.call('d.custom.set', hash_, 'phase-mark', 'unsaved-' + str(index))
+        daemon.stop()  # Asserts a clean exit.
+    elif crash:
+        docker('rm', '-f', daemon.name)  # The test cut already ended the daemon.
+    else:
+        daemon.stop(kill=True)
+    daemon.cut = ''
+    daemon.start()
+    if stop:
+        marks = [daemon.call('d.custom', hash_, 'phase-mark') for hash_ in others]
+        assert marks == ['unsaved-' + str(index) for index in range(6)], 'shutdown save lost: ' + repr(marks)
+    hash_ = job['hash']
+    daemon.wait(lambda: hash_ in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')],
+                'restoration after start')
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1, 'restored owner started', timeout=15)
+    owner_restored(daemon, job, completed=phase == 'committed')
+    assert daemon.call('d.tracker_size', hash_) == (1 if phase == 'committed' else 0)
+
+
+def retry_cleared_dequeue(daemon):
+    # A job that waited and then completed leaves no retry receipt behind.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('retry-cleared', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    wait = f'r1:{queue}:1:{int(time.time()) + 60}:source-not-ready'
+    assert daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue, '', wait) == 'cancelled'
+    marker = daemon.call('d.retrackers.enqueue_original', hash_, daemon.call('d.local_id', hash_), '0' * 64, '0')
+    tx = marker.rsplit(':', 1)[1]
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == wait
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    assert daemon.call('d.retrackers.dequeue_original', hash_, tx, incarnation, queue) == 'dequeued'
+    assert daemon.call('d.custom', hash_, 'retrackers-queued') == ''
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == '', 'retry kept after completion'
+    daemon.stop()
+    daemon.start()
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == ''
+
+
+def pause_kept(daemon):
+    # A paused (open, inactive) original stays paused through a completed
+    # same-hash transaction: the release reopens what capture closed.
+    job = same_hash_job(daemon, 'pause-kept', paused=True, worker=False)
+    incarnation = load_candidate(daemon, job)
+    assert daemon.call('d.retrackers.commit', job['hash'], job['hash'], job['local'], job['tx']) == 'committed'
+    assert daemon.call('d.retrackers.release_committed', job['hash'], job['tx'], incarnation) == 'released'
+    owner_restored(daemon, job, completed=True)
+
+
+def erase_retire_batch(daemon):
+    # Erases queue their tombstones for one batch a few seconds later instead
+    # of three directory syncs each. A clean shutdown runs a pending batch; a
+    # crash before it leaves the tombstone to startup without resurrecting
+    # anything.
+    journal = daemon.session / '.retrackers-migration'
+    hashes = []
+    for index in range(7):
+        hash_ = daemon.fixture('retire-batch-' + str(index))
+        tx, incarnation = daemon.begin(hash_)
+        assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+        hashes.append(hash_)
+    owned = lambda hash_: sorted(x.name[41:] for x in journal.iterdir() if x.name.startswith(hash_))
+    for hash_ in hashes[:5]:
+        daemon.call('d.erase', hash_)
+    assert all(owned(h) == ['finalized.receipt', 'owner.current'] for h in hashes[:5]), 'not deferred'
+    daemon.wait(lambda: not any(owned(h) for h in hashes[:5]), 'one deferred retirement batch', timeout=10)
+    erased = time.time()
+    daemon.call('d.erase', hashes[5])
+    assert owned(hashes[5]) == ['finalized.receipt', 'owner.current'], 'not deferred'
+    result = docker('stop', '-t', '60', daemon.name)
+    state = docker('inspect', '-f', '{{.State.ExitCode}} {{.State.FinishedAt}}', daemon.name).stdout.split()
+    docker('rm', daemon.name)
+    assert state[0] == '0', (state, result)
+    # The batch timer waits at least two seconds from the main loop's cached
+    # time at the erase, so an exit well within them proves that the shutdown
+    # itself retired the tombstone.
+    stamp = re.fullmatch(r'(\S+?)(?:\.(\d+))?Z', state[1])
+    finished = datetime.datetime.strptime(stamp.group(1), '%Y-%m-%dT%H:%M:%S').replace(
+        tzinfo=datetime.timezone.utc).timestamp() + float('0.' + (stamp.group(2) or '0'))
+    print(f'  clean exit {finished - erased:.2f} s after the erase', flush=True)
+    assert finished - erased < 1.9, f'the daemon took {finished - erased:.2f} s to exit after the erase'
+    assert not owned(hashes[5]), 'clean shutdown kept the pending tombstone: ' + repr(owned(hashes[5]))
+    daemon.start()
+    daemon.call('d.erase', hashes[6])
+    daemon.stop(kill=True)
+    assert owned(hashes[6]) == ['finalized.receipt', 'owner.current']
+    daemon.start()
+    assert not daemon.call('d.multicall2', '', 'main', 'd.hash='), 'erased owner resurrected'
+    assert not owned(hashes[6]), 'startup kept the pending tombstone: ' + repr(owned(hashes[6]))
+
+
+def dispatcher_actor(daemon, user):
+    # The fake php85 actor and a single-user ledger profile, as dispatcher_gate.
+    compile_fixture(daemon, 'fake-php.cc', 'fake-php')
+    scripts = daemon.directory / 'app' / 'plugins' / 'retrackers'
+    scripts.mkdir(parents=True)
+    for path in (daemon.directory, daemon.directory / 'app', scripts.parent, scripts):
+        path.chmod(0o755)
+    for script in ('dispatch.php', 'update.php'):
+        (scripts / script).write_text('<?php\n')
+        (scripts / script).chmod(0o644)
+    (daemon.directory / 'fake-php').chmod(0o755)
+    daemon.stop()
+    daemon.environment = {'RUTORRENT_NATIVE_PHP': '/data/fake-php', 'RUTORRENT_NATIVE_APP_ROOT': '/data/app'}
+    daemon.start()
+    digest = hashlib.sha256(user.encode()).hexdigest()
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pv:' + 'a' * 32, '1')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pf:' + digest + ':' + 'b' * 64, '1')
+    return digest
+
+
+def dispatcher_gate_busy(daemon):
+    # Work that a pass cannot do now launches nothing: a none claim under a
+    # file-operation stop lease, and worker jobs while all eight slots run.
+    # Dequeueing a finalized claim needs no slot and still launches.
+    user = 'busyuser'
+    digest = dispatcher_actor(daemon, user)
+    dispatch = lambda: daemon.call('system.retrackers.dispatcher_start', '', user)
+    leased = daemon.fixture('busy-lease', start=False)
+    queue = uuid.uuid4().hex
+    daemon.call('d.custom.set', leased, 'retrackers-queued', 'q1:' + digest + ':' + queue)
+    daemon.call('d.stop_close_claim', leased, 'b' * 32)
+    expect_fault(lambda: daemon.call('d.retrackers.enqueue_original', leased, daemon.call('d.local_id', leased),
+                                    digest, '0'), 'reserved for a file operation')
+    assert dispatch() == 'idle', 'pass launched while a stop lease refuses enqueue'
+    jobs = []
+    for index in range(9):
+        hash_ = daemon.fixture('busy-' + str(index), start=False)
+        marker = daemon.call('d.retrackers.enqueue_original', hash_, daemon.call('d.local_id', hash_), digest, '0')
+        jobs.append((hash_, marker.rsplit(':', 1)[1], daemon.call('d.incarnation', hash_)))
+    for hash_, tx, incarnation in jobs[:8]:
+        assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'spawned'
+    hash_, tx, incarnation = jobs[8]
+    assert daemon.call('system.retrackers.worker_start', '', hash_, tx, incarnation, user) == 'full'
+    assert dispatch() == 'idle', 'pass launched while every worker slot is busy'
+    done = daemon.fixture('busy-done', start=False)
+    marker = daemon.call('d.retrackers.enqueue_original', done, daemon.call('d.local_id', done), digest, '0')
+    assert daemon.call('d.retrackers.finish_original', done, marker.rsplit(':', 1)[1],
+                       daemon.call('d.incarnation', done)) == 'finalized'
+    assert dispatch() == 'spawned', 'finalized claim was not dispatched with a full pool'
+
+
+def dispatcher_gate_cost(daemon):
+    # Waiting and terminal jobs without a completion marker are skipped before
+    # any journal read: an unreadable claim of a waiting job does not count,
+    # and two thousand waiting jobs keep the per-tick gate cheap.
+    user = 'costuser'
+    digest = hashlib.sha256(user.encode()).hexdigest()
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pv:' + 'a' * 32, '1')
+    daemon.call('method.set_key', '', 'rr.receipts.v1', 'pf:' + digest + ':' + 'b' * 64, '1')
+    hashes = []
+    for index in range(2000):
+        info = {'length': 8, 'name': 'cost-' + str(index), 'piece length': 16384,
+                'pieces': hashlib.sha1(b'xxxxxxxx').digest()}
+        hashes.append(hashlib.sha1(encode(info)).hexdigest().upper())
+        daemon.call('load.raw', '', xmlrpc.client.Binary(encode({'info': info})))
+    daemon.wait(lambda: len(daemon.call('d.multicall2', '', 'main', 'd.hash=')) == len(hashes),
+                'two thousand loads', timeout=120)
+    due = int(time.time()) + 3600
+    calls = []
+    for index, hash_ in enumerate(hashes):
+        queue = uuid.uuid4().hex
+        retry = (f'r1:{queue}:1:{due}:transport-unavailable' if index % 2 else
+                 f'r1:{queue}:6:0:capture-refused')
+        calls += [{'methodName': 'd.custom.set', 'params': [hash_, 'retrackers-queued', 'q1:' + digest + ':' + queue]},
+                  {'methodName': 'd.custom.set', 'params': [hash_, 'retrackers-retry', retry]}]
+    for offset in range(0, len(calls), 400):
+        daemon.call('system.multicall', calls[offset:offset + 400])
+    unreadable = daemon.session / '.retrackers-migration' / (hashes[1] + '.preclaim.receipt')
+    unreadable.write_text('preclaim:malformed\n')
+    unreadable.chmod(0o600)
+    assert daemon.call('system.retrackers.dispatcher_start', '', user) == 'idle'
+    samples = []
+    for _ in range(15):
+        began = time.perf_counter()
+        assert daemon.call('system.retrackers.dispatcher_start', '', user) == 'idle'
+        samples.append(time.perf_counter() - began)
+    median = sorted(samples)[len(samples) // 2]
+    print(f'  dispatcher_start with 2000 waiting or terminal jobs: median {median * 1000:.1f} ms', flush=True)
+    assert median < 0.02, f'gate costs {median * 1000:.1f} ms per tick'
+
+
+def defer_storage_failure(daemon):
+    # A storage failure before the durable release receipt leaves the exact
+    # expected retry, status and claim, so the same CAS succeeds after repair.
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    hash_ = daemon.fixture('defer-storage-failure', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    journal = daemon.session / '.retrackers-migration'
+    prefix = hash_ + '.claim.' + tx
+    receipt = journal / (prefix + '.late.receipt')
+    sequence = int(receipt.read_text().split(':')[4]) + 1 if receipt.exists() else 1
+    blocker = journal / (prefix + '.late.' + str(sequence) + '.a.torrent')
+    blocker.mkdir(mode=0o700)
+    prior = f'r1:{queue}:5:{int(time.time()) + 60}:capture-refused'
+    daemon.call('d.custom.set', hash_, 'retrackers-retry', prior)
+    terminal = f'r1:{queue}:6:0:capture-refused'
+    defer = lambda: daemon.call('d.retrackers.defer_original', hash_, tx, incarnation, queue,
+                                prior, terminal)
+    expect_fault(defer, 'failed to rename torrent file')
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == prior, 'retry advanced without release'
+    assert daemon.call('d.message', hash_) == '', 'exhaustion shown without release'
+    assert daemon.call('d.custom', hash_, 'retrackers-recovery') == marker
+    assert daemon.call('system.retrackers.original_claim', '', hash_).startswith('original:' + tx + ':')
+    assert 'wp:' + local in daemon.call('method.list_keys', '', 'rr.receipts.v1')
+    blocker.rmdir()
+    assert defer() == 'cancelled', 'the same CAS must succeed after storage repair'
+    assert daemon.call('d.custom', hash_, 'retrackers-retry') == terminal
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+    assert daemon.call('system.retrackers.original_claim', '', hash_) == 'none'
+    assert daemon.call('d.custom', hash_, 'retrackers-queued').endswith(queue)
+
+
+CAPSULE_SUFFIXES = ('.rollback.torrent', '.rollback.torrent.rtorrent',
+                    '.rollback.torrent.libtorrent_resume', '.benc', '.backup.benc', '.target')
+
+
+def stale_capsule_temp(daemon):
+    # A killed publisher leaves unpublished ".<name>.tmp.<pid>[.<n>]" files.
+    # A restarted daemon reuses the PID (PID 1 here): startup removes our own
+    # temporaries and a later capture never collides with such a name.
+    journal = daemon.session / '.retrackers-migration'
+    hash_ = daemon.fixture('stale-capsule-temp')
+    enqueue(daemon, hash_)
+    pid = daemon.call('system.pid')
+
+    def plant(directory, name, mode=0o600):
+        path = directory / name
+        path.write_bytes(b'interrupted publication')
+        path.chmod(mode)
+        return path
+
+    stale = [plant(journal, '.' + hash_ + '.rollback.torrent.tmp.' + str(pid)),
+             plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.3'),
+             plant(journal, '.' + hash_ + '.preclaim.receipt.tmp.77.12'),
+             plant(daemon.session, '.' + hash_ + '.torrent.rtorrent.tmp.' + str(pid) + '.5')]
+    unsafe = [plant(journal, '.' + hash_ + '.target.tmp.' + str(pid) + '.9', 0o644),
+              journal / ('.' + hash_ + '.backup.benc.tmp.' + str(pid) + '.4'),
+              journal / ('.' + hash_ + '.target.tmp.' + str(pid) + '.8'),
+              plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.6'),
+              plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.7')]
+    unsafe[1].mkdir(mode=0o700)
+    os.symlink('missing', unsafe[2])
+    # A second link elsewhere, and another owner, are not our unpublished files.
+    os.link(unsafe[3], daemon.directory / 'second-link')
+    docker('exec', '--user', '0', daemon.name, 'chown', '1001:1001', '/data/.session/.retrackers-migration/' + unsafe[4].name)
+    foreign = [plant(journal, '.' + hash_ + '.rollback.torrent.tmp.x'),
+               plant(daemon.session, '.' + hash_ + '.torrent.tmp.' + str(pid)),
+               plant(daemon.session, '.' + hash_ + '.other.tmp.1.1')]
+    daemon.stop(kill=True)
+    daemon.start()
+    assert daemon.call('system.pid') == pid, 'this case needs the same PID after restart'
+    survivors = [path.name for path in stale if os.path.lexists(path)]
+    assert not survivors, 'unpublished temporaries survived restart: ' + repr(survivors)
+    lost = [path.name for path in unsafe + foreign if not os.path.lexists(path)]
+    assert not lost, 'startup removed entries it does not own: ' + repr(lost)
+    log = (daemon.directory / 'native.log').read_text()
+    assert 'RR migration startup kept 5 temporary-named entries' in log, log[-2000:]
+    assert unsafe[3].stat().st_nlink == 2 and unsafe[4].stat().st_uid == 1001
+    # A crash in this same process lifetime leaves names with the current PID.
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    names = ['.' + hash_ + suffix + '.tmp.' + str(pid) + ('.' + str(n) if n else '')
+             for suffix in CAPSULE_SUFFIXES for n in range(0, 65)]
+    collisions = [plant(journal, name) for name in names if not os.path.lexists(journal / name)]
+    daemon.call('d.retrackers.capture_erase', hash_, local, marker, hash_, tx, '0' * 64)
+    assert hash_ not in [r[0] for r in daemon.call('d.multicall2', '', 'main', 'd.hash=')]
+    for suffix in CAPSULE_SUFFIXES:
+        assert (journal / (hash_ + suffix)).stat().st_nlink == 1
+    assert all(path.read_bytes() == b'interrupted publication' for path in collisions)
+
+
+def shutdown_slow_tracker(daemon):
+    # Shutdown must save before stopped announces can hang: a kill while the
+    # tracker holds the first event=stopped request keeps every label edited
+    # after the last explicit save.
+    compile_fixture(daemon, 'stopped-tracker.cc', 'stopped-tracker')
+    port = 45580
+    docker('exec', '-d', daemon.name, '/data/stopped-tracker', str(port), '/data/tracker.ready',
+           '/data/tracker-stopped')
+    daemon.wait(lambda: (daemon.directory / 'tracker.ready').exists(), 'local tracker readiness')
+    labels = {}
+    for index in range(16):
+        name = 'slow-stop-' + str(index)
+        info = {'length': 8, 'name': name, 'piece length': 16384,
+                'pieces': hashlib.sha1(b'xxxxxxxx').digest()}
+        hash_ = hashlib.sha1(encode(info)).hexdigest().upper()
+        (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+        (daemon.directory / (name + '.torrent')).write_bytes(encode({
+            'announce': f'http://127.0.0.1:{port}/announce', 'info': info}))
+        daemon.call('load.start', '', '/data/' + name + '.torrent')
+        labels[hash_] = 'latest-slow-label-' + str(index)
+    daemon.wait(lambda: all(daemon.call('d.hash', h) == h for h in labels), 'tracker torrents loaded')
+    daemon.wait(lambda: all((rows := daemon.call('t.multicall', h, '', 't.success_counter=', 't.is_busy='))
+                            and all(row[0] > 0 and row[1] == 0 for row in rows) for h in labels),
+                'initial announces accepted', timeout=60)
+    daemon.call('session.save')
+    daemon.wait(lambda: all((daemon.session / (h + '.torrent.rtorrent')).exists() for h in labels),
+                'initial session triples')
+    for hash_, label in labels.items():
+        daemon.call('d.custom1.set', hash_, label)
+    docker('kill', '--signal', 'SIGINT', daemon.name)
+    daemon.wait(lambda: (daemon.directory / 'tracker-stopped').exists(), 'first held stopped announce')
+    running = docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip()
+    docker('kill', daemon.name)
+    assert running == 'true', 'daemon exited before its held stopped announce could be cut'
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                'killed daemon')
+    assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '137'
+    docker('rm', daemon.name)
+    daemon.start()
+    lost = [h for h, label in labels.items() if daemon.call('d.custom1', h) != label]
+    assert not lost, f'{len(lost)}/{len(labels)} labels lost while a stopped announce was held'
+    print(f'  labels kept with a held stopped announce: {len(labels)}/{len(labels)}', flush=True)
+
+
+def assert_saves_intact(daemon, hashes):
+    errors = [line for line in (daemon.directory / 'native.log').read_text().splitlines()
+              if 'Storage errors' in line]
+    assert not errors, errors
+    missing = [h + suffix for h in hashes for suffix in ('.torrent', '.torrent.rtorrent',
+               '.torrent.libtorrent_resume') if not (daemon.session / (h + suffix)).exists()]
+    assert not missing, 'torn session triples: ' + repr(missing)
+    staging = sorted(x.name for x in daemon.session.iterdir() if x.name.endswith('.new'))
+    assert not staging, 'overlapping saves left staging files: ' + repr(staging)
+
+
+def session_save_overlap(daemon):
+    # Two saves of one download share its fixed ".new" staging names. Full and
+    # resume saves of a torrent with many files, requested back to back, must
+    # run one after the other; overlapping writers unlinked each other's
+    # staging files and could leave a torn triple.
+    info = {'name': 'save-overlap', 'piece length': 1 << 20,
+            'files': [{'length': 1, 'path': ['d' + str(index // 100), 'f' + str(index)]}
+                      for index in range(2000)]}
+    info['pieces'] = b'\0' * 20
+    hash_ = hashlib.sha1(encode(info)).hexdigest().upper()
+    daemon.call('load.raw', '', xmlrpc.client.Binary(encode({'info': info})))
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_, 'large torrent load')
+    time.sleep(2)
+    for _ in range(20):
+        daemon.call('system.multicall', [{'methodName': method, 'params': [hash_]}
+                                         for method in ('d.save_full_session', 'd.save_resume') * 3])
+    time.sleep(3)
+    assert_saves_intact(daemon, [hash_])
+
+
+def session_save_overlap_held(daemon):
+    # The same rule with every save held between staging and renames, so a
+    # mutation that lets saves of one path overlap fails deterministically.
+    hashes = [daemon.fixture('save-overlap-' + str(index), start=False) for index in range(4)]
+    daemon.call('session.save')
+    daemon.call('system.multicall', [{'methodName': 'd.save_full_session', 'params': [hash_]}
+                                     for hash_ in hashes])
+    daemon.call('session.save')
+    time.sleep(4)
+    assert_saves_intact(daemon, hashes)
+
+
+def shutdown_storage_errors(daemon):
+    # Shutdown flushes share the session thread's storage-error policy: the
+    # first error is logged with its text and later ones are counted, instead
+    # of one error line per torrent and flush.
+    hashes = [daemon.fixture('storage-error-' + str(index), start=False) for index in range(12)]
+    daemon.call('session.save')
+    daemon.wait(lambda: all((daemon.session / (h + '.torrent.rtorrent')).exists() for h in hashes),
+                'initial session triples')
+    time.sleep(1)
+    for hash_ in hashes:
+        daemon.call('d.custom1.set', hash_, 'unsaved')
+    daemon.session.chmod(0o2500)
+    try:
+        # The session thread fails these first: one line, eleven suppressed.
+        daemon.call('session.save')
+        time.sleep(2)
+        daemon.stop()
+    finally:
+        daemon.session.chmod(0o2700)
+    lines = [line for line in (daemon.directory / 'native.log').read_text().splitlines()
+             if 'Storage errors' in line]
+    assert lines and 'failed to' in lines[0], lines
+    summaries = [re.search(r'flushing session data: ignored:(\d+), earlier ignored:(\d+)', line)
+                 for line in lines if 'flushing session data' in line]
+    assert summaries and all(summaries), lines
+    assert all(int(match.group(1)) <= len(hashes) for match in summaries), lines
+    assert int(summaries[0].group(2)) == len(hashes) - 1, lines
+    assert len(lines) <= 3, f'{len(lines)} storage error lines for {len(hashes)} torrents'
+    print(f'  storage error lines for {len(hashes)} torrents: {len(lines)}', flush=True)
+
+
 CASES = {'stop-cat': stop_cat, 'claim-restart': claim_restart,
          'claim-finish': claim_finish, 'owner-finalize': owner_finalize,
          'metadata-start': metadata_start, 'metadata-restart': metadata_restart,
          'stale-counter': stale_counter,
          'unsafe-async-path': unsafe_async_path, 'erase-guard-preflight': erase_guard_preflight}
-CASES.update({'rename-einval': rename_fallback, 'rename-enosys': rename_fallback,
-              'rename-eopnotsupp': rename_fallback, 'uncaptured-remove': uncaptured_remove,
-              'retry-cancel': retry_cancel, 'retry-new-queue': retry_new_queue,
+CASES.update({'rename-publication': rename_fallback, 'rename-einval': rename_fallback,
+              'rename-enosys': rename_fallback, 'rename-eopnotsupp': rename_fallback,
+              'uncaptured-remove': uncaptured_remove,
+              'retry-cancel': retry_cancel, 'retry-wait': retry_wait,
+              'retry-new-queue': retry_new_queue,
               'captured-remove': captured_remove,
-              'partial-capture-remove': partial_capture_remove, 'defer-crash': defer_crash,
-              'shutdown-early-save': shutdown_early_save, 'shutdown-hook-save': shutdown_early_save})
+              'partial-capture-remove': partial_capture_remove,
+              'capture-existing-capsule': capture_existing_capsule, 'defer-crash': defer_crash,
+              'defer-storage-failure': defer_storage_failure,
+              'defer-late-failure': defer_late_failure,
+              'defer-late-failure-cut': defer_late_failure_cut,
+              'erase-storage-refusal': erase_storage_refusal,
+              'enqueue-storage-refusal': enqueue_storage_refusal,
+              'enqueue-storage-full': enqueue_storage_full,
+              'late-save-schedule': late_save_schedule,
+              'worker-death-erased': worker_death_erased,
+              'worker-death-candidate': worker_death_candidate,
+              'worker-death-committed': worker_death_committed,
+              'worker-death-restart': worker_death_restart,
+              'worker-death-reprocessed': worker_death_reprocessed,
+              'worker-death-partial': worker_death_partial,
+              'worker-death-loop': worker_death_loop,
+              'capture-crash-intent': lambda daemon: capture_phase(daemon, 'intent', stop=False),
+              'capture-crash-quiesced': lambda daemon: capture_phase(daemon, 'quiesced', stop=False),
+              'capture-crash-erased': lambda daemon: capture_phase(daemon, 'erased', stop=False),
+              'capture-crash-committed': lambda daemon: capture_phase(daemon, 'committed', stop=False),
+              'capture-stop-erased': lambda daemon: capture_phase(daemon, 'erased', stop=True),
+              'capture-stop-candidate': lambda daemon: capture_phase(daemon, 'candidate', stop=True),
+              'capture-stop-committed': lambda daemon: capture_phase(daemon, 'committed', stop=True),
+              'retry-cleared-dequeue': retry_cleared_dequeue,
+              'pause-kept': pause_kept,
+              'erase-retire-batch': erase_retire_batch,
+              'dispatcher-gate-busy': dispatcher_gate_busy,
+              'dispatcher-gate-cost': dispatcher_gate_cost,
+              'dispatcher-gate': dispatcher_gate,
+              'stale-capsule-temp': stale_capsule_temp,
+              'shutdown-slow-tracker': shutdown_slow_tracker,
+              'shutdown-storage-errors': shutdown_storage_errors,
+              'session-save-overlap': session_save_overlap,
+              'session-save-overlap-held': session_save_overlap_held,
+              'startup-hold-visible': startup_hold_visible,
+              'shutdown-early-save': shutdown_early_save,
+              'shutdown-hook-save': lambda daemon: shutdown_early_save(daemon, hook=True)})
 CASES.update({'owner-cut-before': owner_cut, 'owner-cut-after': owner_cut,
-              'owner-cut-retry': owner_cut_retry})
+              'owner-cut-retry': owner_cut_retry, 'owner-tombstone-cut': owner_tombstone_cut,
+              'owner-tombstone-startup': owner_tombstone_startup})
+assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 4:
+    arguments, cuts = [], False
+    for argument in sys.argv[1:]:
+        if argument == '--cuts':
+            cuts = True
+        elif argument == '--ninep':
+            SETTINGS['seccomp'] = 'ninep'
+        elif argument.startswith('--prefix='):
+            SETTINGS['prefix'] = argument.split('=', 1)[1]
+        elif argument.startswith('--label='):
+            SETTINGS['labels'].append(argument.split('=', 1)[1])
+        elif argument.startswith('--'):
+            raise SystemExit('unknown option ' + argument + '\n' + __doc__)
+        else:
+            arguments.append(argument)
+    if len(arguments) < 3:
         raise SystemExit(__doc__)
-    image, tree, scratch = sys.argv[1:4]
-    cut_cases = {'rename-einval', 'rename-enosys', 'rename-eopnotsupp', 'captured-remove',
-                 'defer-crash', 'shutdown-early-save', 'shutdown-hook-save'}
-    selected = sys.argv[4:] or [case for case in CASES if not case.startswith('owner-cut-')
-                              and case not in cut_cases]
+    image, tree, scratch = arguments[:3]
+    unknown = [case for case in arguments[3:] if case not in CASES]
+    if unknown:
+        raise SystemExit('unknown case ' + ', '.join(unknown))
+    if SETTINGS['seccomp']:
+        profile = pathlib.Path(scratch).resolve() / 'ninep-seccomp.json'
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text(json.dumps(NINEP_SECCOMP))
+        SETTINGS['seccomp'] = str(profile)
+    selected = arguments[3:] or [case for case in CASES if cuts or case not in CUTS]
     failures = []
     for case in selected:
         daemon = Daemon(image, tree, scratch, case)

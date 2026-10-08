@@ -1,8 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
-#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fcntl.h>
@@ -10,34 +10,77 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <torrent/utils/log.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
 
+#include "core/migration_test_cut.h"
+
 namespace core {
 
-// The main-thread caller owns this attested private session directory. Only
-// trusted same-UID processes can race the absence check on the fallback path.
-// Keep file and directory durability at the publication call site.
+#ifdef __linux__
+// Test builds inject the flag-rejection errors that a 9p mount returns.
+inline int injected_rename_noreplace_error() {
+  static constexpr struct { const char* cut; int error; } cuts[] = {
+    {"rename-noreplace-einval", EINVAL}, {"rename-noreplace-enosys", ENOSYS},
+    {"rename-noreplace-eopnotsupp", EOPNOTSUPP}, {"rename-noreplace-eacces", EACCES}};
+  for (const auto& cut : cuts)
+    if (migration_test_cut(cut.cut)) return cut.error;
+  return 0;
+}
+
+// The first fallback of a process is reported once, by errno class only: the
+// session filesystem then lacks atomic no-replace rename. Containers capture
+// stderr even when the rc routes only errors to a log file.
+inline void report_rename_noreplace_fallback(int error) {
+  static std::atomic<bool> reported{false};
+  if (reported.exchange(true)) return;
+  const char* reason = error == EINVAL ? "EINVAL" : error == ENOSYS ? "ENOSYS" : "EOPNOTSUPP";
+  const std::string line = std::string("rtorrent: session publication uses the checked rename "
+      "fallback: renameat2 RENAME_NOREPLACE unsupported (") + reason + "); reported once per process";
+  lt_log_print(torrent::LOG_WARN, "%s", line.c_str());
+  const std::string output = line + "\n";
+  (void)::write(STDERR_FILENO, output.data(), output.size());
+}
+#endif
+
+// Portable no-replace publication by hard link, the primitive outside Linux.
+// The link is the publication; removing the staging name is cleanup. A failed
+// removal leaves a two-link pair: stop claim recovery retires the claim's exact
+// nonce-named staging entry, and startup reports a capsule temporary, so it is
+// not reported as a failed publication. Test builds can skip the removal.
+inline int link_session_entry_noreplace(int directory, const std::string& source,
+                                         const std::string& destination) {
+  if (::linkat(directory, source.c_str(), directory, destination.c_str(), 0) != 0) return -1;
+  if (!migration_test_cut("link-publication-keep-staging"))
+    (void)::unlinkat(directory, source.c_str(), 0);
+  return 0;
+}
+
+// Publishes a fully written private session entry without replacing an
+// existing name. The main-thread caller owns this attested directory: the
+// daemon is its only writer, so no lock is taken and only trusted same-UID
+// processes can race the absence check on the fallback path. File and
+// directory durability stay at the publication call site.
+//
+// Twin rule: ruTorrent plugins/erasedata/rename-noreplace.c rename_no_replace()
+// applies the same EINVAL/ENOSYS/EOPNOTSUPP fallback for payload renames, and
+// its --probe status for that fallback is reported by docker-rutorrent
+// rootfs/usr/local/bin/startup. Change the three together.
 inline int rename_session_entry_noreplace(int directory, const std::string& source,
                                            const std::string& destination) {
 #ifdef __linux__
-  int result;
-#ifdef ENABLE_RR_MIGRATION_TEST_CUTS
-  const char* cut = ::getenv("RR_MIG_TEST_CUT");
-  int injected = 0;
-  if (cut && std::strcmp(cut, "rename-noreplace-einval") == 0) injected = EINVAL;
-  if (cut && std::strcmp(cut, "rename-noreplace-enosys") == 0) injected = ENOSYS;
-  if (cut && std::strcmp(cut, "rename-noreplace-eopnotsupp") == 0) injected = EOPNOTSUPP;
-  if (cut && std::strcmp(cut, "rename-noreplace-eacces") == 0) injected = EACCES;
-  if (injected) { errno = injected; result = -1; }
+  int result = -1;
+  if (const int injected = injected_rename_noreplace_error())
+    errno = injected;
   else
-#endif
     result = ::syscall(SYS_renameat2, directory, source.c_str(), directory,
                        destination.c_str(), 1 /* RENAME_NOREPLACE */);
   if (result == 0 || (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP))
     return result;
   // WSL drvfs over 9p rejects rename flags even on a current Linux kernel.
+  report_rename_noreplace_fallback(errno);
   // A dangling symlink is also an existing target and must never be replaced.
   struct stat target{};
   if (::fstatat(directory, destination.c_str(), &target, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -47,9 +90,7 @@ inline int rename_session_entry_noreplace(int directory, const std::string& sour
   if (errno != ENOENT) return -1;
   return ::renameat(directory, source.c_str(), directory, destination.c_str());
 #else
-  // Preserve the historical no-overwrite primitive outside Linux.
-  if (::linkat(directory, source.c_str(), directory, destination.c_str(), 0) != 0) return -1;
-  return ::unlinkat(directory, source.c_str(), 0);
+  return link_session_entry_noreplace(directory, source, destination);
 #endif
 }
 

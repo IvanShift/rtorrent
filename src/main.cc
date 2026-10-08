@@ -55,6 +55,8 @@ void do_panic(int signum);
 void print_help();
 void initialize_commands();
 void retrackers_migration_recover_startup();
+// Removes unpublished journal and session temporaries; never fatal.
+void retrackers_migration_remove_temporaries_startup();
 void retrackers_migration_repair_released_startup();
 void retrackers_migration_repair_committed_startup();
 
@@ -486,6 +488,7 @@ main(int argc, char** argv) {
     control->dht_manager()->set_auto_if_untouched_and_has_session();
     control->dht_manager()->load_dht_cache();
 
+    retrackers_migration_remove_temporaries_startup();
     retrackers_migration_repair_released_startup();
     retrackers_migration_repair_committed_startup();
     load_session_torrents(session_thread::manager()->path());
