@@ -1,5 +1,6 @@
 #include "config.h"
 #include "stop_intent.h"
+#include "core/erasedata_lifecycle.h"
 
 #include "download_factory.h"
 #include "incarnation.h"
@@ -298,6 +299,8 @@ DownloadFactory::receive_success() {
 
   rtorrent->insert_key("key", download->tracker_controller().key());
 
+  const bool saved_incarnation_valid = rtorrent->has_key_string("incarnation") &&
+      valid_incarnation(rtorrent->get_key_string("incarnation"));
   // Session loads keep the daemon identity; new objects always receive a fresh one.
   if (!m_session || !rtorrent->has_key_string("incarnation") ||
       !valid_incarnation(rtorrent->get_key_string("incarnation"))) {
@@ -306,7 +309,25 @@ DownloadFactory::receive_success() {
     rtorrent->insert_key("incarnation", fresh_incarnation());
   }
 
+  bool erasedata_held = false;
+  try {
+    erasedata_held = erasedata_lifecycle::admit(rpc::call_command_string("session.path"),
+        rr_hash, rtorrent->get_key_string("incarnation"), m_session, saved_incarnation_valid);
+  } catch (const std::exception& e) {
+    const auto message = "erasedata: load refused H=" + rr_hash + ": " + e.what();
+    lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+    m_manager->push_log_std(message);
+    refuse_load();
+    return;
+  }
   initialize_rtorrent(download, rtorrent);
+  if (erasedata_held) {
+    rtorrent->insert_key("state", int64_t(0));
+    erasedata_intent::Record intent;
+    erasedata_intent::read(rpc::call_command_string("session.path"), rr_hash, &intent);
+    download->set_message("erasedata: original session recovery held; inspect " +
+        erasedata_lifecycle::description(intent) + "; exact erase recovery or ordinary Remove/re-add cancels");
+  }
 
   if (!rtorrent->has_key_string("custom1")) rtorrent->insert_key("custom1", std::string());
   if (!rtorrent->has_key_string("custom2")) rtorrent->insert_key("custom2", std::string());
@@ -456,7 +477,7 @@ DownloadFactory::receive_success() {
 
   // The action of inserting might cause the torrent to be
   // opened/started or such. Figure out a nicer way of handling this.
-  if (m_manager->download_list()->insert(download) == m_manager->download_list()->end()) {
+  if (m_manager->download_list()->insert(download, erasedata_held) == m_manager->download_list()->end()) {
     // ATM doesn't really ever get here.
     delete download;
 
@@ -482,8 +503,9 @@ DownloadFactory::receive_success() {
     if (torrent::log_groups[torrent::LOG_TORRENT_DEBUG].valid())
       log_created(download, rtorrent);
 
-    for (const auto& command : m_commands)
-      rpc::parse_command_multiple_std(command, rpc::make_target(download));
+    if (!erasedata_held)
+      for (const auto& command : m_commands)
+        rpc::parse_command_multiple_std(command, rpc::make_target(download));
     if (!rr_target_source.empty() && !m_session && !rr_creation.applied())
       throw torrent::input_error("RR migration apply did not finish.");
 
@@ -493,8 +515,8 @@ DownloadFactory::receive_success() {
     if (!m_session)
        rpc::call_command("d.state.set", (int64_t)m_start, rpc::make_target(download));
 
-    bool session_event_ready = true;
-    if (m_session) {
+    bool session_event_ready = !erasedata_held;
+    if (m_session && !erasedata_held) {
       session_event_ready = retrackers_migration_repair_prepared_loaded(download);
       // A completed same-hash release retires the reservation. The restored
       // owner then gets the ordinary session event, which starts a saved

@@ -32,6 +32,19 @@ std::string move_state(const std::string& hash) {
     return "queued:"+r.user+":"+r.queue+":"+r.local+":"+r.retry;
   } catch(const std::exception&) { return "held:record-malformed"; }
 }
+void move_acknowledge_outcome(core::Download* d) {
+  auto& custom=d->bencode()->get_key("rtorrent").insert_preserve_copy("custom",torrent::Object::create_map()).first->second;
+  const auto found=custom.as_map().find("autotools-native-outcome");
+  if(found==custom.as_map().end() || !found->second.is_string() ||
+     (found->second.as_string()!="expired" && found->second.as_string()!="superseded-by-user")) return;
+  // An explicit message write acknowledges only a retired Move outcome. An
+  // unreadable record is still an obligation, not proof that Q was retired.
+  try {
+    MoveRecord record;
+    if(!core::file_jobs::read(move_session(),move_hash(d),&record))
+      custom.erase_key("autotools-native-outcome");
+  } catch(const std::exception&) {}
+}
 void move_enqueue_clear_refusal(core::Download* d) {
   auto& custom=d->bencode()->get_key("rtorrent").insert_preserve_copy("custom",torrent::Object::create_map()).first->second;
   custom.erase_key("autotools-enqueue-refusal"); custom.erase_key("autotools-native-outcome");
@@ -160,6 +173,7 @@ std::string move_dispatch(const std::string& user) {
   // Copy keys because durable retirement updates the index.
   std::vector<std::string> hashes;
   for(const auto& [h,r]:core::file_jobs::records) if(r.user==digest) hashes.push_back(h);
+  bool held=false;
   for(const auto& h:hashes) {
     try {
       MoveRecord r; if(!core::file_jobs::read(session,h,&r)) continue;
@@ -184,9 +198,12 @@ std::string move_dispatch(const std::string& user) {
            rpc::call_command_string("d.incarnation",rpc::make_target(d))},false);
       if(result=="spawned") { move_launch_retries[identity]=r.retry; rr_watch_workers_schedule(); }
       return result;
-    } catch(const std::exception&) { move_log(h,"held","storage-failed"); return "held"; }
+    } catch(const std::exception&) {
+      // This hash keeps its exact Q/lease; independent records may proceed.
+      move_log(h,"held","storage-failed"); held=true;
+    }
   }
-  return "idle";
+  return held ? "held" : "idle";
 }
 void initialize_file_job_commands() {
   CMD2_ANY("system.autotools.move_queue",[](auto,auto){return int64_t(1);});

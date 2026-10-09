@@ -145,7 +145,7 @@ inline void validate_path(const std::string& path, bool executable) {
 }
 
 inline std::string launch(const std::string& identity, const std::vector<std::string>& argv,
-                          bool dispatcher) {
+                          bool dispatcher, int lifetime_fd = -1) {
 #ifndef __linux__
   throw torrent::input_error("RR bounded worker launch requires Linux parent-death support.");
 #endif
@@ -175,9 +175,20 @@ inline std::string launch(const std::string& identity, const std::vector<std::st
     // argv, limits and all C++ storage were prepared by the parent.
 #ifdef __linux__
     if (::syscall(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) != 0 || ::getppid() != parent) ::_exit(125);
-    if (::syscall(SYS_close_range, 3, std::numeric_limits<unsigned>::max(), 0) != 0)
+    // An erasedata worker and all its filesystem helpers retain this same
+    // open-file-description across daemon death. The stable inode is never retired.
+    if (lifetime_fd >= 0 && ::dup2(lifetime_fd, 198) < 0) ::_exit(125);
+    if (lifetime_fd >= 0 && ::fcntl(198, F_SETFD, 0) < 0) ::_exit(125);
+    const bool closed = lifetime_fd < 0 ?
+        ::syscall(SYS_close_range, 3, std::numeric_limits<unsigned>::max(), 0) == 0 :
+        (::syscall(SYS_close_range, 3, 197, 0) == 0 &&
+         ::syscall(SYS_close_range, 199, std::numeric_limits<unsigned>::max(), 0) == 0);
+    if (closed) {
+      // Every nonstandard descriptor except the inherited lifetime is closed.
+    } else
 #endif
-      for (rlim_t fd = 3; fd < limit.rlim_cur; ++fd) ::close(static_cast<int>(fd));
+      for (rlim_t fd = 3; fd < limit.rlim_cur; ++fd)
+        if (lifetime_fd < 0 || fd != 198) ::close(static_cast<int>(fd));
     ::execve(raw_arguments[0], raw_arguments, environ);
     ::_exit(126);
   }

@@ -3937,7 +3937,9 @@ void rr_watch_workers() {
   std::vector<core::retrackers_process_pool::Exit> exited;
   exited.swap(core::retrackers_process_pool::exited_workers);
   for (const auto& exit : exited) {
-    if (exit.identity.rfind("move:", 0) == 0) move_recover_exit(exit);
+    if (exit.identity.rfind("erasedata:", 0) == 0) {
+      lt_log_print(torrent::LOG_NOTICE, "erasedata: worker exited; exact intent retained for retry: %s", exit.identity.c_str());
+    } else if (exit.identity.rfind("move:", 0) == 0) move_recover_exit(exit);
     else rr_recover_exited_worker(exit.identity);
   }
   if (core::retrackers_process_pool::workers_running())
@@ -4690,9 +4692,12 @@ bool retrackers_migration_cancel_queued_original(core::Download* owner) {
 }
 
 #include "file_jobs_commands.h"
+#include "core/erasedata_lifecycle.h"
+#include "erasedata_commands.h"
 
 void
 initialize_command_download() {
+  initialize_erasedata_commands();
   initialize_file_job_commands();
   CMD2_DL_LIST("d.retrackers.preflight_stage", rr_preflight_stage);
   CMD2_DL_LIST("d.retrackers.enqueue_original",rr_enqueue_original);
@@ -4839,6 +4844,7 @@ initialize_command_download() {
   CMD2_DL         ("d.delete_tied", std::bind(&apply_d_delete_tied, std::placeholders::_1));
 
   CMD2_DL("d.start", [](core::Download* download, const torrent::Object&) {
+    core::erasedata_lifecycle::require_activity(download);
     if (retrackers_migration_candidate_activity_held(
         rpc::call_command_string("d.hash", rpc::make_target(download))))
       throw torrent::input_error("RR candidate start held until durable release.");
@@ -5095,6 +5101,7 @@ initialize_command_download() {
   // 1 - started
   CMD2_DL("d.state", std::bind(&download_get_variable, std::placeholders::_1, "rtorrent", "state"));
   CMD2_DL_VALUE_P("d.state.set", [](core::Download* download, int64_t value) {
+    if (value != 0) core::erasedata_lifecycle::require_activity(download);
     if (value != 0 && !(value == 1 && stop_intent::terminal_activity_allowed(download)))
       stop_intent::require_unleased(download);
     return download_set_variable_value(download, value, "rtorrent", "state");
@@ -5185,7 +5192,10 @@ initialize_command_download() {
       return std::string("autotools: move cancelled: ") + outcome;
     return core::file_jobs::message(move_session(), move_hash(owner));
   });
-  CMD2_DL_STRING_V("d.message.set", std::bind(&core::Download::set_message, std::placeholders::_1, std::placeholders::_2));
+  CMD2_DL_STRING_V("d.message.set", [](core::Download* owner, const std::string& message) {
+    move_acknowledge_outcome(owner);
+    owner->set_message(message);
+  });
 
   CMD2_DL         ("d.max_file_size",       CMD2_ON_FL(max_file_size));
   CMD2_DL_VALUE_V ("d.max_file_size.set",   std::bind(&torrent::FileList::set_max_file_size, CMD2_BIND_FL, std::placeholders::_2));

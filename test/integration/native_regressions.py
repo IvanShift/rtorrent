@@ -45,7 +45,10 @@ def docker(*args, check=True):
 SETTINGS = {'prefix': 'rr-remediation-', 'labels': [], 'seccomp': ''}
 # The one list of cases that need a test-cut build, with the RR_MIG_TEST_CUT
 # each sets. Only --cuts (or naming the case) runs them.
-CUTS = {'move-sync-failure': 'move-directory-sync-failed',
+CUTS = {'erasedata-crash-prepared': 'erasedata-after-prepare',
+        'erasedata-crash-before-erase': 'erasedata-before-erase',
+        'erasedata-crash-after-erase': 'erasedata-after-erase',
+        'move-sync-failure': 'move-directory-sync-failed',
         'move-publish-before': 'before-move-record-publication',
         'move-publish-after': 'after-move-record-publication',
         'move-finish-crash': 'after-move-finish',
@@ -84,6 +87,7 @@ class Daemon:
         self.cut = CUTS.get(case, '')
         self.environment = {}
         self.options = []  # Extra docker run options, such as a tmpfs session.
+        self.supervised = False
         self.directory = pathlib.Path(scratch).resolve() / (case + '-' + uuid.uuid4().hex[:8])
         self.directory.mkdir(mode=0o755, parents=True)
         self.session = self.directory / '.session'
@@ -115,7 +119,10 @@ class Daemon:
                *[option for key, value in self.environment.items() for option in ('-e', key + '=' + value)],
                *self.options,
                '-v', str(self.tree) + ':/w:ro', '-v', str(self.directory) + ':/data',
-               '--entrypoint', '/w/src/rtorrent', self.image, '-n', '-o', 'import=/data/test.rc')
+               *(['--entrypoint', '/bin/sh', self.image, '-c', 'while :; do sleep 3600; done']
+                 if self.supervised else ['--entrypoint', '/w/src/rtorrent', self.image, '-n', '-o', 'import=/data/test.rc']))
+        if self.supervised:
+            docker('exec', '-d', self.name, '/w/src/rtorrent', '-n', '-o', 'import=/data/test.rc')
 
     def stop(self, kill=False):
         result = docker('kill' if kill else 'stop', *([] if kill else ['-t', '60']), self.name)
@@ -168,6 +175,95 @@ class Daemon:
         marker = self.call('d.retrackers.begin_original', hash_, self.call('d.local_id', hash_),
                            '0' * 64, str(self.call('d.state', hash_)))
         return marker.rsplit(':', 1)[1], self.call('d.incarnation', hash_)
+
+
+def hash_status_after_repair(daemon):
+    # Real full-hash failure and repair own only these exact native diagnoses.
+    owned = 'Download registered as completed, but hash check returned unfinished chunks.'
+    failures = ((3, owned), (2, 'Hash check on download completion found bad chunks.'),
+                (4, 'Hash check completed but the "hashing" variable is in an invalid state.'))
+    name = 'hash-status-after-repair'
+    payload = daemon.directory / 'dl' / name
+    payload.write_bytes(b'xxxxxxxx')
+    h = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.complete', h) == 1, 'complete hash-status fixture')
+    for event, command in (
+            ('hash_done', 'd.custom.set=hash-status-observed,done'),
+            ('hash_queued', 'd.custom.set=hash-status-queued,$d.message='),
+            ('hash_final_failed', 'd.custom.set=hash-status-final-failed,yes'),
+            ('finished', 'd.custom.set=hash-status-finished,yes')):
+        daemon.call('method.set_key', '', 'event.download.' + event, 'review-hash-status', command)
+
+    def rehash(complete, message, active=False, mode=None):
+        before = daemon.call('d.message', h)
+        daemon.call('d.custom.set', h, 'hash-status-observed', '')
+        daemon.call('d.custom.set', h, 'hash-status-finished', '')
+        if mode is None:
+            daemon.call('d.check_hash', h)
+        else:
+            daemon.call('d.multicall2', '', 'main', 'd.check_hash=', 'd.hashing.set=' + str(mode))
+        key, value = ('hash-status-finished', 'yes') if mode == 2 else ('hash-status-observed', 'done')
+        daemon.wait(lambda: daemon.call('d.custom', h, key) == value, 'attested full hash completion')
+        methods = ('d.complete', 'd.hashing', 'd.completed_chunks', 'd.size_chunks',
+                   'd.is_hash_checked', 'd.chunks_hashed', 'd.state', 'd.is_active', 'd.message')
+        result = {key: daemon.call(key, h) for key in methods}
+        print('HASH_STATUS', result, flush=True)
+        assert result['d.complete'] == complete and result['d.hashing'] == 0, result
+        assert result['d.completed_chunks'] == (result['d.size_chunks'] if complete else 0), result
+        assert result['d.is_active'] == int(active), result
+        if not active:
+            assert result['d.is_hash_checked'] == 1, result
+            assert result['d.chunks_hashed'] == result['d.size_chunks'], result
+        assert daemon.call('d.custom', h, 'hash-status-queued') == before, 'hash start discarded diagnostic'
+        assert result['d.message'] == message, 'successful full rehash retained owned stale error or changed unrelated text: ' + repr(result)
+
+    payload.write_bytes(b'yyyyyyyy')
+    rehash(0, owned)
+    # A completed hash pass with still-bad data does not retire the diagnosis.
+    rehash(0, owned)
+    payload.write_bytes(b'xxxxxxxx')
+    rehash(1, '')
+
+    def native_failure(mode, message):
+        payload.write_bytes(b'yyyyyyyy')
+        daemon.call('d.custom.set', h, 'hash-status-final-failed', '')
+        # Select the public hashing mode atomically before async completion.
+        # This exercises native emission, not a natural peer-transfer finish.
+        daemon.call('d.multicall2', '', 'main', 'd.check_hash=', 'd.hashing.set=' + str(mode))
+        daemon.wait(lambda: daemon.call('d.message', h) == message, 'native static hash diagnostic')
+        assert daemon.call('d.is_hash_checked', h) == 1
+        assert daemon.call('d.chunks_hashed', h) == daemon.call('d.size_chunks', h)
+        assert daemon.call('d.completed_chunks', h) == 0
+        if mode == 2:
+            assert daemon.call('d.custom', h, 'hash-status-final-failed') == 'yes'
+
+    for failure_mode, message in failures:
+        for success_mode in (1, 2, 3):
+            native_failure(failure_mode, message)
+            payload.write_bytes(b'xxxxxxxx')
+            rehash(1, '', mode=success_mode)
+
+    # These are independent diagnostic texts, not Move/retrackers job fixtures.
+    controls = ('User diagnostic: preserve my message',
+                'autotools: move cancelled: superseded-by-user',
+                'retrackers: enqueue refused: session-storage-failed; repair session storage and run tools/retrackers-apply-existing.php',
+                *(message + ' Independent detail' for _, message in failures))
+    for message in controls:
+        payload.write_bytes(b'yyyyyyyy')
+        rehash(0, owned)
+        daemon.call('d.message.set', h, message)
+        assert daemon.call('d.message', h) == message, 'diagnostic text control must be independently visible'
+        payload.write_bytes(b'xxxxxxxx')
+        for success_mode in (1, 2, 3):
+            rehash(1, message, mode=success_mode)
+    # Even complete data cannot make a newly invalid hashing mode successful.
+    daemon.call('d.multicall2', '', 'main', 'd.check_hash=', 'd.hashing.set=4')
+    daemon.wait(lambda: daemon.call('d.message', h) == failures[2][1], 'new invalid hashing diagnosis')
+    assert daemon.call('d.completed_chunks', h) == daemon.call('d.size_chunks', h)
+    daemon.call('d.message.set', h, controls[0])
+    daemon.call('d.start', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'active repaired download')
+    rehash(1, controls[0], active=True)
 
 
 def stop_cat(daemon):
@@ -442,6 +538,8 @@ def unsafe_async_path(daemon):
     daemon.wait(lambda: 'RR load initialization refused: ' + hash_ in
                 (daemon.directory / 'native.log').read_text() or
                 'RR migration reservation load refused: ' + hash_ in
+                (daemon.directory / 'native.log').read_text() or
+                'erasedata: load refused H=' + hash_ in
                 (daemon.directory / 'native.log').read_text(), 'visible asynchronous refusal')
     assert daemon.call('system.pid') > 0
     assert daemon.call('d.hash', unrelated) == unrelated
@@ -1478,8 +1576,9 @@ def move_claim_crash(daemon, supersede=False):
     if supersede:
         assert daemon.call('system.autotools.move_dispatch', '', 'moveuser') == 'idle'
         assert daemon.call('system.autotools.move_state', '', h) == 'none'
-        daemon.call('d.message.set', h, '')
         assert 'superseded-by-user' in daemon.call('d.message', h)
+        daemon.call('d.message.set', h, '')
+        assert daemon.call('d.message', h) == ''
     else:
         result = daemon.call('d.autotools.move_begin', h, q, daemon.call('d.incarnation', h))
         assert result.startswith('active|' + token + '|')
@@ -1594,6 +1693,414 @@ def move_supersede(daemon):
     daemon.call('d.erase', hash_)
     assert not record.exists()
 
+
+
+def zero_infohash_refusal(daemon):
+    # Captured direct-RPC crash: libtorrent's tracker manager rejects the
+    # decoded zero identity after construction. Refuse it before that point.
+    control = daemon.fixture('zero-infohash-control', start=False)
+    pid = daemon.call('system.pid')
+    cases = [
+        'magnet:?xt=urn:btih:' + 'A' * 32 + '&xt=urn:btmh:1220' + 'ab' * 32,
+        'magnet:?xt=urn:btih:' + '0' * 40,
+        'magnet:?xt=urn:btih:' + '%00' * 20,
+        'magnet:?xt=urn:btih:' + '%30' * 40,
+    ]
+    log = daemon.directory / 'native.log'
+    for index, uri in enumerate(cases):
+        daemon.call('load.normal', '', uri)
+        daemon.wait(lambda: log.exists() and log.read_text().count('zero-info-hash') >= index + 1,
+                    'visible zero infohash refusal')
+        assert daemon.call('system.pid') == pid, 'zero infohash stopped the daemon'
+        assert daemon.call('d.hash', control) == control, 'zero infohash disturbed unrelated download'
+        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[control]]
+    # A raw/session metadata envelope has the same dangerous identity without
+    # any magnet URI; path admission must share the guard.
+    raw = encode({'info': {'meta_download': 1, 'name': 'zero.meta', 'pieces': b'\0' * 20}})
+    (daemon.directory / 'zero-envelope.torrent').write_bytes(raw)
+    daemon.call('load.normal', '', '/data/zero-envelope.torrent')
+    daemon.wait(lambda: log.read_text().count('zero-info-hash') >= len(cases) + 1,
+                'visible zero metadata envelope refusal')
+    assert daemon.call('system.pid') == pid
+    assert daemon.call('d.hash', control) == control
+    # Invalid bencoded scalar/list roots retain the old nonfatal admission path.
+    for index, malformed in enumerate((b'i7e', b'le')):
+        path = daemon.directory / ('malformed-root-' + str(index) + '.torrent')
+        path.write_bytes(malformed)
+        for method, source in [('load.normal', '/data/' + path.name),
+                               ('load.raw', xmlrpc.client.Binary(malformed))]:
+            before = log.read_text().count('invalid-metainfo-root')
+            daemon.call(method, '', source)
+            daemon.wait(lambda: log.read_text().count('invalid-metainfo-root') > before,
+                        'visible malformed metainfo root refusal')
+            assert daemon.call('system.pid') == pid, 'malformed root stopped the daemon'
+            assert daemon.call('d.hash', control) == control
+    # Valid v1 magnets, including a hybrid's extra btmh, remain admissible.
+    valid = '11' * 20
+    daemon.call('load.normal', '', 'magnet:?xt=urn:btih:' + valid + '&xt=urn:btmh:1220' + 'ab' * 32)
+    daemon.wait(lambda: daemon.call('d.hash', valid.upper()) == valid.upper(), 'valid hybrid magnet after refusal')
+
+
+def erasedata_tuple(daemon, h, nonce='a' * 32, user='eraseuser'):
+    return (h, daemon.call('d.incarnation', h), '0000000000000001', user, nonce, 'b' * 64)
+
+
+def erasedata_call(daemon, name, values, *extra):
+    return daemon.call('system.erasedata.' + name, '', *values, *extra)
+
+
+def erasedata_readd_revokes(daemon):
+    h = daemon.fixture('erasedata-readd', start=False)
+    (daemon.directory / 'dl' / 'erasedata-readd').write_bytes(b'newbytes')
+    control = daemon.fixture('erasedata-unrelated', start=False)
+    raw = (daemon.directory / 'erasedata-readd.torrent').read_bytes()
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'prepared', 'live_relation': 'exact'}
+    expect_fault(lambda: daemon.call('d.start', h), 'recovery held')
+    wrong = (*values[:4], 'c' * 32, values[5])
+    assert erasedata_call(daemon, 'state', wrong)['phase'] == 'mismatch'
+    expect_fault(lambda: erasedata_call(daemon, 'erase', wrong), 'intent mismatch')
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'missing'
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    assert erasedata_call(daemon, 'erase', values) == 'committed'
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'committed', 'live_relation': 'absent'}
+    expect_fault(lambda: erasedata_call(daemon, 'cancel', values), 'phase')
+    # Successful re-add revokes C before any load-tail command. Ordinary Remove
+    # entirely between collector ticks can never restore the original authority.
+    daemon.call('load.raw', '', xmlrpc.client.Binary(raw))
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'readd after committed old erase')
+    assert daemon.call('d.incarnation', h) != values[1]
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'missing'
+    daemon.call('d.erase', h)
+    expect_fault(lambda: erasedata_call(daemon, 'collect_start', values), 'missing intent')
+    assert (daemon.directory / 'dl' / 'erasedata-readd').read_bytes() == b'newbytes'
+    assert daemon.call('d.hash', control) == control
+    assert (daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata.lock')).exists()
+
+
+def erasedata_prepared_restart(daemon):
+    h = daemon.fixture('erasedata-prepared-restart', start=False)
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    with (daemon.directory / 'test.rc').open('a') as rc:
+        rc.write('\nmethod.set_key=event.download.inserted,ed-generic,"d.custom1.set=generic"\n')
+        rc.write('method.set_key=event.download.inserted_session,ed-session,"d.custom2.set=session"\n')
+        rc.write('view.filter=main,"d.custom3.set=filter"\n')
+        rc.write('view.event_added=main,"d.custom4.set=view"\n')
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'exact prepared original session restore')
+    assert [daemon.call('d.custom' + str(n), h) for n in range(1, 5)] == ['', '', '', '']
+    assert [h] in daemon.call('d.multicall2', '', 'main', 'd.hash='), 'held original remains visible'
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'prepared', 'live_relation': 'exact'}
+    assert [daemon.call(method, h) for method in ('d.state', 'd.is_open', 'd.is_active')] == [0, 0, 0]
+    assert h + '.erasedata' in daemon.call('d.message', h)
+    expect_fault(lambda: daemon.call('d.start', h), 'recovery held')
+    expect_fault(lambda: daemon.call('d.open', h), 'recovery held')
+    assert erasedata_call(daemon, 'erase', values) == 'committed'
+
+
+def erasedata_session_residue(daemon):
+    h = daemon.fixture('erasedata-session-residue', start=False)
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    residue = daemon.session / (h + '.torrent.meta')
+    residue.mkdir()
+    expect_fault(lambda: erasedata_call(daemon, 'erase', values), '.torrent.meta')
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'erase-started', 'live_relation': 'absent'}
+    assert erasedata_call(daemon, 'collect_start', values) == 'busy'
+    residue.rmdir()  # Exact lab-created residue, manual repair under this test's authority.
+    assert erasedata_call(daemon, 'erase', values) == 'committed'
+
+
+def erasedata_actor(daemon, mode):
+    # Native-owned PHP actor uses the same descriptor propagation as production.
+    daemon.stop()
+    script = daemon.directory / 'app/plugins/erasedata/collect_worker.php'
+    script.parent.mkdir(parents=True)
+    for path in [daemon.directory / 'app', script.parent.parent, script.parent]:
+        path.chmod(0o755)
+    script.write_text(r'''<?php
+function callNative($name, $args) {
+    $socket = stream_socket_client('unix:///data/rtorrent.sock', $errno, $error, 3);
+    if (!$socket) throw new Exception('socket');
+    $xml = '<?xml version="1.0"?><methodCall><methodName>system.erasedata.' . $name . '</methodName><params>';
+    foreach (array_merge(array(''), $args) as $arg)
+        $xml .= '<param><value><string>' . htmlspecialchars($arg, ENT_XML1) . '</string></value></param>';
+    $xml .= '</params></methodCall>';
+    $headers = "CONTENT_LENGTH\0" . strlen($xml) . "\0SCGI\0" . "1\0REQUEST_METHOD\0POST\0REQUEST_URI\0/RPC2\0";
+    $request = strlen($headers) . ':' . $headers . ',' . $xml;
+    while ($request !== '') { $n = fwrite($socket, $request); if (!$n) throw new Exception('write'); $request = substr($request, $n); }
+    $answer = stream_get_contents($socket); fclose($socket);
+    if (strpos($answer, '<fault>') !== false) throw new Exception($answer);
+    return $answer;
+}
+$values = array($argv[2], $argv[3], $argv[4], $argv[1], $argv[5], $argv[6]);
+$proof = array_merge($values, array((string)getmypid()));
+$lease = fopen('php://fd/198', 'r+'); if (!$lease) exit(90);
+try {
+ callNative('collect_begin', $proof);
+ file_put_contents('/data/actor-' . $argv[5], (string)getmypid());
+ if (file_get_contents('/data/actor-mode') === 'family') {
+  $helper = proc_open(array('/usr/bin/php85', '/data/lease-helper.php', $argv[5]),
+      array(0 => array('file','/dev/null','r'), 1 => array('file','/dev/null','a'),
+            2 => array('file','/dev/null','a'), 198 => $lease), $pipes);
+  if (!is_resource($helper)) exit(91);
+  while (!file_exists('/data/helper-' . $argv[5])) usleep(10000);
+  callNative('collect_finish', $proof);
+  file_put_contents('/data/finished-' . $argv[5], 'finished');
+ }
+ while (!file_exists('/data/release-' . $argv[5])) usleep(10000);
+} catch (Throwable $e) { file_put_contents('/data/actor-error-' . $argv[5], $e->getMessage()); exit(92); }
+''')
+    script.chmod(0o644)
+    (daemon.directory / 'actor-mode').write_text(mode)
+    (daemon.directory / 'lease-helper.php').write_text(r'''<?php
+$lease = fopen('php://fd/198', 'r+'); if (!$lease) exit(93);
+file_put_contents('/data/helper-' . $argv[1], (string)getmypid());
+posix_kill(getmypid(), SIGSTOP);
+while (!file_exists('/data/helper-release-' . $argv[1])) usleep(10000);
+''')
+    daemon.environment = {'RUTORRENT_NATIVE_PHP': '/usr/bin/php85', 'RUTORRENT_NATIVE_APP_ROOT': '/data/app'}
+    daemon.supervised = mode == 'family'
+    daemon.start()
+
+
+def erasedata_family_restart(daemon):
+    erasedata_actor(daemon, 'family')
+    h = daemon.fixture('erasedata-family', start=False)
+    raw = (daemon.directory / 'erasedata-family.torrent').read_bytes()
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    assert erasedata_call(daemon, 'erase', values) == 'committed'
+    expect_fault(lambda: erasedata_call(daemon, 'collect_begin', values, '1'), 'exact native worker')
+    assert erasedata_call(daemon, 'collect_start', values) == 'spawned'
+    finished = daemon.directory / ('finished-' + values[4])
+    daemon.wait(lambda: finished.exists(), 'worker finish while helper is stopped')
+    actor = int((daemon.directory / ('actor-' + values[4])).read_text())
+    helper = int((daemon.directory / ('helper-' + values[4])).read_text())
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'missing'
+    # Kill PHP while its stopped descendant retains the exact inherited OFD.
+    docker('exec', daemon.name, 'kill', '-9', str(actor))
+    before = (daemon.directory / 'native.log').read_text().count('collector-busy')
+    daemon.call('load.raw', '', xmlrpc.client.Binary(raw))
+    daemon.wait(lambda: (daemon.directory / 'native.log').read_text().count('collector-busy') > before,
+                'helper excludes new load even after E retirement and PHP death')
+    native = daemon.call('system.pid')
+    docker('exec', daemon.name, 'kill', '-9', str(native))
+    daemon.wait(lambda: docker('exec', daemon.name, 'test', '-d', '/proc/' + str(native), check=False).returncode != 0,
+                'exact old daemon exit')
+    daemon.socket.unlink(missing_ok=True)
+    (daemon.session / 'rtorrent.lock').unlink(missing_ok=True)
+    docker('exec', '-d', daemon.name, '/w/src/rtorrent', '-n', '-o', 'import=/data/test.rc')
+    daemon.wait(lambda: daemon.call('system.pid') != native, 'cold native generation')
+    before = (daemon.directory / 'native.log').read_text().count('collector-busy')
+    daemon.call('load.raw', '', xmlrpc.client.Binary(raw))
+    daemon.wait(lambda: (daemon.directory / 'native.log').read_text().count('collector-busy') > before,
+                'cold generation observes surviving helper even when E is absent')
+    (daemon.directory / ('helper-release-' + values[4])).write_text('release')
+    docker('exec', daemon.name, 'kill', '-CONT', str(helper))
+    lock = daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata.lock')
+    def released():
+        import fcntl
+        with lock.open('r+') as fd:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            return True
+    daemon.wait(released, 'last helper lifetime release')
+    daemon.call('load.raw', '', xmlrpc.client.Binary(raw))
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'successful retry after family exit')
+    newer = erasedata_tuple(daemon, h, 'c' * 32)
+    assert erasedata_call(daemon, 'prepare', newer) == 'prepared'
+    expect_fault(lambda: erasedata_call(daemon, 'collect_finish', values, str(actor)), 'intent mismatch')
+    assert erasedata_call(daemon, 'state', newer)['phase'] == 'prepared'
+
+
+def erasedata_shared_pool(daemon):
+    erasedata_actor(daemon, 'hold')
+    values = []
+    for index in range(9):
+        h = daemon.fixture('erasedata-pool-' + str(index), start=False)
+        row = erasedata_tuple(daemon, h, format(index + 1, '032x'), 'pooluser' + str(index % 2))
+        assert erasedata_call(daemon, 'prepare', row) == 'prepared'
+        assert erasedata_call(daemon, 'erase', row) == 'committed'
+        values.append(row)
+    for row in values[:8]:
+        assert erasedata_call(daemon, 'collect_start', row) == 'spawned'
+    for row in values[:8]:
+        daemon.wait(lambda row=row: (daemon.directory / ('actor-' + row[4])).exists(), 'exact native actor admission')
+    assert erasedata_call(daemon, 'collect_start', values[8]) == 'full'
+    assert len(list(daemon.directory.glob('actor-*'))) == 9  # Includes actor-mode.
+    for row in values[:8]:
+        (daemon.directory / ('release-' + row[4])).write_text('release')
+    daemon.wait(lambda: erasedata_call(daemon, 'collect_start', values[8]) == 'spawned', 'reaped reservation permits ninth actor')
+    (daemon.directory / ('release-' + values[8][4])).write_text('release')
+
+
+def erasedata_uncertain_erase(daemon):
+    h = daemon.fixture('erasedata-uncertain', start=False)
+    values = erasedata_tuple(daemon, h)
+    try:
+        result = erasedata_call(daemon, 'prepare', values)
+        assert result == 'prepared'
+        erasedata_call(daemon, 'erase', values)
+    except (OSError, RuntimeError):
+        pass
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                'exact erasedata crash cut')
+    assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '137'
+    before = (daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata')).read_bytes()
+    assert before[3:4] == (b'P' if daemon.cut == 'erasedata-after-prepare' else b'E')
+    docker('rm', daemon.name)
+    daemon.cut = ''
+    daemon.start()
+    state = erasedata_call(daemon, 'state', values)
+    if state['live_relation'] == 'exact':
+        assert daemon.call('d.state', h) == 0 and not daemon.call('d.is_open', h)
+    assert erasedata_call(daemon, 'erase', values) == 'committed'
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'committed', 'live_relation': 'absent'}
+
+
+def erasedata_unproven_session(daemon):
+    for index, phase in enumerate(('P', 'E', 'C')):
+        h = daemon.fixture('erasedata-unproven-' + phase, start=False)
+        values = erasedata_tuple(daemon, h, format(index + 1, '032x'))
+        assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+        saved = {p.name: p.read_bytes() for p in daemon.session.glob(h + '.torrent*') if p.is_file()}
+        metadata = h + '.torrent.rtorrent'
+        token = b'11:incarnation32:' + values[1].encode()
+        assert saved[metadata].count(token) == 1
+        if phase == 'C': assert erasedata_call(daemon, 'erase', values) == 'committed'
+        daemon.stop(kill=True)
+        record = daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata')
+        if phase == 'E': record.write_bytes(record.read_bytes().replace(b'e1:P:', b'e1:E:', 1))
+        exact = record.read_bytes()
+        for replacement in (b'', b'11:incarnation32:' + b'z' * 32):
+            for name, raw in saved.items():
+                (daemon.session / name).write_bytes(raw.replace(token, replacement) if name == metadata else raw)
+                (daemon.session / name).chmod(0o600)
+            daemon.start()
+            daemon.wait(lambda: 'unproven session identity refused' in (daemon.directory / 'native.log').read_text(),
+                        'unknown saved identity cannot revoke ' + phase)
+            assert record.read_bytes() == exact
+            expect_fault(lambda: daemon.call('d.hash', h), 'info-hash not found')
+            assert erasedata_call(daemon, 'state', values)['live_relation'] == 'absent'
+            daemon.stop(kill=True)
+        for name, raw in saved.items():
+            (daemon.session / name).write_bytes(raw)
+            (daemon.session / name).chmod(0o600)
+        daemon.start()
+        if phase == 'C':
+            daemon.wait(lambda: 'erased session refused' in (daemon.directory / 'native.log').read_text(),
+                        'committed original session cannot resurrect')
+            assert record.read_bytes() == exact
+        else:
+            daemon.wait(lambda: daemon.call('d.hash', h) == h, 'exact original session remains recoverable')
+            assert not daemon.call('d.is_active', h)
+            assert erasedata_call(daemon, 'erase', values) == 'committed'
+
+
+def move_outcome_acknowledgement(daemon):
+    # A retired cancellation is visible until the user acknowledges it. This
+    # must never acknowledge a retained unsafe/terminal queue obligation.
+    h, q = move_complete(daemon, 'move-outcome-ack')
+    receipt = daemon.call('d.stop_close_claim', h, 'e' * 32)
+    assert daemon.call('system.autotools.move_state', '', h) == 'none'
+    assert 'superseded-by-user' in daemon.call('d.message', h)
+    daemon.call('d.release_stop_close_claim', h, receipt.split('|')[0])
+    daemon.call('session.save')
+    daemon.stop()
+    daemon.start()
+    assert 'superseded-by-user' in daemon.call('d.message', h), 'unacknowledged cancellation lost on restart'
+    daemon.call('d.message.set', h, '')
+    assert daemon.call('d.message', h) == '', 'retired Move cancellation overrides explicit user acknowledgement'
+    assert daemon.call('d.custom', h, 'autotools-native-outcome') == ''
+    assert daemon.call('system.autotools.move_state', '', h) == 'none'
+    daemon.call('d.message.set', h, 'independent user message')
+    assert daemon.call('d.message', h) == 'independent user message'
+    daemon.call('session.save')
+    daemon.stop()
+    daemon.start()
+    assert daemon.call('d.custom', h, 'autotools-native-outcome') == '', 'acknowledged outcome returned after restart'
+    # Expiry is the other retired native outcome and has the same explicit
+    # acknowledgement contract, without launching a worker.
+    expired, expired_q = move_complete(daemon, 'move-outcome-expired')
+    expired_record = daemon.session / '.rutorrent-stop-intents' / (expired + '.move')
+    fields = expired_record.read_text().rstrip('\n').split(':')
+    fields[4] = str(int(time.time()) - 86401)
+    expired_record.write_text(':'.join(fields) + '\n')
+    assert daemon.call('system.autotools.move_dispatch', '', 'moveuser') == 'idle'
+    assert not expired_record.exists()
+    assert 'expired' in daemon.call('d.message', expired)
+    daemon.call('d.message.set', expired, 'independent user message')
+    assert daemon.call('d.custom', expired, 'autotools-native-outcome') == ''
+    assert daemon.call('d.message', expired) == 'independent user message'
+    daemon.call('d.message.set', expired, '')
+    assert daemon.call('d.message', expired) == ''
+    # A stale outcome must not make a retained malformed Q dismissible.
+    h, q = move_complete(daemon, 'move-outcome-retained')
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    before = record.read_bytes()
+    daemon.call('d.custom.set', h, 'autotools-native-outcome', 'expired')
+    record.chmod(0o644)
+    daemon.call('d.message.set', h, '')
+    assert daemon.call('d.custom', h, 'autotools-native-outcome') == 'expired'
+    assert record.read_bytes() == before and record.stat().st_mode & 0o7777 == 0o644
+    record.chmod(0o600)
+
+
+def move_dispatch_record_isolation(daemon):
+    user = 'moveuser'
+    dispatcher_actor(daemon, user)
+    scripts = daemon.directory / 'app' / 'plugins' / 'autotools'
+    scripts.mkdir(mode=0o755)
+    (scripts / 'move_worker.php').write_text('<?php\n')
+    (scripts / 'move_worker.php').chmod(0o644)
+    (bad, bad_q), (healthy, healthy_q) = sorted(
+        move_complete(daemon, 'move-record-isolation-' + str(n), user) for n in range(2))
+    # Capture the bad Q first; unreadability cannot retire its Stop obligation.
+    claim = daemon.call('d.autotools.move_begin', bad, bad_q, daemon.call('d.incarnation', bad))
+    assert claim.startswith('active|'), claim
+    intent = daemon.session / '.rutorrent-stop-intents'
+    record, lease = intent / (bad + '.move'), intent / (bad + '.claim')
+    before, held = record.read_bytes(), lease.read_bytes()
+    record.chmod(0o644)
+    dispatch = lambda: daemon.call('system.autotools.move_dispatch', '', user)
+    try:
+        assert dispatch() == 'spawned', 'unreadable first record starved healthy later Move'
+        actors = daemon.directory / 'actor.log'
+        daemon.wait(lambda: actors.exists() and healthy in actors.read_text(), 'healthy Move actor after corrupt record')
+        assert bad not in actors.read_text(), 'unsafe Move record launched a worker'
+        assert daemon.call('system.autotools.move_state', '', healthy).startswith('queued:')
+        assert dispatch() == 'held', 'only held work must stay classified as held'
+        daemon.call('d.message.set', bad, '')
+        assert 'held:' in daemon.call('d.message', bad)
+        assert record.read_bytes() == before and lease.read_bytes() == held, 'unsafe Q or captured lease changed'
+        assert daemon.call('d.stop_close_claim_held', bad) == claim.split('|')[1]
+    finally:
+        record.chmod(0o600)
+
+
+def move_finished_hook_refusal(daemon):
+    # This is the core grammar used by AutoTools' registered finished hook.
+    # Application registration is independently pinned in MoveAdmissionTest.
+    h, q = move_complete(daemon, 'move-finished-hook-refusal')
+    daemon.call('d.autotools.move_finish', h, q)
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    record.mkdir(mode=0o700)
+    daemon.call('method.set_key', '', 'event.download.finished', 'automove',
+                'try="d.autotools.move_enqueue=moveuser"')
+    daemon.call('method.set_key', '', 'event.download.finished', 'zz-native-later',
+                'd.custom.set=finished-later,ran')
+    expect_fault(lambda: daemon.call('d.autotools.move_enqueue', h, 'moveuser'), 'record-unreadable')
+    assert daemon.call('event.download.finished', h) == 0
+    assert daemon.call('d.custom', h, 'finished-later') == 'ran', 'enqueue refusal skipped later finished hook'
+    assert 'record-unreadable' in daemon.call('d.message', h)
+    assert record.is_dir(), 'hook refusal changed unknown record'
 
 
 def move_pool(daemon):
@@ -2190,7 +2697,16 @@ def shutdown_storage_errors(daemon):
     print(f'  storage error lines for {len(hashes)} torrents: {len(lines)}', flush=True)
 
 
-CASES = {'stop-cat': stop_cat, 'claim-restart': claim_restart,
+CASES = {'erasedata-crash-prepared': erasedata_uncertain_erase,
+         'erasedata-crash-before-erase': erasedata_uncertain_erase,
+         'erasedata-crash-after-erase': erasedata_uncertain_erase,
+         'erasedata-unproven-session': erasedata_unproven_session,
+         'erasedata-family-restart': erasedata_family_restart,
+         'erasedata-shared-pool': erasedata_shared_pool,
+         'erasedata-readd-revokes': erasedata_readd_revokes,
+         'erasedata-prepared-restart': erasedata_prepared_restart,
+         'erasedata-session-residue': erasedata_session_residue,
+         'zero-infohash-refusal': zero_infohash_refusal, 'stop-cat': stop_cat, 'claim-restart': claim_restart,
          'claim-finish': claim_finish, 'owner-finalize': owner_finalize,
          'metadata-start': metadata_start, 'metadata-restart': metadata_restart,
          'stale-counter': stale_counter,
@@ -2234,6 +2750,9 @@ CASES.update({'rename-publication': rename_fallback, 'rename-einval': rename_fal
               'move-finish-crash': lambda daemon: move_publication_crash(daemon, finish=True),
               'move-claim-crash': move_claim_crash,
               'move-supersede-crash': lambda daemon: move_claim_crash(daemon, supersede=True), 'move-queue': move_queue, 'move-supersede': move_supersede, 'move-corrupt': move_corrupt, 'move-foreign-leaf': move_foreign_leaf,
+              'move-outcome-acknowledgement': move_outcome_acknowledgement,
+              'move-dispatch-record-isolation': move_dispatch_record_isolation,
+              'move-finished-hook-refusal': move_finished_hook_refusal,
               'move-pool': move_pool, 'move-worker-exhaustion': move_worker_exhaustion, 'move-capture-restart': move_capture_restart, 'move-storage': move_storage,
               'samehash-prepared-prior': samehash_prepared_prior,
               'samehash-prepared-foreign': lambda daemon: samehash_prepared_prior(daemon, foreign=True),
@@ -2252,6 +2771,7 @@ CASES.update({'rename-publication': rename_fallback, 'rename-einval': rename_fal
 CASES.update({'owner-cut-before': owner_cut, 'owner-cut-after': owner_cut,
               'owner-cut-retry': owner_cut_retry, 'owner-tombstone-cut': owner_tombstone_cut,
               'owner-tombstone-startup': owner_tombstone_startup})
+CASES.update({'hash-status-after-repair': hash_status_after_repair})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 

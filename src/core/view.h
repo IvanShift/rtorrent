@@ -74,6 +74,12 @@ public:
   }
 
   void insert(const std::shared_ptr<Download>& download) { base_type::push_back(download); }
+  // Held recovery is visible without executing user filters, comparators or hooks.
+  void insert_held_visible(const std::shared_ptr<Download>& download) {
+    base_type::insert(begin() + m_size, download);
+    ++m_size;
+    emit_changed();
+  }
   void erase(Download* download);
 
   void set_visible(Download* download);

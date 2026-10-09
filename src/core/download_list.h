@@ -56,7 +56,7 @@ public:
   Download*           create(std::istream* str, uint32_t tracker_key, bool printLog);
   Download*           create(torrent::Object* obj, uint32_t tracker_key, bool printLog);
 
-  iterator            insert(Download* d);
+  iterator            insert(Download* d, bool held_recovery = false);
 
   void                erase_ptr(Download* d);
   iterator            erase(iterator itr, bool retire_stop_intent = true);

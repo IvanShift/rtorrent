@@ -1,6 +1,8 @@
 #include "config.h"
 #include "stop_intent.h"
 #include "core/file_jobs.h"
+#include "core/download_admission.h"
+#include "core/erasedata_lifecycle.h"
 
 #include <algorithm>
 #include <cstring>
@@ -112,6 +114,13 @@ DownloadList::find_hex_ptr(const char* hash) {
 
 Download*
 DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) {
+  if (!obj->is_map() || download_input_zero_infohash(*obj)) {
+    const auto reason = obj->is_map() ? "zero-info-hash" : "invalid-metainfo-root";
+    lt_log_print(torrent::LOG_ERROR, "Download load refused: %s", reason);
+    control->core()->push_log_std(std::string("Download load refused: ") + reason);
+    delete obj;
+    return nullptr;
+  }
   torrent::Download download;
 
   try {
@@ -134,7 +143,6 @@ DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) 
 Download*
 DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
   torrent::Object* object = new torrent::Object;
-  torrent::Download download;
 
   try {
     *str >> *object;
@@ -150,7 +158,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
       return NULL;
     }
 
-    download = torrent::download_add(object, tracker_key);
+    return create(object, tracker_key, printLog);
 
   } catch (torrent::local_error& e) {
     delete object;
@@ -161,13 +169,10 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
     return NULL;
   }
 
-  // There's no non-critical exceptions that should be throwable by
-  // the ctor, so don't catch.
-  return new Download(download);
 }
 
 DownloadList::iterator
-DownloadList::insert(Download* download) {
+DownloadList::insert(Download* download, bool held_recovery) {
   iterator itr = base_type::insert(end(), std::shared_ptr<Download>(download));
 
   LT_LOG_DOWNLOAD_DEBUG("inserting download", 0);
@@ -178,12 +183,15 @@ DownloadList::insert(Download* download) {
 
     // This needs to be separated into two different calls to ensure
     // the download remains in the view.
-    for (auto v : *control->view_manager())
-      v->insert(*itr);
-    for (auto v : *control->view_manager())
-      v->filter_download(download);
-
-    DL_TRIGGER_EVENT(*itr, "event.download.inserted");
+    for (auto v : *control->view_manager()) {
+      if (held_recovery && v->name() == "main") v->insert_held_visible(*itr);
+      else v->insert(*itr);
+    }
+    if (!held_recovery) {
+      for (auto v : *control->view_manager())
+        v->filter_download(download);
+      DL_TRIGGER_EVENT(*itr, "event.download.inserted");
+    }
 
   } catch (torrent::local_error& e) {
     // Should perhaps relax this, just print an error and remove the
@@ -235,6 +243,7 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   const bool retire_counter = retire_stop_intent && !retrackers_migration_pending(erase_hash) &&
       !retrackers_migration_original_claim_active(erase_hash) &&
       !retrackers_migration_uncommitted_candidate(erase_hash);
+  erasedata_lifecycle::ordinary_erase(itr->get());
   core::file_jobs::erase_download(itr->get());
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
@@ -285,6 +294,7 @@ DownloadList::open(Download* download) {
 void
 DownloadList::open_throw(Download* download) {
   check_contains(download);
+  erasedata_lifecycle::require_activity(download);
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash())))
     throw torrent::input_error("RR candidate open held until durable release.");
@@ -438,6 +448,7 @@ DownloadList::close_throw(Download* download) {
 void
 DownloadList::resume(Download* download, int flags) {
   check_contains(download);
+  erasedata_lifecycle::require_activity(download);
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash()))) {
     lt_log_print(torrent::LOG_TORRENT_EVENTS, "RR candidate resume held until durable release");
@@ -645,6 +656,20 @@ DownloadList::hash_done(Download* download) {
   if (download->is_done() && download->download()->info()->is_meta_download())
     return process_meta_download(download);
 
+  constexpr auto completed_hash_failure =
+      "Download registered as completed, but hash check returned unfinished chunks.";
+
+  constexpr auto final_hash_failure = "Hash check on download completion found bad chunks.";
+  constexpr auto invalid_hashing_state =
+      "Hash check completed but the \"hashing\" variable is in an invalid state.";
+
+  // Retire exact native diagnoses only after a checked, valid, complete hash.
+  if ((hashing == Download::variable_hashing_initial || hashing == Download::variable_hashing_rehash ||
+       hashing == Download::variable_hashing_last) && download->is_done() &&
+      (download->message() == completed_hash_failure || download->message() == final_hash_failure ||
+       download->message() == invalid_hashing_state))
+    download->set_message({});
+
   switch (hashing) {
   case Download::variable_hashing_initial:
   case Download::variable_hashing_rehash:
@@ -654,7 +679,7 @@ DownloadList::hash_done(Download* download) {
     // f.ex deleted, then we clear the state and complete.
     if (rpc::call_command_value("d.complete", rpc::make_target(download)) && !download->is_done()) {
       set_state_stopped(download);
-      download->set_message("Download registered as completed, but hash check returned unfinished chunks.");
+      download->set_message(completed_hash_failure);
     }
 
     // Save resume data so we update time-stamps and priorities if
@@ -678,7 +703,7 @@ DownloadList::hash_done(Download* download) {
     if (download->is_done()) {
       confirm_finished(download);
     } else {
-      download->set_message("Hash check on download completion found bad chunks.");
+      download->set_message(final_hash_failure);
       LT_LOG_DOWNLOAD_EVENTS("hash check on download completion found bad chunks", 0);
 
       DL_TRIGGER_EVENT(download, "event.download.hash_final_failed");
@@ -690,7 +715,7 @@ DownloadList::hash_done(Download* download) {
   case Download::variable_hashing_stopped:
   default:
     // Either an error or someone wrote to the hashing variable...
-    download->set_message("Hash check completed but the \"hashing\" variable is in an invalid state.");
+    download->set_message(invalid_hashing_state);
     return;
   }
 

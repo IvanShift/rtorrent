@@ -16,6 +16,10 @@ libsub_root_a_SOURCES = \
 	core/http_queue.cc \
 	core/http_queue.h \
 	core/incarnation.h \
+	core/download_admission.h \
+	core/erasedata_intent.h \
+	core/erasedata_lifecycle.h \
+	erasedata_commands.h \
 	core/manager.cc \
 	core/migration_test_cut.h \
 	core/retrackers_migration_creation.h \
