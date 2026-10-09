@@ -45,7 +45,15 @@ def docker(*args, check=True):
 SETTINGS = {'prefix': 'rr-remediation-', 'labels': [], 'seccomp': ''}
 # The one list of cases that need a test-cut build, with the RR_MIG_TEST_CUT
 # each sets. Only --cuts (or naming the case) runs them.
-CUTS = {'owner-cut-before': 'before-owner-ordinary',
+CUTS = {'move-sync-failure': 'move-directory-sync-failed',
+        'move-publish-before': 'before-move-record-publication',
+        'move-publish-after': 'after-move-record-publication',
+        'move-finish-crash': 'after-move-finish',
+        'move-claim-crash': 'after-stop-claim-publication',
+        'move-supersede-crash': 'after-stop-claim-publication',
+        'samehash-prepared-prior': 'after-samehash-prepared',
+        'samehash-prepared-foreign': 'after-samehash-prepared',
+        'owner-cut-before': 'before-owner-ordinary',
         'owner-cut-after': 'after-owner-ordinary',
         'owner-cut-retry': 'before-owner-ordinary-throw',
         'shutdown-early-save': 'after-shutdown-session-save',
@@ -90,7 +98,7 @@ class Daemon:
             'network.listen.port.range.set=45561-45561', 'network.block.ipv6.set=no',
             'dht.mode.set=disable', 'protocol.pex.set=no', 'trackers.use_udp.set=no',
             'log.open_file.flush="native",/data/native.log', 'log.add_output="error","native"',
-            'log.add_output="torrent_error","native"', 'log.add_output="warn","native"', '']))
+            'log.add_output="torrent_events","native"', 'log.add_output="warn","native"', '']))
 
     def start(self):
         self.run()
@@ -983,11 +991,15 @@ def enqueue_storage_check(daemon, hash_, digest, restore):
     assert 'session-storage-failed' in daemon.call('d.message', hash_), daemon.call('d.message', hash_)
     log = (daemon.directory / 'native.log').read_text()
     assert 'RR enqueue refused: session-storage-failed: ' + hash_ in log, log[-2000:]
+    daemon.call('d.message.set', hash_, '')  # Tracker success clears the volatile message.
+    assert 'session-storage-failed' in daemon.call('d.message', hash_)
+    assert daemon.call('d.custom', hash_, 'retrackers-enqueue-user') == digest
     restore()
     marker = daemon.call('d.retrackers.enqueue_original', hash_, daemon.call('d.local_id', hash_), digest,
                          str(daemon.call('d.state', hash_)))
     assert marker.startswith('v2:original:'), marker
     assert daemon.call('d.custom', hash_, 'retrackers-queued').startswith('q1:' + digest + ':')
+    assert daemon.call('d.custom', hash_, 'retrackers-enqueue-refusal') == ''
 
 
 def enqueue_hook(daemon, digest):
@@ -1066,6 +1078,8 @@ def same_hash_job(daemon, name, paused=False, worker=True, user='txuser', prior=
     digest = dispatcher_actor(daemon, user) if worker else '0' * 64
     (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')  # Complete data: a seeding original.
     hash_ = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.complete', hash_) == 1 and daemon.call('d.is_hash_checked', hash_) == 1,
+                'source hash check complete')
     if paused:
         daemon.call('d.stop', hash_)
     assert [daemon.call(m, hash_) for m in ('d.state', 'd.is_open', 'd.is_active')] == (
@@ -1364,6 +1378,464 @@ def retry_cleared_dequeue(daemon):
     daemon.stop()
     daemon.start()
     assert daemon.call('d.custom', hash_, 'retrackers-retry') == ''
+
+
+
+
+
+def immediate_shutdown(daemon):
+    # Latest upstream NetworkConfig owns a delayed notification. Shutdown
+    # must drain it, including a new mutation immediately before SIGINT.
+    daemon.call('network.block.ipv6.set', '', 0)
+    daemon.stop()
+    daemon.start()
+    daemon.call('network.block.ipv6.set', '', 1)
+    docker('kill', '--signal', 'SIGINT', daemon.name)
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false', 'immediate normal shutdown')
+    assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '0'
+    docker('rm', daemon.name)
+    daemon.start()
+
+
+
+def move_sync_failure(daemon):
+    name = 'move-sync-failure'
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    h = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.complete', h) == 1, 'Move sync complete')
+    daemon.call('d.save_full_session', h)
+    daemon.wait(lambda: b'8:completei1e' in (daemon.session / (h + '.torrent.rtorrent')).read_bytes(),
+                'complete session before sync failure')
+    enqueue = lambda: daemon.call('d.autotools.move_enqueue', h, 'moveuser')
+    expect_fault(enqueue, 'enqueue refused')
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    original = record.read_bytes()
+    q = original.decode().split(':')[2]
+    # A visible record after failed directory sync is still not durable
+    # admission; idempotent retry must pass the same sync boundary.
+    expect_fault(enqueue, 'enqueue refused')
+    assert record.read_bytes() == original
+    daemon.call('d.message.set', h, '')
+    assert 'session-storage-failed' in daemon.call('d.message', h)
+    daemon.stop(kill=True)
+    daemon.cut = ''
+    daemon.start()
+    assert enqueue() == 'exists:' + q
+    assert daemon.call('d.message', h) == ''
+    assert record.read_bytes() == original
+
+
+def move_publication_crash(daemon, after=False, finish=False):
+    name = 'move-publication'
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    h = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.complete', h) == 1, 'Move publication complete')
+    daemon.call('d.save_full_session', h)
+    daemon.wait(lambda: b'8:completei1e' in (daemon.session / (h + '.torrent.rtorrent')).read_bytes(),
+                'complete session before record publication cut')
+    q = daemon.call('d.autotools.move_enqueue', h, 'moveuser')[7:] if finish else None
+    try:
+        if finish:
+            daemon.call('d.autotools.move_finish', h, q)
+        else:
+            daemon.call('d.autotools.move_enqueue', h, 'moveuser')
+    except (OSError, RuntimeError):
+        pass
+    else:
+        raise AssertionError('Move publication cut not reached')
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false', 'record cut exit')
+    docker('rm', daemon.name)
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    assert record.exists() == (after and not finish)
+    daemon.cut = ''
+    daemon.start()
+    state = daemon.call('system.autotools.move_state', '', h)
+    assert state.startswith('queued:') if after and not finish else state == 'none'
+    assert not list(record.parent.glob(h + '.move.*.tmp'))
+    assert (daemon.directory / 'dl' / name).read_bytes() == b'xxxxxxxx'
+
+
+def move_claim_crash(daemon, supersede=False):
+    h, q = move_complete(daemon, 'move-claim-cut')
+    daemon.call('d.save_full_session', h)
+    daemon.wait(lambda: b'8:completei1e' in (daemon.session / (h + '.torrent.rtorrent')).read_bytes(), 'claim source save')
+    job = 'e' * 32 if supersede else q
+    try:
+        if supersede:
+            daemon.call('d.stop_close_claim', h, job)
+        else:
+            daemon.call('d.autotools.move_begin', h, q, daemon.call('d.incarnation', h))
+    except (OSError, RuntimeError):
+        pass
+    else:
+        raise AssertionError('Move claim cut not reached')
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false', 'claim cut exit')
+    token = (daemon.session / '.rutorrent-stop-intents' / (h + '.claim')).read_text().splitlines()[0]
+    docker('rm', daemon.name)
+    daemon.cut = ''
+    daemon.start()
+    assert daemon.call('d.stop_close_claim_held', h) == token
+    if supersede:
+        assert daemon.call('system.autotools.move_dispatch', '', 'moveuser') == 'idle'
+        assert daemon.call('system.autotools.move_state', '', h) == 'none'
+        daemon.call('d.message.set', h, '')
+        assert 'superseded-by-user' in daemon.call('d.message', h)
+    else:
+        result = daemon.call('d.autotools.move_begin', h, q, daemon.call('d.incarnation', h))
+        assert result.startswith('active|' + token + '|')
+        assert [daemon.call(method, h) for method in ('d.state', 'd.is_open', 'd.is_active')] == [0, 0, 0]
+    assert (daemon.directory / 'dl' / 'move-claim-cut').read_bytes() == b'xxxxxxxx'
+
+
+def move_no_adopter(daemon):
+    # Production-image compatible: no compiler, replacement actor or test cut.
+    control = daemon.fixture('move-no-adopter-control', start=False)
+    pid = daemon.call('system.pid')
+    methods = set(daemon.call('system.listMethods'))
+    assert 'd.autotools.move_adopt' not in methods, 'removed Move adopter remains registered'
+    required = {'system.autotools.move_queue', 'system.autotools.move_state',
+                'system.autotools.move_owner', 'system.autotools.move_dispatch',
+                'system.autotools.move_reset', 'd.autotools.move_enqueue',
+                'd.autotools.move_begin', 'd.autotools.move_defer',
+                'd.autotools.move_finish', 'd.autotools.move_cancel'}
+    assert required <= methods, 'current Move queue capability was removed'
+    assert daemon.call('system.autotools.move_queue', '') == 1
+    try:
+        daemon.call('d.autotools.move_adopt', control, 'a' * 32, 'moveuser')
+    except xmlrpc.client.Fault as error:
+        assert error.faultCode == -506, 'removed method failed for a reason other than absence'
+    else:
+        raise AssertionError('removed Move adopter still callable')
+    assert daemon.call('system.pid') == pid
+    assert daemon.call('d.hash', control) == control
+    assert daemon.call('d.state', control) == 0
+
+
+def move_complete(daemon, name, user='moveuser'):
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    hash_ = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.complete', hash_) == 1, 'complete Move source')
+    queued = daemon.call('d.autotools.move_enqueue', hash_, user)
+    assert queued.startswith('queued:'), queued
+    return hash_, queued[7:]
+
+
+def move_queue(daemon):
+    assert daemon.call('system.autotools.move_queue', '') == 1
+    incomplete = daemon.fixture('move-incomplete', start=False)
+    expect_fault(lambda: daemon.call('d.autotools.move_enqueue', incomplete, 'moveuser'), 'complete')
+    hash_, q = move_complete(daemon, 'move-queue')
+    state = lambda: daemon.call('system.autotools.move_state', '', hash_)
+    assert state().startswith('queued:' + hashlib.sha256(b'moveuser').hexdigest() + ':' + q + ':')
+    assert daemon.call('d.autotools.move_enqueue', hash_, 'moveuser') == 'exists:' + q
+    record = daemon.session / '.rutorrent-stop-intents' / (hash_ + '.move')
+    saved = record.read_bytes()
+    expect_fault(lambda: daemon.call('d.autotools.move_enqueue', hash_, 'foreignuser'), 'owner-changed')
+    assert record.read_bytes() == saved
+    assert daemon.call('d.custom', hash_, 'autotools-enqueue-refusal') == ''
+    assert 'owner-changed' in daemon.call('d.message', hash_)
+    daemon.call('d.message.set', hash_, '')
+    assert record.stat().st_mode & 0o777 == 0o600
+    daemon.stop()
+    daemon.start()
+    assert record.read_bytes() == saved
+    assert state().startswith('queued:')
+    i = daemon.call('d.incarnation', hash_)
+    assert daemon.call('d.autotools.move_begin', hash_, q, 'f' * 32) == 'busy:incarnation-changed'
+    begin = daemon.call('d.autotools.move_begin', hash_, q, i)
+    assert begin.startswith('active|'), begin
+    token = begin.split('|')[1]
+    assert daemon.call('d.stop_close_claim_held', hash_) == token
+    assert state().endswith(':' + token)
+    expect_fault(lambda: daemon.call('d.autotools.move_finish', hash_, q), 'blocked by lease')
+    expect_fault(lambda: daemon.call('d.erase', hash_), 'reserved')
+    daemon.call('d.stop', hash_)  # A late user Stop overrides the original run receipt.
+    daemon.call('d.start_if_stop_close_claim', hash_, token)
+    daemon.call('d.replay_stop_close_claim', hash_, q)
+    daemon.call('d.ack_stop_close_claim', hash_, q)
+    assert daemon.call('d.state', hash_) == 0
+    previous = ''
+    wait = f'r1:{q}:0:{int(time.time()) + 30}:source-not-ready'
+    assert daemon.call('d.autotools.move_defer', hash_, q, previous, wait) == 'deferred'
+    previous = wait
+    expect_fault(lambda: daemon.call('d.autotools.move_defer', hash_, q, '', wait), 'CAS changed')
+    for count in range(1, 7):
+        due = 0 if count == 6 else int(time.time()) + 60 * 2 ** (count - 1)
+        retry = f'r1:{q}:{count}:{due}:preflight-refused'
+        assert daemon.call('d.autotools.move_defer', hash_, q, previous, retry) == 'deferred'
+        previous = retry
+    assert state().startswith('terminal:')
+    daemon.call('d.message.set', hash_, '')
+    assert 'retries exhausted' in daemon.call('d.message', hash_)
+    assert daemon.call('system.autotools.move_dispatch', '', 'moveuser') == 'idle'
+    daemon.stop()
+    daemon.start()
+    assert state().startswith('terminal:')
+    assert daemon.call('system.autotools.move_reset', '', hash_) == 'reset'
+    assert state().endswith(':')
+    expect_fault(lambda: daemon.call('d.autotools.move_finish', hash_, 'a' * 32), 'queue changed')
+    assert daemon.call('d.autotools.move_finish', hash_, q) == 'finished'
+    assert state() == 'none'
+    assert not record.exists()
+    assert daemon.call('d.autotools.move_finish', hash_, q) == 'none'
+
+
+def move_supersede(daemon):
+    hash_, q = move_complete(daemon, 'move-supersede')
+    job = 'e' * 32
+    receipt = daemon.call('d.stop_close_claim', hash_, job)
+    assert daemon.call('system.autotools.move_state', '', hash_) == 'none'
+    assert 'superseded-by-user' in daemon.call('d.message', hash_)
+    daemon.call('d.release_stop_close_claim', hash_, receipt.split('|')[0])
+    daemon.call('d.replay_stop_close_claim', hash_, job)
+    daemon.call('d.ack_stop_close_claim', hash_, job)
+    hash_, q = move_complete(daemon, 'move-direct-erase')
+    record = daemon.session / '.rutorrent-stop-intents' / (hash_ + '.move')
+    daemon.call('d.erase', hash_)
+    assert not record.exists()
+
+
+
+def move_pool(daemon):
+    user = 'moveuser'
+    digest = dispatcher_actor(daemon, user)
+    scripts = daemon.directory / 'app' / 'plugins' / 'autotools'
+    scripts.mkdir(mode=0o755)
+    (scripts / 'move_worker.php').write_text('<?php\n')
+    (scripts / 'move_worker.php').chmod(0o644)
+    jobs = [move_complete(daemon, 'pool-move-' + str(n), user) for n in range(3)]
+    dispatch = lambda: daemon.call('system.autotools.move_dispatch', '', user)
+    assert dispatch() == 'spawned'
+    assert dispatch() == 'spawned'
+    assert dispatch() == 'full', 'Move exceeded its two shared reservations'
+    # Six retracker workers can use the remaining slots; the seventh cannot.
+    for n in range(7):
+        h = daemon.fixture('pool-rr-' + str(n), start=False)
+        marker = daemon.call('d.retrackers.enqueue_original', h, daemon.call('d.local_id', h), digest, '0')
+        result = daemon.call('system.retrackers.worker_start', '', h, marker.rsplit(':', 1)[1], daemon.call('d.incarnation', h), user)
+        assert result == ('spawned' if n < 6 else 'full'), result
+    actors = daemon.directory / 'actor.log'
+    daemon.wait(lambda: len([line for line in actors.read_text().splitlines() if '/move_worker.php ' in line]) == 2,
+                'two fixed Move actors')
+    lines = [line for line in actors.read_text().splitlines() if '/move_worker.php ' in line]
+    line = lines[0].split()
+    h, q = line[2], line[3]
+    pid = line[-1].split('=')[1]
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    docker('exec', daemon.name, 'kill', '-9', pid)
+    daemon.wait(lambda: b':1:' in record.read_bytes() and b':worker-exit' in record.read_bytes(), 'counted Move exit')
+    state = daemon.call('system.autotools.move_state', '', h)
+    assert state.endswith(':worker-exit'), state
+    assert f'r1:{q}:1:' in state
+    assert dispatch() == 'spawned', 'reaped shared reservation did not become available'
+
+
+
+def move_worker_exhaustion(daemon):
+    user = 'moveuser'
+    dispatcher_actor(daemon, user)
+    scripts = daemon.directory / 'app' / 'plugins' / 'autotools'
+    scripts.mkdir(mode=0o755)
+    (scripts / 'move_worker.php').write_text('<?php\n')
+    (scripts / 'move_worker.php').chmod(0o644)
+    h, q = move_complete(daemon, 'move-exhausted', user)
+    i = daemon.call('d.incarnation', h)
+    receipt = daemon.call('d.autotools.move_begin', h, q, i)
+    assert receipt.startswith('active|')
+    token = receipt.split('|')[1]
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    actors = daemon.directory / 'actor.log'
+    dispatch = lambda: daemon.call('system.autotools.move_dispatch', '', user)
+    for count in range(1, 7):
+        if count > 1:
+            fields = record.read_text().strip().split(':')
+            fields[8] = '1'  # Advance only the fixture's clock eligibility; keep Q/count/reason.
+            record.write_text(':'.join(fields) + '\n')
+        before = actors.read_text().splitlines() if actors.exists() else []
+        assert dispatch() == 'spawned'
+        daemon.wait(lambda: len(actors.read_text().splitlines()) > len(before), 'Move actor launch')
+        pid = actors.read_text().splitlines()[-1].split(' pid=')[1]
+        docker('exec', daemon.name, 'kill', '-9', pid)
+        assert dispatch() == 'idle', 'reaped identity relaunched before exit accounting/backoff'
+        daemon.wait(lambda: len(record.read_text().strip().split(':')) == 10 and
+                    record.read_text().strip().split(':')[7] == str(count), 'Move worker exit counted')
+        fields = record.read_text().strip().split(':')
+        assert fields[9] == 'worker-exit'
+        due = int(fields[8])
+        assert due == 0 if count == 6 else 0 < due - int(time.time()) <= 60 * 2 ** (count - 1)
+        assert daemon.call('d.stop_close_claim_held', h) == token, 'exit retired captured lease'
+    assert daemon.call('system.autotools.move_state', '', h) == 'held:worker-exit'
+    assert daemon.call('system.autotools.move_owner', '', h) == hashlib.sha256(user.encode()).hexdigest()
+    assert dispatch() == 'idle'
+    assert 'retries exhausted' in daemon.call('d.message', h)
+    assert daemon.call('system.autotools.move_reset', '', h) == 'reset'
+    assert daemon.call('d.stop_close_claim_held', h) == token
+    assert dispatch() == 'spawned', 'reset did not resume the retained recovery'
+
+
+def move_capture_restart(daemon):
+    name = 'move-capture-restart'
+    h, q = move_complete(daemon, name)
+    record = daemon.session / '.rutorrent-stop-intents' / (h + '.move')
+    saved = record.read_bytes()
+    job = same_hash_job(daemon, name, worker=False)
+    assert record.read_bytes() == saved, 'capture erase lost native Move intent'
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'captured original restored')
+    assert record.read_bytes() == saved
+    assert daemon.call('d.custom', h, 'retrackers-queued') == job['queue']
+    assert daemon.call('d.custom', h, 'retrackers-queue-finished') == ''
+    assert daemon.call('system.autotools.move_state', '', h).startswith('queued:')
+
+
+def move_storage(daemon):
+    # A failed record publication must be visible after the volatile message
+    # is cleared, without terminating an event hook or touching payload.
+    h, q = move_complete(daemon, 'move-storage')
+    assert daemon.call('d.autotools.move_finish', h, q) == 'finished'
+    intent = daemon.session / '.rutorrent-stop-intents'
+    intent.chmod(0o500)
+    try:
+        expect_fault(lambda: daemon.call('d.autotools.move_enqueue', h, 'moveuser'), 'record-unreadable')
+        daemon.call('d.message.set', h, '')
+        assert 'record-malformed' in daemon.call('d.message', h)
+        assert daemon.call('system.pid') > 0
+    finally:
+        intent.chmod(0o700)
+    assert daemon.call('d.autotools.move_enqueue', h, 'moveuser').startswith('queued:')
+    assert daemon.call('d.message', h) == ''
+    intent.chmod(0o500)
+    try:
+        expect_fault(lambda: daemon.call('d.autotools.move_enqueue', h, 'moveuser'), 'record-unreadable')
+    finally:
+        intent.chmod(0o700)
+    assert daemon.call('d.autotools.move_enqueue', h, 'moveuser').startswith('exists:')
+    assert daemon.call('d.message', h) == '', 'repaired idempotent enqueue retained owned refusal'
+
+
+
+def move_foreign_leaf(daemon):
+    # Another Unix UID writes the leaf while the owner has temporarily made
+    # its parents writable. Restoring parent permissions does not make that
+    # foreign single-link regular record admissible.
+    h, q = move_complete(daemon, 'move-foreign-leaf')
+    other = daemon.fixture('move-foreign-control', start=False)
+    intent = daemon.session / '.rutorrent-stop-intents'
+    record = intent / (h + '.move')
+    original = record.read_bytes()
+    record.unlink()
+    daemon.session.chmod(0o777)
+    intent.chmod(0o777)
+    try:
+        docker('exec', '--user', '65534:65534', daemon.name, 'sh', '-c',
+               'umask 077; printf %s "$1" > "$2"', 'sh', original.decode(),
+               '/data/.session/.rutorrent-stop-intents/' + h + '.move')
+    finally:
+        intent.chmod(0o700)
+        daemon.session.chmod(0o2700)
+    assert record.stat().st_uid == 65534
+    assert daemon.call('system.autotools.move_state', '', h) == 'held:record-malformed'
+    expect_fault(lambda: daemon.call('d.autotools.move_begin', h, q, daemon.call('d.incarnation', h)), 'record-unreadable')
+    assert daemon.call('d.hash', other) == other
+    assert daemon.call('system.pid') > 0
+    record.unlink()
+    record.write_bytes(original)
+    record.chmod(0o600)
+    assert daemon.call('d.autotools.move_cancel', h, q, 'configuration-declined') == 'cancelled'
+
+
+def move_corrupt(daemon):
+    hash_, q = move_complete(daemon, 'move-corrupt')
+    record = daemon.session / '.rutorrent-stop-intents' / (hash_ + '.move')
+    original = record.read_bytes()
+    record.write_bytes(b'm1:broken\n')
+    assert daemon.call('system.autotools.move_state', '', hash_) == 'held:record-malformed'
+    daemon.call('d.message.set', hash_, '')
+    assert str(hash_) + '.move' in daemon.call('d.message', hash_)
+    expect_fault(lambda: daemon.call('d.erase', hash_), 'Move record blocks')
+    assert daemon.call('system.pid') > 0
+    record.write_bytes(original)
+    assert daemon.call('d.autotools.move_cancel', hash_, q, 'configuration-declined') == 'cancelled'
+
+
+def samehash_prepared_prior(daemon, foreign=False):
+    # ACC4-OWN-N-01: a previous ordinary owner pointer belongs to the source,
+    # while prepared belongs to its committed same-hash successor.
+    daemon.stop(kill=True)
+    daemon.cut = ''
+    daemon.start()
+    unrelated = daemon.fixture('prepared-unrelated', start=False)
+    daemon.call('d.save_full_session', unrelated)
+    daemon.wait(lambda: (daemon.session / (unrelated + '.torrent')).exists(), 'unrelated session save')
+    name = 'prepared-prior'
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    hash_ = daemon.fixture(name)
+    daemon.wait(lambda: daemon.call('d.is_hash_checked', hash_) == 1, 'initial hash check')
+    tx, incarnation = daemon.begin(hash_)
+    assert daemon.call('d.retrackers.finish_original', hash_, tx, incarnation) == 'finalized'
+    pointer = daemon.session / '.retrackers-migration' / (hash_ + '.owner.current')
+    daemon.stop(kill=True)
+    daemon.cut = 'after-samehash-prepared'
+    daemon.start()
+    job = same_hash_job(daemon, name, worker=False)
+    candidate = load_candidate(daemon, job)
+    assert candidate != incarnation
+    assert daemon.call('d.retrackers.commit', hash_, hash_, job['local'], job['tx']) == 'committed'
+    try:
+        daemon.call('d.retrackers.release_committed', hash_, job['tx'], candidate)
+    except (OSError, RuntimeError):
+        pass
+    else:
+        raise AssertionError('samehash prepare cut did not end the daemon')
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false', 'prepare cut exit')
+    assert pointer.read_text().strip().split(':')[-1] == incarnation, 'cut must retain source owner incarnation'
+    assert pointer.read_text().strip().split(':')[-1] != candidate
+    assert (daemon.session / '.retrackers-migration' / (hash_ + '.prepared.receipt')).exists()
+    docker('rm', daemon.name)
+    if foreign:
+        pointer.write_text('retired:' + hash_ + ':' + 'f' * 32 + '\n')
+    daemon.cut = ''
+    daemon.start()
+    assert daemon.call('d.hash', unrelated) == unrelated
+    if foreign:
+        assert hash_ not in [row[0] for row in daemon.call('d.multicall2', '', 'main', 'd.hash=')]
+        assert 'RR prepared startup authority mismatch' in (daemon.directory / 'native.log').read_text()
+        assert (daemon.directory / 'dl' / name).read_bytes() == b'xxxxxxxx'
+        return
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_, 'samehash prepared source returns')
+    assert daemon.call('system.retrackers.original_claim', '', hash_).startswith('finalized:' + job['tx'] + ':')
+    assert daemon.call('d.incarnation', hash_) == candidate
+    assert (daemon.directory / 'dl' / name).read_bytes() == b'xxxxxxxx'
+    assert daemon.call('d.custom', hash_, 'retrackers-queued') == job['queue']
+    assert daemon.call('d.custom', hash_, 'retrackers-queue-finished').endswith(job['queue'][68:])
+    daemon.stop(kill=True)
+    daemon.start()
+    assert daemon.call('d.hash', hash_) == hash_
+
+
+
+def samehash_resume(daemon):
+    # ACC4-SCALE-01 / ACC4-OWN-P4c: libtorrent logs each full hash pass.
+    # Copying the captured resume proof must keep both active and paused
+    # replacements on its normal quick-check path (sizes/mtimes still apply).
+    for paused in (False, True):
+        job = same_hash_job(daemon, 'resume-paused-' + str(int(paused)), paused=paused, worker=False)
+        h = job['hash']
+        log = daemon.directory / 'native.log'
+        passes = lambda: len([line for line in log.read_text().splitlines() if h in line and 'try_quick:0.' in line])
+        initial = passes()
+        assert initial == 1, ('initial full hash passes', initial)
+        candidate = load_candidate(daemon, job)
+        assert daemon.call('d.retrackers.commit', h, h, job['local'], job['tx']) == 'committed'
+        assert daemon.call('d.retrackers.release_committed', h, job['tx'], candidate) == 'released'
+        if paused:
+            assert daemon.call('d.complete', h) == 1, 'paused completion bit lost'
+            daemon.call('d.start', h)
+        daemon.wait(lambda: daemon.call('d.is_active', h) == 1 and daemon.call('d.is_hash_checked', h) == 1,
+                    'samehash replacement resumed')
+        assert passes() == initial, 'samehash replacement hashed payload twice'
+        assert (daemon.directory / 'dl' / job['name']).read_bytes() == b'xxxxxxxx'
 
 
 def pause_kept(daemon):
@@ -1753,7 +2225,18 @@ CASES.update({'rename-publication': rename_fallback, 'rename-einval': rename_fal
               'capture-stop-candidate': lambda daemon: capture_phase(daemon, 'candidate', stop=True),
               'capture-stop-committed': lambda daemon: capture_phase(daemon, 'committed', stop=True),
               'retry-cleared-dequeue': retry_cleared_dequeue,
-              'pause-kept': pause_kept,
+              'pause-kept': pause_kept, 'samehash-resume': samehash_resume,
+              'immediate-shutdown': immediate_shutdown,
+              'move-no-adopter': move_no_adopter,
+              'move-sync-failure': move_sync_failure,
+              'move-publish-before': move_publication_crash,
+              'move-publish-after': lambda daemon: move_publication_crash(daemon, after=True),
+              'move-finish-crash': lambda daemon: move_publication_crash(daemon, finish=True),
+              'move-claim-crash': move_claim_crash,
+              'move-supersede-crash': lambda daemon: move_claim_crash(daemon, supersede=True), 'move-queue': move_queue, 'move-supersede': move_supersede, 'move-corrupt': move_corrupt, 'move-foreign-leaf': move_foreign_leaf,
+              'move-pool': move_pool, 'move-worker-exhaustion': move_worker_exhaustion, 'move-capture-restart': move_capture_restart, 'move-storage': move_storage,
+              'samehash-prepared-prior': samehash_prepared_prior,
+              'samehash-prepared-foreign': lambda daemon: samehash_prepared_prior(daemon, foreign=True),
               'erase-retire-batch': erase_retire_batch,
               'dispatcher-gate-busy': dispatcher_gate_busy,
               'dispatcher-gate-cost': dispatcher_gate_cost,

@@ -1,5 +1,6 @@
 #include "config.h"
 #include "stop_intent.h"
+#include "core/file_jobs.h"
 
 #include <algorithm>
 #include <cstring>
@@ -33,7 +34,12 @@
 #include "session/session_manager.h"
 #include "ui/root.h"
 
-#define DL_TRIGGER_EVENT(download, event_name) \
+#define LT_LOG_DOWNLOAD_DEBUG(log_fmt, ...)                             \
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : " log_fmt, __VA_ARGS__);
+#define LT_LOG_DOWNLOAD_EVENTS(log_fmt, ...)                             \
+  lt_log_print_info(torrent::LOG_TORRENT_EVENTS, download->info(), "download_list", log_fmt, __VA_ARGS__);
+
+#define DL_TRIGGER_EVENT(download, event_name)                          \
   rpc::commands.call_catch(event_name, rpc::make_target(download), torrent::Object(), "Event '" event_name "' failed: ");
 
 namespace core {
@@ -113,7 +119,7 @@ DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) 
 
   } catch (torrent::local_error& e) {
     if (printLog)
-      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download: %s", e.what());
+      lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not create download : %s", e.what());
 
     delete obj;
 
@@ -139,7 +145,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
       delete object;
 
       if (printLog)
-        lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download, the input is not a valid torrent.");
+        lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not create download : invalid or incomplete bencode data");
 
       return NULL;
     }
@@ -150,7 +156,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
     delete object;
 
     if (printLog)
-      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download: %s", e.what());
+      lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not create download : %s", e.what());
 
     return NULL;
   }
@@ -164,7 +170,7 @@ DownloadList::iterator
 DownloadList::insert(Download* download) {
   iterator itr = base_type::insert(end(), std::shared_ptr<Download>(download));
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Inserting download.");
+  LT_LOG_DOWNLOAD_DEBUG("inserting download", 0);
 
   try {
     (*itr)->data()->slot_initial_hash()        = std::bind(&DownloadList::hash_done, this, download);
@@ -229,12 +235,13 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   const bool retire_counter = retire_stop_intent && !retrackers_migration_pending(erase_hash) &&
       !retrackers_migration_original_claim_active(erase_hash) &&
       !retrackers_migration_uncommitted_candidate(erase_hash);
+  core::file_jobs::erase_download(itr->get());
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
   // Erasure and its view callbacks are internal shutdown, not a newer user Stop.
   stop_intent::ScopedSuppress suppress;
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, (*itr)->info(), "download_list", "Erasing download.");
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, (*itr)->info()->hash(), "download_list : removing download");
 
   // Makes sure close doesn't restart hashing of this download.
   (*itr)->set_hash_failed(true);
@@ -270,7 +277,7 @@ DownloadList::open(Download* download) {
     return true;
 
   } catch (torrent::local_error& e) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not open download: %s", e.what());
+    lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not open download : %s", e.what());
     return false;
   }
 }
@@ -284,7 +291,7 @@ DownloadList::open_throw(Download* download) {
   if (!stop_intent::owner_open() && !stop_intent::terminal_activity_allowed(download))
     stop_intent::require_unleased(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Opening download.");
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : opening download");
 
   if (download->download()->info()->is_open())
     return;
@@ -295,6 +302,7 @@ DownloadList::open_throw(Download* download) {
     openFlags |= torrent::Download::open_enable_fallocate;
 
   download->download()->open(openFlags);
+
   DL_TRIGGER_EVENT(download, "event.download.opened");
 }
 
@@ -304,7 +312,7 @@ DownloadList::close(Download* download) {
     close_throw(download);
 
   } catch (torrent::local_error& e) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not close download: %s", e.what());
+    lt_log_print(torrent::LOG_TORRENT_EVENTS, "download_list : could not close download : %s", e.what());
   }
 }
 
@@ -312,7 +320,7 @@ DownloadList::close(Download* download) {
 // need the files closed and will keep using the download.
 void
 DownloadList::close_files(Download* download) {
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Closing download files.");
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download files");
 
   if (download->download()->info()->is_active()) {
     download->download()->stop(torrent::Download::stop_skip_tracker);
@@ -327,7 +335,7 @@ DownloadList::close_files(Download* download) {
 
 void
 DownloadList::close_directly(Download* download) {
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Closing download directly.");
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download directly");
 
   auto lifetime   = download->lifetime();
   bool was_active = download->download()->info()->is_active();
@@ -374,7 +382,8 @@ DownloadList::update_paused_state(Download* download) {
 
 void
 DownloadList::close_quick(Download* download) {
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Closing download quickly.");
+  lt_log_print_hash_only(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download quickly.");
+
   close(download);
 
   // Make sure we cancel any tracker requests. This should rather be
@@ -388,7 +397,7 @@ void
 DownloadList::close_throw(Download* download) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Closing download with throw.");
+  LT_LOG_DOWNLOAD_DEBUG("closing download with throw", 0);
 
   // When pause gets called it will clear the initial hash check state
   // and set hash failed. This should ensure hashing doesn't restart
@@ -431,16 +440,16 @@ DownloadList::resume(Download* download, int flags) {
   check_contains(download);
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash()))) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "RR candidate resume held until durable release");
+    lt_log_print(torrent::LOG_TORRENT_EVENTS, "RR candidate resume held until durable release");
     return;
   }
   if (!stop_intent::owner_restoring() && !stop_intent::terminal_activity_allowed(download) &&
       !stop_intent::held(download).empty()) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Stop claim held native resume");
+    lt_log_print(torrent::LOG_TORRENT_EVENTS, "Stop claim held native resume");
     return;
   }
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Resuming download: flags:%0x.", flags);
+  LT_LOG_DOWNLOAD_DEBUG("resuming download : flags:%0x.", flags);
 
   try {
 
@@ -529,7 +538,7 @@ DownloadList::resume(Download* download, int flags) {
     DL_TRIGGER_EVENT(download, "event.download.resumed");
 
   } catch (torrent::local_error& e) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not resume download: %s", e.what());
+    LT_LOG_DOWNLOAD_EVENTS("could not resume download : %s", e.what());
   }
 }
 
@@ -537,7 +546,7 @@ void
 DownloadList::pause(Download* download, int flags) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Pausing download: flags:%0x.", flags);
+  LT_LOG_DOWNLOAD_DEBUG("pausing download : flags:%0x.", flags);
 
   auto lifetime = download->lifetime();
 
@@ -580,7 +589,7 @@ DownloadList::pause(Download* download, int flags) {
     //control->core()->download_store()->save(download);
 
   } catch (torrent::local_error& e) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not pause download: %s", e.what());
+    LT_LOG_DOWNLOAD_EVENTS("could not pause download : %s", e.what());
   }
 }
 
@@ -588,7 +597,7 @@ void
 DownloadList::check_hash(Download* download) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Checking hash.");
+  LT_LOG_DOWNLOAD_DEBUG("checking hash", 0);
 
   try {
     if (rpc::call_command_value("d.hashing", rpc::make_target(download)) != Download::variable_hashing_stopped)
@@ -597,7 +606,7 @@ DownloadList::check_hash(Download* download) {
     hash_queue(download, Download::variable_hashing_rehash);
 
   } catch (torrent::local_error& e) {
-    lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not check hash: %s", e.what());
+    LT_LOG_DOWNLOAD_EVENTS("could not check hash : %s", e.what());
   }
 }
 
@@ -605,7 +614,7 @@ void
 DownloadList::hash_done(Download* download) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Hash done.");
+  LT_LOG_DOWNLOAD_DEBUG("hash done", 0);
 
   if (download->is_hash_checking() || download->is_active())
     throw torrent::internal_error("DownloadList::hash_done(...) download in invalid state.");
@@ -670,7 +679,8 @@ DownloadList::hash_done(Download* download) {
       confirm_finished(download);
     } else {
       download->set_message("Hash check on download completion found bad chunks.");
-      lt_log_print(torrent::LOG_TORRENT_ERROR, "Hash check on download completion found bad chunks.");
+      LT_LOG_DOWNLOAD_EVENTS("hash check on download completion found bad chunks", 0);
+
       DL_TRIGGER_EVENT(download, "event.download.hash_final_failed");
     }
 
@@ -691,7 +701,7 @@ void
 DownloadList::hash_queue(Download* download, int type) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Hash queue.");
+  LT_LOG_DOWNLOAD_DEBUG("hash queue : type:%d", type);
 
   if (rpc::call_command_value("d.hashing", rpc::make_target(download)) != Download::variable_hashing_stopped)
     throw torrent::internal_error("DownloadList::hash_queue(...) hashing already queued.");
@@ -735,7 +745,7 @@ void
 DownloadList::received_finished(Download* download) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Received finished.");
+  LT_LOG_DOWNLOAD_DEBUG("received finished", 0);
 
   if (rpc::call_command_value("pieces.hash.on_completion"))
     // Set some 'checking_finished_thingie' variable to make hash_done
@@ -750,7 +760,7 @@ void
 DownloadList::confirm_finished(Download* download) {
   check_contains(download);
 
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Confirming finished.");
+  LT_LOG_DOWNLOAD_DEBUG("confirming finished", 0);
 
   if (download->download()->info()->is_meta_download())
     return process_meta_download(download);
@@ -825,7 +835,7 @@ DownloadList::confirm_finished(Download* download) {
 
 void
 DownloadList::process_meta_download(Download* download) {
-  lt_log_print_info(torrent::LOG_TORRENT_INFO, download->info(), "download_list", "Processing meta download.");
+  LT_LOG_DOWNLOAD_DEBUG("processing meta download", 0);
 
   const auto lifetime = download->lifetime();
   try {
@@ -855,7 +865,7 @@ DownloadList::process_meta_download(Download* download) {
     std::fstream file(metafile.c_str(), std::ios::in | std::ios::binary);
 
     if (!file.is_open()) {
-      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not read download metadata.");
+      LT_LOG_DOWNLOAD_EVENTS("could not read download metadata : %s", metafile.c_str());
       return;
     }
 
@@ -863,7 +873,7 @@ DownloadList::process_meta_download(Download* download) {
     file >> bencode->insert_key("info", torrent::Object());
 
     if (file.fail()) {
-      lt_log_print(torrent::LOG_TORRENT_ERROR, "Could not create download, the input is not a valid torrent.");
+      LT_LOG_DOWNLOAD_EVENTS("could not create download, the input is not a valid torrent : %s", metafile.c_str());
       return;
     }
 
@@ -907,6 +917,7 @@ DownloadList::process_meta_download(Download* download) {
     lt_log_print(torrent::LOG_ERROR, "Metadata replacement held: %s", e.what());
     if (!lifetime.expired()) download->set_message(std::string("Metadata replacement held: ") + e.what());
   }
+
 }
 
 }

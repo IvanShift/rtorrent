@@ -184,6 +184,8 @@ libsub_root_a_SOURCES = \
 	utils/watch_ready_queue.h \
 	\
 	command_download.cc \
+	file_jobs_commands.h \
+	core/file_jobs.h \
 	command_dynamic.cc \
 	command_events.cc \
 	command_file.cc \

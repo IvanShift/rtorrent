@@ -55,6 +55,7 @@
 #include "core/migration_test_cut.h"
 #include "core/session_path.h"
 #include "core/retrackers_process_pool.h"
+#include "core/file_jobs.h"
 #include "core/manager.h"
 #include "rpc/parse.h"
 #include "session/session_manager.h"
@@ -140,7 +141,7 @@ apply_d_change_link(core::Download* download, const torrent::Object::list_type& 
   switch (changeType) {
   case 0:
     if (symlink(target.c_str(), link.c_str()) == -1)
-      lt_log_print(torrent::LOG_TORRENT_WARN, "create_link failed: %s", std::strerror(errno));
+      lt_log_print(torrent::LOG_TORRENT_DEBUG, "create_link failed: %s", std::strerror(errno));
 
     break;
 
@@ -150,7 +151,7 @@ apply_d_change_link(core::Download* download, const torrent::Object::list_type& 
     errno = 0;
 
     if (!fileStat.update_link(link) || !fileStat.is_link() || unlink(link.c_str()) == -1)
-      lt_log_print(torrent::LOG_TORRENT_WARN, "delete_link failed: %s", std::strerror(errno));
+      lt_log_print(torrent::LOG_TORRENT_DEBUG, "delete_link failed: %s", std::strerror(errno));
 
     break;
   }
@@ -179,7 +180,7 @@ apply_d_delete_tied(core::Download* download) {
   if (tie.empty())
     return torrent::Object();
 
-  if (::unlink(expand_path(tie).c_str()) == -1)
+  if (unlink(expand_path(tie).c_str()) == -1)
     control->core()->push_log_std("Could not unlink tied file: " + std::string(std::strerror(errno)));
 
   rpc::call_command("d.tied_to_file.set", std::string(), rpc::make_target(download));
@@ -348,7 +349,7 @@ apply_d_add_peer(core::Download* download, const std::string& arg) {
   // Currently discarding SOCK_STREAM.
   torrent::this_thread::resolver()->resolve_preferred(callback_id, host, AF_UNSPEC, AF_INET, [download, port](torrent::c_sa_shared_ptr sa, int err) {
       if (sa == nullptr) {
-        lt_log_print(torrent::LOG_TORRENT_WARN, "could not resolve hostname for added peer: %s", gai_strerror(err));
+        lt_log_print(torrent::LOG_TORRENT_DEBUG, "could not resolve hostname for added peer: %s", gai_strerror(err));
         return;
       }
 
@@ -1493,6 +1494,8 @@ torrent::Object rr_migration_capture(core::Download* source,
   return int64_t(1);
 }
 
+torrent::Object rr_committed_map(const std::string& bytes);
+
 torrent::Object rr_migration_apply(core::Download* candidate,
                                    const torrent::Object::list_type& args) {
   if (!core::RetrackersMigrationCreation::mark_apply(candidate))
@@ -1543,6 +1546,21 @@ torrent::Object rr_migration_apply(core::Download* candidate,
   candidate->info()->mutable_up_rate()->set_total(state.up_total);
   candidate->info()->mutable_down_rate()->set_total(state.down_total);
   candidate->bencode()->get_key("rtorrent").insert_key("state_counter", state.state_counter);
+  if (source_hash == hash) {
+    // Same-info retracker replacement retains the captured resume proof. The
+    // normal libtorrent resume loader still checks sizes and mtimes before
+    // trusting its bitfield; a different payload root must never inherit it.
+    const auto source_sidecar = rr_committed_map(rr_migration_read_bytes(
+        source_hash + ".rollback.torrent.rtorrent", 64 * 1024 * 1024));
+    if (source_sidecar.has_key_string("directory") &&
+        source_sidecar.get_key_string("directory") == rpc::call_command_string("d.directory", target)) {
+      auto resume = rr_committed_map(rr_migration_read_bytes(
+          source_hash + ".rollback.torrent.libtorrent_resume", 64 * 1024 * 1024));
+      candidate->bencode()->insert_key("libtorrent_resume", resume);
+      if (source_sidecar.has_key_value("complete"))
+        candidate->bencode()->get_key("rtorrent").insert_key("complete", source_sidecar.get_key_value("complete"));
+    }
+  }
   if (!core::RetrackersMigrationCreation::mark_applied(candidate))
     throw torrent::input_error("RR apply lost candidate creation context.");
   rr_applied_candidates[hash] = {source_hash, rpc::call_command_string("d.local_id", target)};
@@ -2313,8 +2331,10 @@ bool rr_late_save(core::Download* download) {
   const std::string incarnation = rpc::call_command_string("d.incarnation", target);
   RrOriginalClaim claim;
   if (rr_original_claim_read(hash, &claim)) {
-    if (claim.incarnation != incarnation)
-      throw torrent::input_error("RR original claim save incarnation changed.");
+    if (claim.incarnation != incarnation) {
+      lt_log_print(torrent::LOG_INFO, "RR late save skipped: %s: stale-original-incarnation", hash.c_str());
+      return true;
+    }
     rr_late_save_to_prefix(download, hash + ".claim." + claim.tx, hash, incarnation);
     return true;
   }
@@ -2323,8 +2343,10 @@ bool rr_late_save(core::Download* download) {
   bool ordinary = false;
   if (rr_owner_read(hash, &owner_incarnation, &retired, &ordinary)) {
     if (retired || ordinary) return false;
-    if (owner_incarnation != incarnation)
-      throw torrent::input_error("RR owner save incarnation changed.");
+    if (owner_incarnation != incarnation) {
+      lt_log_print(torrent::LOG_INFO, "RR late save skipped: %s: stale-owner-incarnation", hash.c_str());
+      return true;
+    }
     rr_late_save_to_prefix(download, rr_owner_prefix(hash, incarnation), hash, incarnation);
     return true;
   }
@@ -2337,7 +2359,7 @@ bool rr_late_save(core::Download* download) {
   const auto state = rr_migration_read(old_hash);
   if (incarnation == state.source_incarnation ||
       (released != rr_released_owners.end() && released->second.second != incarnation))
-    throw torrent::input_error("RR late save owner incarnation changed.");
+    return true; // A stale callback cannot save through a newer released owner.
   rr_late_save_to_prefix(download, old_hash, hash, incarnation);
   return true;
 }
@@ -3237,12 +3259,17 @@ void rr_owner_repair_startup() {
     try {
       RrOriginalClaim active_claim;
       if (rr_original_claim_read(hash, &active_claim)) continue;
-      if (rr_journal_exists(hash + ".benc") &&
-          !rr_journal_exists(hash + ".prepared.receipt")) continue;
       std::string incarnation;
       bool retired = false;
       bool ordinary = false;
       if (!rr_owner_read(hash, &incarnation, &retired, &ordinary)) continue;
+      if (rr_journal_exists(hash + ".benc")) {
+        std::string prepared_tx, prepared_incarnation;
+        // Before its new pointer is published, the capsule and release own
+        // the replacement. An older pointer cannot overwrite that triple.
+        if (!rr_prepared_read(hash, &prepared_tx, &prepared_incarnation) ||
+            prepared_incarnation != incarnation) continue;
+      }
       if (ordinary) {
         // Ordinary persistence owns a loaded triple. Without one the hash is
         // not loaded and its pointer and receipt protect nothing any more.
@@ -3596,10 +3623,16 @@ void rr_repair_released_startup_impl() {
         bool retired = false;
         const bool prepared = rr_prepared_read(hash, &prepared_tx, &prepared_incarnation);
         const bool pointer = rr_owner_read(hash, &pointer_incarnation, &retired);
+        const bool previous_owner = prepared && pointer &&
+            state.expected_new_hash == hash && pointer_incarnation == state.source_incarnation;
         if (prepared && (prepared_tx != state.tx ||
-            (pointer && prepared_incarnation != pointer_incarnation)))
+            (pointer && prepared_incarnation != pointer_incarnation && !previous_owner)))
           throw torrent::input_error("RR prepared startup authority mismatch.");
-        if (!(prepared && pointer && !retired && !rr_owner_hold_hashes.count(hash)))
+        // A prepared receipt is published before the owner pointer. Validate
+        // and replay its released triple before loading, then finalize_loaded
+        // publishes the successor pointer. Never trust a foreign incarnation.
+        if (!(prepared && pointer && prepared_incarnation == pointer_incarnation &&
+              !retired && !rr_owner_hold_hashes.count(hash)))
           rr_release_repair(hash);
         if (state.expected_new_hash == hash && !prepared) {
           const auto sidecar = rr_committed_map(rr_migration_read_bytes(
@@ -3897,12 +3930,16 @@ torrent::system::SchedulerEntry* const rr_worker_watch_task = new torrent::syste
 
 void rr_watch_workers_schedule();
 
+void move_recover_exit(const core::retrackers_process_pool::Exit& exit);
+
 void rr_watch_workers() {
   core::retrackers_process_pool::reap();
-  std::vector<std::string> exited;
+  std::vector<core::retrackers_process_pool::Exit> exited;
   exited.swap(core::retrackers_process_pool::exited_workers);
-  for (const auto& identity : exited)
-    rr_recover_exited_worker(identity);
+  for (const auto& exit : exited) {
+    if (exit.identity.rfind("move:", 0) == 0) move_recover_exit(exit);
+    else rr_recover_exited_worker(exit.identity);
+  }
   if (core::retrackers_process_pool::workers_running())
     rr_watch_workers_schedule();
 }
@@ -4419,7 +4456,7 @@ torrent::Object rr_enqueue_original_unchecked(core::Download* owner,const torren
 }
 
 constexpr const char* rr_enqueue_storage_refused_message =
-    "retrackers: enqueue refused: session-storage-failed; a later insert or recovery retries";
+    "retrackers: enqueue refused: session-storage-failed; repair session storage and run tools/retrackers-apply-existing.php";
 
 // The insert hook runs enqueue through call_catch, which catches only input
 // errors: a storage error (EACCES, ENOSPC) escaping there would end the
@@ -4427,13 +4464,24 @@ constexpr const char* rr_enqueue_storage_refused_message =
 // in the error log and d.message; Q is not left behind half-published.
 torrent::Object rr_enqueue_original(core::Download* owner, const torrent::Object::list_type& args) {
   try {
-    return rr_enqueue_original_unchecked(owner, args);
+    const auto result = rr_enqueue_original_unchecked(owner, args);
+    auto& custom = owner->bencode()->get_key("rtorrent").get_key("custom");
+    if (custom.has_key("retrackers-enqueue-refusal")) {
+      custom.erase_key("retrackers-enqueue-refusal");
+      custom.erase_key("retrackers-enqueue-user");
+      if (owner->message() == rr_enqueue_storage_refused_message) owner->set_message({});
+      session_thread::manager()->save_full_download_durable(owner);
+    }
+    return result;
   } catch (const torrent::input_error&) {
     throw;
   } catch (const torrent::local_error& e) {
     const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
     lt_log_print(torrent::LOG_ERROR, "RR enqueue refused: session-storage-failed: %s: %s",
                  hash.c_str(), e.what());
+    auto& custom = owner->bencode()->get_key("rtorrent").insert_preserve_copy("custom", torrent::Object::create_map()).first->second;
+    custom.insert_key("retrackers-enqueue-refusal", "session-storage-failed");
+    custom.insert_key("retrackers-enqueue-user", args[1].as_string());
     owner->set_message(rr_enqueue_storage_refused_message);
     throw torrent::input_error(std::string("RR enqueue refused: session-storage-failed: ") + e.what());
   }
@@ -4641,8 +4689,11 @@ bool retrackers_migration_cancel_queued_original(core::Download* owner) {
   return true;
 }
 
+#include "file_jobs_commands.h"
+
 void
 initialize_command_download() {
+  initialize_file_job_commands();
   CMD2_DL_LIST("d.retrackers.preflight_stage", rr_preflight_stage);
   CMD2_DL_LIST("d.retrackers.enqueue_original",rr_enqueue_original);
   CMD2_DL_LIST("d.retrackers.dequeue_original",rr_dequeue_original);
@@ -4828,6 +4879,13 @@ initialize_command_download() {
       const auto local_id = rpc::call_command_string("d.local_id", target);
       const auto stop_token = stop_intent::next_claim_token(download, local_id);
       claim = stop_intent::create_lease(download, stop_token, job, state, open, active, local_id);
+      // Publish the user's lease first. If deletion fails or the daemon dies,
+      // dispatch sees the foreign lease and finishes this exact supersede.
+      core::file_jobs::Record move;
+      const auto hash = rpc::call_command_string("d.hash", target);
+      if (core::file_jobs::read(move_session(), hash, &move) && move.queue != job) {
+        move_supersede(download, move);
+      }
     }
     stop_intent::ensure_claim_generation(download, claim);
     // A retry after SIGKILL can see the saved session's stale open/running state.
@@ -5118,7 +5176,14 @@ initialize_command_download() {
     core::RetrackersRetry parsed;
     if (rr_queue_valid(queue) && core::retrackers_retry_parse(retry, queue.substr(68), &parsed) &&
         parsed.terminal()) return std::string(rr_retry_exhausted_message);
-    return std::string();
+    if (retrieve_d_custom(owner, "retrackers-enqueue-refusal").as_string() == "session-storage-failed")
+      return std::string(rr_enqueue_storage_refused_message);
+    if (retrieve_d_custom(owner, "autotools-enqueue-refusal").as_string() == "session-storage-failed")
+      return std::string("autotools: move enqueue refused: session-storage-failed; inspect session directory and retry enqueue");
+    const auto outcome = retrieve_d_custom(owner, "autotools-native-outcome").as_string();
+    if (outcome == "expired" || outcome == "superseded-by-user")
+      return std::string("autotools: move cancelled: ") + outcome;
+    return core::file_jobs::message(move_session(), move_hash(owner));
   });
   CMD2_DL_STRING_V("d.message.set", std::bind(&core::Download::set_message, std::placeholders::_1, std::placeholders::_2));
 

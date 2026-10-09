@@ -313,3 +313,53 @@ state/open/active tuple before erasure. Its scoped tied-file deletion guard
 covers retie hooks and nested guarded erasures while unrelated erase hooks run.
 Scheduled command errors also emit a bounded classified key/reason to stderr
 and the error log; raw commands and remote error text are not added there.
+
+### Native AutoTools Move jobs
+
+`system.autotools.move_queue` advertises the trusted Move queue ABI. Finished
+hooks call `d.autotools.move_enqueue(user)` without spawning a process or
+saving the session. A private, single-link 0600
+`.rutorrent-stop-intents/H.move` record stores
+`m1:sha256(user):Q:local_id:enqueue_time:retry` followed by a newline. Its Q and
+retry survive internal retrackers erase/load and cold restart. Malformed or
+unsafe records are retained with a visible classified refusal naming the file.
+
+`system.autotools.move_dispatch(user)` launches the fixed
+`plugins/autotools/move_worker.php H Q user I` actor. Move shares the native
+pool's eight worker reservations and separate dispatcher slot; at most two
+Move workers run. Reservations remain occupied through reap. Actor paths
+still come only from daemon startup policy. These commands are trusted SCGI
+commands and must not be exposed through application HTTP proxy allowlists.
+
+`move_begin(Q,I)` checks the current incarnation and exact queued Q, then
+reuses the exclusive stop lease. Repeating it completes interrupted quiescence
+without replacing its original run-state receipt. Retrackers capture and file
+operation leases exclude each other; a pending Move record alone does not
+block durable retrackers enqueue. Multi-file directory publication must use
+`d.directory.base.set_if_stop_close_claim` with the actual root, avoiding an
+extra torrent-name component. Late user Stop remains authoritative.
+
+The `d.autotools.move_defer(Q,expected,next)` CAS accepts Move retry reasons
+`preflight-refused`, `storage-failed`, and `worker-exit`, with six counted
+attempts and delays of 60, 120, 240, 480, and 960 seconds. Noncounted
+`source-not-ready` and `transport-unavailable` waits may start at count zero;
+existing retrackers r1 receipts retain their original count-one grammar.
+An unexpected worker exit spends an attempt, while exit zero without an
+outcome waits before relaunch. A terminal leased job keeps its lease and
+payload recovery journal. `system.autotools.move_reset(H)` clears only the
+terminal retry, allowing the same Q and lease to resume recovery.
+`system.autotools.move_owner(H)` returns its user digest for trusted
+operator tooling, including held records whose state has no owner field.
+
+`move_finish(Q)` and `move_cancel(Q,reason)` require the exact record and no
+lease. User erase retires a pending record; internal capture preserves it.
+A datadir operation publishes its own exclusive lease before retiring a
+queued Move. If interrupted between those writes, dispatch sees that exact
+foreign lease and finishes superseding the old record. Unleased, nonterminal
+jobs expire after 24 hours with a visible outcome; terminal records remain
+until explicit reset or retirement.
+
+An enqueue storage refusal is projected from retained custom metadata even
+when tracker activity clears the volatile message. For retrackers, repair
+session storage and use `tools/retrackers-apply-existing.php`; successful
+native enqueue clears the owned refusal. No metadata-erasing re-add is needed.

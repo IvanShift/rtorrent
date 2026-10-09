@@ -16,7 +16,8 @@ int main(int argc, char** argv) {
     log << " pid=" << ::getpid() << '\n';
   }
   const std::string script = argc > 1 ? argv[1] : "";
-  if (script.size() >= 10 && script.compare(script.size() - 10, 10, "update.php") == 0)
+  if ((script.size() >= 10 && script.compare(script.size() - 10, 10, "update.php") == 0) ||
+      script.ends_with("move_worker.php"))
     std::this_thread::sleep_for(std::chrono::seconds(40));
   return 0;
 }

@@ -27,14 +27,16 @@ struct RetrackersRetry {
 // single-digit count 1..6, a canonical decimal due of at most ten digits that
 // is 0 if and only if the count is terminal, and one of the four reasons; the
 // whole receipt is at most 100 bytes.
-inline bool retrackers_retry_parse(const std::string& retry, const std::string& queue_token,
-                                   RetrackersRetry* result) {
+template <size_t N>
+inline bool queue_retry_parse(const std::string& retry, const std::string& queue_token,
+                              RetrackersRetry* result, const char* const (&reasons)[N],
+                              bool allow_initial_wait = false) {
   const std::string prefix = "r1:" + queue_token + ":";
   if (retry.size() > 100 || retry.compare(0, prefix.size(), prefix) != 0)
     return false;
   const size_t count_at = prefix.size();
   const size_t due_at = count_at + 2;
-  if (retry.size() <= due_at || retry[count_at] < '1' ||
+  if (retry.size() <= due_at || retry[count_at] < (allow_initial_wait ? '0' : '1') ||
       retry[count_at] > static_cast<char>('0' + retrackers_retry_max_attempts) ||
       retry[count_at + 1] != ':')
     return false;
@@ -53,13 +55,19 @@ inline bool retrackers_retry_parse(const std::string& retry, const std::string& 
     return false;
   parsed.reason = retry.substr(due_end + 1);
   bool known = false;
-  for (const char* reason : retrackers_retry_reasons)
+  for (const char* reason : reasons)
     known = known || parsed.reason == reason;
-  if (!known)
+  if (!known || (parsed.count == 0 && parsed.reason != "source-not-ready" &&
+                 parsed.reason != "transport-unavailable"))
     return false;
   if (result != nullptr)
     *result = parsed;
   return true;
+}
+
+inline bool retrackers_retry_parse(const std::string& retry, const std::string& queue_token,
+                                   RetrackersRetry* result) {
+  return queue_retry_parse(retry, queue_token, result, retrackers_retry_reasons);
 }
 
 // Temporary unreadiness is a wait, not a failure: a deferral for one of these

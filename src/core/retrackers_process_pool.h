@@ -49,15 +49,17 @@ inline void initialize_policy() {
 // Identities of reaped worker children, oldest first. A reaped exit of the
 // exact native-owned child is the only proof that its worker is gone; the
 // retrackers recovery takes them from here. The dispatcher slot is no worker.
-inline std::vector<std::string> exited_workers;
+struct Exit { std::string identity; int status; };
+inline std::vector<Exit> exited_workers;
 
 inline void reap() {
   for (size_t slot = 0; slot < children.size(); ++slot) {
     auto& child = children[slot];
     if (child.pid <= 0) continue;
-    const pid_t result = ::waitpid(child.pid, nullptr, WNOHANG);
+    int status = -1;
+    const pid_t result = ::waitpid(child.pid, &status, WNOHANG);
     if (result == child.pid || (result < 0 && errno == ECHILD)) {
-      if (slot < 8 && !shutting_down) exited_workers.push_back(child.identity);
+      if (slot < 8 && !shutting_down) exited_workers.push_back({child.identity, result == child.pid ? status : -1});
       child = {};
     }
   }
@@ -88,9 +90,22 @@ inline bool worker_slot_free() {
 
 inline bool active(const std::string& identity) {
   reap();
+  // Reap releases the slot, but its owner must account the exit before this
+  // exact identity can launch again. Otherwise a dispatcher can replace the
+  // launch receipt and let the old exit charge the new live worker.
+  for (const auto& exited : exited_workers)
+    if (exited.identity == identity) return true;
   for (const auto& child : children)
     if (child.pid != 0 && child.identity == identity) return true;
   return false;
+}
+
+inline unsigned move_workers() {
+  reap();
+  unsigned count = 0;
+  for (size_t slot = 0; slot < 8; ++slot)
+    if (children[slot].pid != 0 && children[slot].identity.rfind("move:", 0) == 0) ++count;
+  return count;
 }
 
 inline void validate_path(const std::string& path, bool executable) {
@@ -136,6 +151,7 @@ inline std::string launch(const std::string& identity, const std::vector<std::st
 #endif
   if (shutting_down) return "held";
   if (active(identity)) return "active";
+  if (!dispatcher && identity.rfind("move:", 0) == 0 && move_workers() >= 2) return "full";
   validate_path(argv.at(0), true);
   validate_path(argv.at(1), false);
   const size_t first = dispatcher ? 8 : 0;

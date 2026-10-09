@@ -45,6 +45,7 @@
 #include "setup.h"
 #include "signal_handler.h"
 #include "stop_intent.h"
+#include "core/file_jobs.h"
 #include "option_parser.h"
 
 #define LT_LOG(log_fmt, ...)                                    \
@@ -497,6 +498,8 @@ main(int argc, char** argv) {
     catch (const std::exception& e) {
       lt_log_print(torrent::LOG_ERROR, "Stop intent cleanup held: %s", e.what());
     }
+    try { core::file_jobs::startup(session_thread::manager()->path()); }
+    catch (const std::exception&) { lt_log_print(torrent::LOG_ERROR, "autotools: move startup held: session-storage-failed"); }
     load_arg_torrents(argv + firstArg, argv + argc);
 
     // Make sure we update the display before any scheduled tasks can run, so that loading of

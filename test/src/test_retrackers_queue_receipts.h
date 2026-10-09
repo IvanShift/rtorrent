@@ -15,9 +15,13 @@ class TestRetrackersQueueReceipts : public test_fixture {
   CPPUNIT_TEST(test_retry_terminal_and_bounds_stay_closed);
   CPPUNIT_TEST(test_retry_counted_next_matches_the_application);
 
+  CPPUNIT_TEST(test_move_record_and_retry_grammar);
+  CPPUNIT_TEST(test_reaped_identity_waits_for_exit_accounting);
   CPPUNIT_TEST_SUITE_END();
 
 public:
+  void test_move_record_and_retry_grammar();
+  void test_reaped_identity_waits_for_exit_accounting();
   void test_retry_accepts_counts_one_through_six();
   void test_retry_rejects_counts_outside_the_limit();
   void test_retry_due_is_zero_only_when_terminal();

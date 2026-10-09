@@ -6,8 +6,11 @@
 #include <string>
 
 #include "core/retrackers_queue_receipts.h"
+#include "core/file_jobs.h"
+#include "core/retrackers_process_pool.h"
 
 CPPUNIT_TEST_SUITE_REGISTRATION(TestRetrackersQueueReceipts);
+CPPUNIT_TEST_SUITE_NAMED_REGISTRATION(TestRetrackersQueueReceipts, "queue_receipts");
 
 // These cases pin the native side of the r1 retry contract. The application
 // side, plugins/retrackers/update.php RetrackersQueueRetry in ruTorrent, must
@@ -181,4 +184,52 @@ void TestRetrackersQueueReceipts::test_retry_counted_next_matches_the_applicatio
   core::RetrackersRetry terminal;
   CPPUNIT_ASSERT(parses(receipt("6", "0"), &terminal));
   CPPUNIT_ASSERT(!core::retrackers_retry_counted_next(&terminal, now, "capture-refused", &next));
+}
+
+void TestRetrackersQueueReceipts::test_move_record_and_retry_grammar() {
+  core::file_jobs::Record record{std::string(64,'a'), queue, std::string(40,'A'), {}, 1791500000};
+  core::file_jobs::Record parsed;
+  const auto bytes=core::file_jobs::format(record);
+  CPPUNIT_ASSERT(core::file_jobs::parse(bytes,&parsed));
+  CPPUNIT_ASSERT_EQUAL(record.queue,parsed.queue);
+  CPPUNIT_ASSERT_EQUAL(record.enqueued,parsed.enqueued);
+  for(size_t position : {size_t(3),size_t(68),size_t(101)}) {
+    auto invalid=bytes; invalid[position]='z';
+    CPPUNIT_ASSERT(!core::file_jobs::parse(invalid,nullptr));
+  }
+  CPPUNIT_ASSERT(!core::file_jobs::parse(std::string(257,'x')+"\n",nullptr));
+  for(const auto& bad : {bytes+"\n", bytes.substr(0,bytes.size()-1), "m2"+bytes.substr(2),
+      bytes.substr(0,142)+"01791500000:\n", bytes.substr(0,142)+"0:\n"})
+    CPPUNIT_ASSERT(!core::file_jobs::parse(bad,nullptr));
+  for(const char* reason : {"source-not-ready","transport-unavailable"}) {
+    const auto wait=receipt("0","1791500030",reason);
+    CPPUNIT_ASSERT(core::file_jobs::retry_parse(wait,queue,nullptr));
+    CPPUNIT_ASSERT(!parses(wait)); // RR wire remains count 1..6.
+    CPPUNIT_ASSERT(!core::file_jobs::retry_parse(receipt("6","0",reason),queue,nullptr));
+  }
+  for(const char* reason : {"preflight-refused","storage-failed","worker-exit"}) {
+    CPPUNIT_ASSERT(!core::file_jobs::retry_parse(receipt("0","1791500030",reason),queue,nullptr));
+    CPPUNIT_ASSERT(core::file_jobs::retry_parse(receipt("6","0",reason),queue,nullptr));
+  }
+  record.retry=receipt("6","0","worker-exit");
+  CPPUNIT_ASSERT(core::file_jobs::parse(core::file_jobs::format(record),nullptr));
+  record.retry="r1:"+std::string(32,'b')+":1:1791500060:worker-exit";
+  CPPUNIT_ASSERT(!core::file_jobs::parse(core::file_jobs::format(record),nullptr));
+}
+
+void TestRetrackersQueueReceipts::test_reaped_identity_waits_for_exit_accounting() {
+  namespace pool=core::retrackers_process_pool;
+  const std::string identity="move:"+std::string(40,'A')+":"+queue;
+  struct Cleanup {
+    std::vector<pool::Exit> prior;
+    Cleanup() { prior.swap(pool::exited_workers); }
+    ~Cleanup() { pool::exited_workers.swap(prior); }
+  } cleanup;
+  // Causal boundary: waitpid has completed, but watcher has not consumed the
+  // exit. No timing, sleeping child, or scheduler order can satisfy this test.
+  pool::exited_workers.push_back({identity,9});
+  CPPUNIT_ASSERT(pool::active(identity));
+  CPPUNIT_ASSERT_EQUAL(std::string("active"),pool::launch(identity,{"unused","unused"},false));
+  pool::exited_workers.clear();
+  CPPUNIT_ASSERT(!pool::active(identity));
 }
