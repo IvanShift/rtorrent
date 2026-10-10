@@ -37,7 +37,7 @@ void move_acknowledge_outcome(core::Download* d) {
   const auto found=custom.as_map().find("autotools-native-outcome");
   if(found==custom.as_map().end() || !found->second.is_string() ||
      (found->second.as_string()!="expired" && found->second.as_string()!="superseded-by-user")) return;
-  // An explicit message write acknowledges only a retired Move outcome. An
+  // An explicit empty message write acknowledges only a retired Move outcome. An
   // unreadable record is still an obligation, not proof that Q was retired.
   try {
     MoveRecord record;

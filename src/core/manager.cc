@@ -1,5 +1,6 @@
 #include "config.h"
 #include "stop_intent.h"
+#include "core/erasedata_lifecycle.h"
 
 #include "core/manager.h"
 
@@ -409,6 +410,9 @@ Manager::receive_hashing_changed() {
       continue;
 
     try {
+      // P may have been prepared by a hash-queued callback. Keep that queue
+      // pending without treating an intentional hold as a failed hash.
+      if (erasedata_lifecycle::activity_held(itr->get())) continue;
       if (!stop_intent::held(itr->get()).empty() &&
           !stop_intent::terminal_activity_allowed(itr->get())) continue;
       m_download_list->open_throw(itr->get());

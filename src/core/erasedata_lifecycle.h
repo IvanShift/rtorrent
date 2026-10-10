@@ -42,14 +42,18 @@ inline void ordinary_erase(Download* d) {
     lt_log_print(torrent::LOG_NOTICE, "erasedata: ordinary Remove revoked %s; payload retained", description(record).c_str());
   }
 }
-inline void require_activity(Download* d) {
+inline bool activity_held(Download* d) {
   erasedata_intent::Record record;
   if (erasedata_intent::read(session(), hash(d), &record)) {
     const auto message = "erasedata: recovery held: " + description(record) +
         "; payload retained; use exact erase recovery, ordinary Remove or re-add to cancel";
     d->set_message(message);
-    throw torrent::input_error(message);
+    return true;
   }
+  return false;
+}
+inline void require_activity(Download* d) {
+  if (activity_held(d)) throw torrent::input_error(d->message());
 }
 // Called before insertion, load-tail commands or inserted hooks. A true result
 // is an exact original session restore for reconciliation, never an autostart.

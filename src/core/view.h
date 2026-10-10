@@ -13,6 +13,7 @@
 #ifndef RTORRENT_CORE_VIEW_DOWNLOADS_H
 #define RTORRENT_CORE_VIEW_DOWNLOADS_H
 
+#include <cstdint>
 #include <functional>
 #include <list>
 #include <memory>
@@ -73,11 +74,12 @@ public:
     emit_changed();
   }
 
-  void insert(const std::shared_ptr<Download>& download) { base_type::push_back(download); }
+  void insert(const std::shared_ptr<Download>& download) { base_type::push_back(download); ++m_revision; }
   // Held recovery is visible without executing user filters, comparators or hooks.
   void insert_held_visible(const std::shared_ptr<Download>& download) {
     base_type::insert(begin() + m_size, download);
     ++m_size;
+    ++m_revision;
     emit_changed();
   }
   void erase(Download* download);
@@ -128,12 +130,14 @@ public:
   signal_void& signal_changed() { return m_signal_changed; }
 
 private:
+  uint64_t m_revision = 0;
+
   View(const View&);
   void        operator=(const View&);
 
-  void        push_back(const std::shared_ptr<Download>& d) { base_type::push_back(d); }
+  void        push_back(const std::shared_ptr<Download>& d) { base_type::push_back(d); ++m_revision; }
 
-  inline void insert_visible(const std::shared_ptr<Download>& d);
+  inline bool insert_visible(const std::shared_ptr<Download>& d);
   inline void erase_internal(iterator itr);
 
   void        emit_changed();

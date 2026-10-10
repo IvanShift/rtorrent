@@ -4974,6 +4974,7 @@ initialize_command_download() {
     return int64_t(1);
   });
   CMD2_DL("d.try_start", [](core::Download* download, const torrent::Object&) {
+    core::erasedata_lifecycle::require_activity(download);
     if (retrackers_migration_candidate_activity_held(
         rpc::call_command_string("d.hash", rpc::make_target(download))))
       throw torrent::input_error("RR candidate start held until durable release.");
@@ -5009,6 +5010,7 @@ initialize_command_download() {
   CMD2_DL         ("d.is_meta",               [](auto* download, auto) { return download->info()->is_meta_download(); });
 
   CMD2_DL_V("d.resume", [](core::Download* download, const torrent::Object&) {
+    core::erasedata_lifecycle::require_activity(download);
     stop_intent::require_unleased(download);
     control->core()->download_list()->resume_default(download);
   });
@@ -5062,6 +5064,7 @@ initialize_command_download() {
     return torrent::Object();
   });
   CMD2_DL_V("d.check_hash", [](core::Download* download, const torrent::Object&) {
+    core::erasedata_lifecycle::require_activity(download);
     stop_intent::require_unleased(download);
     control->core()->download_list()->check_hash(download);
   });
@@ -5193,7 +5196,7 @@ initialize_command_download() {
     return core::file_jobs::message(move_session(), move_hash(owner));
   });
   CMD2_DL_STRING_V("d.message.set", [](core::Download* owner, const std::string& message) {
-    move_acknowledge_outcome(owner);
+    if (message.empty()) move_acknowledge_outcome(owner);
     owner->set_message(message);
   });
 

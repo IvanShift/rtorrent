@@ -2,6 +2,7 @@
 #define RTORRENT_CORE_DOWNLOAD_H
 
 #include <memory>
+#include <optional>
 #include <torrent/common.h>
 #include <torrent/download.h>
 #include <torrent/download_info.h>
@@ -56,6 +57,15 @@ public:
   // object alive. Take it before triggering events that may erase.
   std::weak_ptr<void> lifetime() const                         { return m_lifetime; }
   void                release_lifetime()                       { m_lifetime.reset(); }
+
+  bool                insertion_deferred() const               { return m_insertionDeferred; }
+  void                set_insertion_deferred(bool value)        { m_insertionDeferred = value; }
+
+  std::optional<std::string> erasedata_stop_generation() const     { return m_erasedataStopGeneration; }
+  void                set_erasedata_stop_generation(std::optional<std::string> value) { m_erasedataStopGeneration = value; }
+
+  bool                completion_deferred() const              { return m_completionDeferred; }
+  void                set_completion_deferred(bool value)       { m_completionDeferred = value; }
 
   bool                is_erasing() const                       { return m_erasing; }
   void                set_erasing()                            { m_erasing = true; }
@@ -112,6 +122,9 @@ private:
   download_type       m_download;
   bool                m_hashFailed{};
   bool                m_erasing{};
+  bool                m_insertionDeferred{};
+  bool                m_completionDeferred{};
+  std::optional<std::string> m_erasedataStopGeneration;
   std::shared_ptr<void> m_lifetime{std::make_shared<char>()};
   std::string         m_message;
   uint32_t            m_resumeFlags{default_resume_flags};

@@ -27,16 +27,22 @@ EraseRecord erasedata_require(const EraseRecord& wanted) {
   if (!ed::same(actual, wanted)) throw torrent::input_error("erasedata: intent mismatch; payload retained");
   return actual;
 }
-void erasedata_guards(core::Download* d) {
-  stop_intent::require_unleased(d);
+std::string erasedata_guard_refusal(core::Download* d) {
+  if (!stop_intent::owner_restoring() && !stop_intent::held(d).empty())
+    return "independent-file-operation-owner";
   const auto h = edlife::hash(d);
   core::file_jobs::Record move;
   if (stop_intent::checker_owned(d) || rr_queued_original(h) != "none" ||
       retrackers_migration_pending(h) || retrackers_migration_source_reserved(h) ||
       !retrackers_migration_target_source(h).empty() ||
       core::file_jobs::read(edlife::session(), h, &move))
-    throw torrent::input_error("erasedata: independent file-operation owner held");
-  if (d->is_erasing()) throw torrent::input_error("erasedata: partial erase held; exact recovery required");
+    return "independent-file-operation-owner";
+  if (d->is_erasing()) return "partial-erase";
+  return {};
+}
+void erasedata_guards(core::Download* d) {
+  const auto refusal = erasedata_guard_refusal(d);
+  if (!refusal.empty()) throw torrent::input_error("erasedata: " + refusal + "; payload retained");
 }
 std::string erasedata_prepare(const torrent::Object::list_type& args) {
   const auto r = erasedata_args(args);
@@ -49,10 +55,13 @@ std::string erasedata_prepare(const torrent::Object::list_type& args) {
     if (!ed::same(actual, r)) throw torrent::input_error("erasedata: another intent retained");
     return ed::phase_name(actual.phase);
   }
-  erasedata_guards(d);
+  const auto refusal = erasedata_guard_refusal(d);
+  if (!refusal.empty()) return "refused:" + refusal;
+  const auto stop_generation = rpc::call_command_string("d.stop_generation", rpc::make_target(d));
   // A crash before erase must restore this exact identity, held for reconciliation.
   session_thread::manager()->save_full_download_durable(d);
   ed::write(edlife::session(), r.hash, r, true);
+  d->set_erasedata_stop_generation(stop_generation);
   d->set_message("erasedata: prepared " + edlife::description(r) +
       "; payload retained until guarded erase; ordinary Remove/re-add cancels");
   if (core::migration_test_cut("erasedata-after-prepare")) ::_exit(137);
@@ -60,14 +69,29 @@ std::string erasedata_prepare(const torrent::Object::list_type& args) {
 }
 std::string erasedata_cancel(const torrent::Object::list_type& args) {
   const auto wanted = erasedata_args(args);
-  core::SessionPathFd lifetime(ed::lock(edlife::session(), wanted.hash, true));
-  const auto actual = erasedata_require(wanted);
-  if (actual.phase != 'P') throw torrent::input_error("erasedata: cancel phase refused; exact erase recovery required");
-  auto* d = erasedata_live(actual);
-  if (!d || edlife::incarnation(d) != actual.incarnation)
-    throw torrent::input_error("erasedata: cancel original incarnation changed");
-  ed::remove(edlife::session(), actual.hash, actual);
-  if (d->message().rfind("erasedata:", 0) == 0) d->set_message({});
+  core::Download* d;
+  bool resume_allowed = false;
+  {
+    core::SessionPathFd lifetime(ed::lock(edlife::session(), wanted.hash, true));
+    const auto actual = erasedata_require(wanted);
+    if (actual.phase != 'P') throw torrent::input_error("erasedata: cancel phase refused; exact erase recovery required");
+    d = erasedata_live(actual);
+    if (!d || edlife::incarnation(d) != actual.incarnation)
+      throw torrent::input_error("erasedata: cancel original incarnation changed");
+    // Close/Pause also advance the user's Stop generation while state can
+    // remain one. Exact cancellation must not undo those later commands.
+    const auto prepared_generation = d->erasedata_stop_generation();
+    resume_allowed = prepared_generation &&
+        *prepared_generation == rpc::call_command_string("d.stop_generation", rpc::make_target(d));
+    // Held cold recovery has deliberately stopped the saved original. Publish
+    // that current state before removing the hold, including an immediate crash.
+    if (d->insertion_deferred()) session_thread::manager()->save_full_download_durable(d);
+    ed::remove(edlife::session(), actual.hash, actual);
+    d->set_erasedata_stop_generation(std::nullopt);
+    if (d->message().rfind("erasedata:", 0) == 0) d->set_message({});
+  }
+  // Reentrant insertion hooks may ordinary-erase, which takes this same lock.
+  control->core()->download_list()->release_held_insertion(d, resume_allowed);
   return "cancelled";
 }
 torrent::Object erasedata_state(const torrent::Object::list_type& args) {

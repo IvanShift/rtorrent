@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 import xmlrpc.client
 
@@ -1749,6 +1750,372 @@ def erasedata_call(daemon, name, values, *extra):
     return daemon.call('system.erasedata.' + name, '', *values, *extra)
 
 
+def erasedata_hash_completion(daemon, mode):
+    # An internal load-tail command selects the completion branch; this is not a
+    # peer-transfer fixture. Hashing itself is real and already in flight at P.
+    name = 'erasedata-hash-held-' + str(mode)
+    piece_length, length = 4 * 1024 * 1024, 512 * 1024 * 1024
+    payload = daemon.directory / 'dl' / name
+    with payload.open('wb') as stream:
+        stream.truncate(length)
+    info = {'length': length, 'name': name, 'piece length': piece_length,
+            'pieces': hashlib.sha1(bytes(piece_length)).digest() * (length // piece_length)}
+    raw = encode({'info': info})
+    h = hashlib.sha1(encode(info)).hexdigest().upper()
+    (daemon.directory / (name + '.torrent')).write_bytes(raw)
+    control = daemon.fixture(name + '-control', start=False)
+    daemon.call('load.start', '', '/data/' + name + '.torrent', 'd.hashing.set=' + str(mode))
+    daemon.wait(lambda: daemon.call('d.is_hash_checking', h) == 1, 'real hash in flight')
+    assert daemon.call('d.hashing', h) == mode
+    assert daemon.call('d.hashing', control) == 0
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    assert daemon.call('d.is_hash_checking', h) == 1, 'P did not overlap real in-flight hashing'
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        state = docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip()
+        assert state == 'true', 'prepared intent killed daemon during hash completion mode=' + str(mode)
+        if daemon.call('d.is_hash_checking', h) == 0:
+            break
+        time.sleep(.05)
+    else:
+        raise AssertionError('held real hash did not finish')
+    assert daemon.call('d.is_hash_checked', h) == 1
+    assert daemon.call('d.completed_chunks', h) == daemon.call('d.size_chunks', h)
+    assert daemon.call('d.is_active', h) == 0
+    assert daemon.call('d.hash', control) == control
+    assert erasedata_call(daemon, 'state', values) == {'phase': 'prepared', 'live_relation': 'exact'}
+    # d.state.set is private to the internal command parser. Exercise only
+    # public RPC activity entries; a missing private method is not a refusal.
+    for method in ('d.start', 'd.try_start', 'd.resume', 'd.open'):
+        expect_fault(lambda: daemon.call(method, h), 'recovery held')
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    daemon.call('d.start', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'start after exact hash hold cancellation')
+    # A later user Stop remains authoritative across cancellation; refused
+    # Start/Resume cannot overwrite it while the new exact P is held.
+    newer = erasedata_tuple(daemon, h, nonce='d' * 32)
+    assert erasedata_call(daemon, 'prepare', newer) == 'prepared'
+    daemon.call('d.stop', h)
+    for method in ('d.start', 'd.try_start', 'd.resume'):
+        expect_fault(lambda: daemon.call(method, h), 'recovery held')
+        assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [0, 0]
+    assert erasedata_call(daemon, 'cancel', newer) == 'cancelled'
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [0, 0]
+    daemon.call('d.start', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'explicit Start after late Stop and cancellation')
+    print('OBS hash completion held mode=%s complete=%s active-after-cancel=1 late-stop-preserved=1' %
+          (mode, daemon.call('d.complete', h)), flush=True)
+
+
+def erasedata_prepared_recheck(daemon):
+    name = 'erasedata-prepared-recheck'
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    h = daemon.fixture(name, start=False)
+    daemon.call('d.check_hash', h)
+    daemon.wait(lambda: daemon.call('d.is_hash_checked', h) == 1, 'complete stopped original')
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    methods = ('d.hashing', 'd.hashing_failed', 'd.is_open', 'd.state', 'd.is_active')
+    before = [daemon.call(m, h) for m in methods]
+    for method in ('d.check_hash', 'd.try_start'):
+        expect_fault(lambda: daemon.call(method, h), 'recovery held')
+        assert [daemon.call(m, h) for m in methods] == before
+        assert [h] not in daemon.call('d.multicall2', '', 'started', 'd.hash=')
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    daemon.call('d.start', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'start after refused Recheck')
+    daemon.call('d.stop', h)
+    # P can arrive in hash-queued after preflight but before dispatcher open.
+    values = erasedata_tuple(daemon, h, nonce='c' * 32)
+    command = 'system.erasedata.prepare=' + ','.join(values)
+    daemon.call('method.set_key', '', 'event.download.hash_queued', 'ed-prepare', command)
+    daemon.call('d.check_hash', h)
+    daemon.wait(lambda: erasedata_call(daemon, 'state', values)['phase'] == 'prepared', 'queued callback prepared P')
+    assert daemon.call('d.hashing', h) == 3
+    assert daemon.call('d.hashing_failed', h) == 0
+    assert daemon.call('d.is_hash_checking', h) == 0
+    assert daemon.call('d.is_open', h) == 0
+    daemon.call('method.set_key', '', 'event.download.hash_queued', 'ed-prepare')
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    daemon.wait(lambda: daemon.call('d.is_hash_checked', h) == 1, 'pending hash resumes after P cancellation')
+    assert daemon.call('d.hashing_failed', h) == 0
+    print('OBS prepared Recheck and queued-before-P cancellation both recover without manual stop', flush=True)
+
+
+def erasedata_held_cancel(daemon, erase_hook=False):
+    name = 'erasedata-held-cancel' + ('-erase' if erase_hook else '')
+    (daemon.directory / 'dl' / name).write_bytes(b'xxxxxxxx')
+    h = daemon.fixture(name, start=True)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'original active before durable P')
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    with (daemon.directory / 'test.rc').open('a') as rc:
+        rc.write('\nmethod.set_key=event.download.inserted,ed-generic,"d.custom1.set=generic"\n')
+        rc.write('method.set_key=event.download.inserted_session,ed-session,"d.custom2.set=session"\n')
+        if erase_hook:
+            rc.write('method.set_key=event.download.inserted,zz-ed-erase,"d.erase="\n')
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'held session restored')
+    assert [daemon.call('d.custom' + str(n), h) for n in (1, 2)] == ['', '']
+    for view in ('default', 'name'):
+        assert [h] not in daemon.call('d.multicall2', '', view, 'd.hash=')
+    wrong = (*values[:4], 'd' * 32, values[5])
+    expect_fault(lambda: erasedata_call(daemon, 'cancel', wrong), 'intent mismatch')
+    assert daemon.call('d.custom1', h) == ''
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    if erase_hook:
+        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
+        assert daemon.call('system.pid') > 0
+        print('OBS held cancel generic hook ordinary-erased without own-lock collision or session-hook fallthrough', flush=True)
+        return
+    assert [daemon.call('d.custom' + str(n), h) for n in (1, 2)] == ['generic', 'session']
+    for view in ('default', 'name', 'stopped'):
+        assert [h] in daemon.call('d.multicall2', '', view, 'd.hash='), 'cancel did not initialize view ' + view
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] == [0, 0, 0]
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'cold restart immediately after cancel')
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [0, 0]
+    # Ordinary in-process P cancellation must not replay the insertion again.
+    daemon.call('d.custom1.set', h, 'consumed')
+    newer = erasedata_tuple(daemon, h, nonce='e' * 32)
+    assert erasedata_call(daemon, 'prepare', newer) == 'prepared'
+    assert erasedata_call(daemon, 'cancel', newer) == 'cancelled'
+    assert daemon.call('d.custom1', h) == 'consumed'
+    daemon.call('d.start', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'normal start after held cancellation')
+    print('OBS held cancel views and insertion events restored once, run intent remains stopped', flush=True)
+
+
+def view_filter_reentrant(daemon):
+    daemon.call('method.insert', '', 'ed.filter.armed', 'value', 0)
+    expression = 'branch=ed.filter.armed=,"cat=\\\"$d.erase=\\\",MARK",cat=1'
+    for mode in ('single', 'bulk', 'filtered', 'insertion'):
+        daemon.call('ed.filter.armed.set', '', 0)
+        view = 'ed-erasing-filter-' + mode
+        daemon.call('view.add', '', view)
+        daemon.call('view.filter', '', view, expression)
+        h = daemon.fixture('view-filter-reentrant-' + mode, start=False)
+        daemon.call('ed.filter.armed.set', '', 1)
+        if mode == 'single': daemon.call('view.filter_download', h, view)
+        if mode == 'bulk': daemon.call('view.filter_all', '', view)
+        if mode == 'filtered':
+            assert daemon.call('d.multicall.filtered', '', view, expression, 'd.hash=') == []
+        if mode == 'insertion':
+            # The existing torrent is removed first, then the same filter
+            # erases a fresh factory insertion before its remaining load tail.
+            daemon.call('d.erase', h)
+            daemon.call('load.normal', '', '/data/view-filter-reentrant-' + mode + '.torrent')
+            time.sleep(.2)
+        assert daemon.call('system.pid') > 0
+        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
+        assert daemon.call('d.multicall2', '', view, 'd.hash=') == []
+        daemon.call('ed.filter.armed.set', '', 0)
+        print('OBS view erasing filter mode=%s preserves daemon and does not resurrect target' % mode,
+              flush=True)
+
+    for inner in ('d.multicall2', 'd.multicall.filtered'):
+        daemon.call('ed.filter.armed.set', '', 0)
+        h = daemon.fixture('view-filter-nested-' + inner, start=False)
+        view = 'ed-nested-' + inner
+        daemon.call('view.add', '', view)
+        arguments = view + (',cat=1' if inner.endswith('filtered') else '')
+        daemon.call('method.insert', '', 'ed.nested.' + inner, 'simple',
+                    inner + '=' + arguments + ',d.erase=,d.hash=;cat=MARK')
+        daemon.call('view.filter', '', view,
+                    'branch=ed.filter.armed=,ed.nested.' + inner + '=,cat=1')
+        daemon.call('ed.filter.armed.set', '', 1)
+        daemon.call('view.filter_download', h, view)
+        assert daemon.call('system.pid') > 0
+        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
+        assert daemon.call('d.multicall2', '', view, 'd.hash=') == []
+        daemon.call('ed.filter.armed.set', '', 0)
+        print('OBS nested %s stops commands at erased lifetime despite outer owned snapshots' % inner,
+              flush=True)
+
+
+def view_sort_reentrant(daemon, only_current=False):
+    daemon.call('method.insert', '', 'ed.erase.left', 'simple', 'cat="$d.erase=",0')
+    daemon.call('method.insert', '', 'ed.erase.right', 'simple', 'cat="$d.erase=",1')
+    modes = ('current-left', 'current-right') if only_current else ('new-left', 'new-right', 'current-left', 'current-right')
+    for mode in modes:
+        a = daemon.fixture('view-sort-a-' + mode, start=False)
+        b = daemon.fixture('view-sort-b-' + mode, start=False)
+        view = 'ed-erasing-sort-' + mode
+        daemon.call('view.add', '', view)
+        daemon.call('view.filter', '', view, 'cat=1')
+        before = daemon.call('d.multicall2', '', view, 'd.hash=')
+        assert sorted(before) == sorted([[a], [b]]), (before, a, b, daemon.call('d.multicall2', '', 'main', 'd.hash='))
+        # A non-mutating comparator preserves stable order.
+        daemon.call('view.sort_current', '', view, 'false=')
+        daemon.call('view.sort', '', view)
+        assert daemon.call('d.multicall2', '', view, 'd.hash=') == before
+        comparison = ('less=ed.erase.left=,cat=1' if mode.endswith('left')
+                      else 'less=cat=0,ed.erase.right=')
+        if mode.startswith('new'):
+            daemon.call('view.set_not_visible', a, view)
+            daemon.call('view.sort_new', '', view, comparison)
+            daemon.call('view.set_visible', a, view)
+            expected = b if mode.endswith('left') else a
+            assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[expected]]
+        else:
+            daemon.call('view.sort_current', '', view, comparison)
+            daemon.call('view.sort', '', view)
+            remaining = daemon.call('d.multicall2', '', 'main', 'd.hash=')
+            assert len(remaining) == 1, remaining
+            expected = remaining[0][0]
+        assert daemon.call('system.pid') > 0
+        assert daemon.call('d.multicall2', '', view, 'd.hash=') == [[expected]]
+        print('OBS view erasing comparator mode=%s keeps survivor exactly once' % mode, flush=True)
+        daemon.call('view.sort_new', '', view, 'false=')
+        daemon.call('view.sort_current', '', view, 'false=')
+        daemon.call('d.erase', expected)
+
+
+def erasedata_cancel_view_filter(daemon):
+    h = daemon.fixture('erasedata-cancel-view-filter', start=False)
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    with (daemon.directory / 'test.rc').open('a') as rc:
+        rc.write('\nmethod.insert=ed.filter.armed,value,0\n')
+        rc.write('view.add=ed-erasing-filter\n')
+        rc.write('view.filter=ed-erasing-filter,"branch=ed.filter.armed=,{d.erase=},{true=}"\n')
+    daemon.stop(kill=True)
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.hash', h) == h, 'held session before erasing view filter')
+    daemon.call('ed.filter.armed.set', '', 1)
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    assert daemon.call('system.pid') > 0
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
+    assert daemon.call('d.multicall2', '', 'ed-erasing-filter', 'd.hash=') == []
+    print('OBS exact cancel erasing filter did not reuse iterator or resurrect target', flush=True)
+
+
+def erasedata_finished_deferred(daemon, last_hash, only_unknown=False):
+    compile_fixture(daemon, 'payload-peer.cc', 'payload-peer')
+    daemon.call('pieces.hash.on_completion.set', '', int(last_hash))
+    daemon.call('method.set_key', '', 'event.download.finished', 'ed-finished-observed',
+                'd.custom3.set="$cat=$d.custom3=,x"')
+    control = daemon.fixture('erasedata-finished-control', start=False)
+    operations = ('unknown',) if only_unknown else ('running', 'stop', 'close', 'pause', 'hook-pause', 'hook-close', 'unknown')
+    for index, operation in enumerate(operations):
+        name = 'erasedata-finished-' + str(int(last_hash)) + '-' + operation
+        payload = bytes(range(256)) * 512
+        piece_length = 16384
+        info = {'name': name, 'length': len(payload), 'piece length': piece_length,
+                'pieces': b''.join(hashlib.sha1(payload[i:i + piece_length]).digest()
+                                   for i in range(0, len(payload), piece_length))}
+        h = hashlib.sha1(encode(info)).hexdigest().upper()
+        (daemon.directory / (name + '.torrent')).write_bytes(encode({'info': info}))
+        (daemon.directory / (name + '.seed')).write_bytes(payload)
+        daemon.call('load.start', '', '/data/' + name + '.torrent')
+        daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'synthetic download active')
+        prefix = daemon.directory / name
+        docker('exec', '-d', daemon.name, '/data/payload-peer', '/data/' + name + '.seed',
+               h, str(piece_length), str(45620 + index), '/data/' + name)
+        daemon.wait(lambda: prefix.with_suffix('.ready').exists(), 'payload fixture ready')
+        daemon.call('add_peer', h, '127.0.0.1:' + str(45620 + index))
+        daemon.wait(lambda: prefix.with_suffix('.requested').exists(), 'real peer request before P')
+        assert daemon.call('d.completed_chunks', h) == 0
+        assert daemon.call('d.complete', h) == 0
+        values = erasedata_tuple(daemon, h)
+        assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+        intent = daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata')
+        if operation == 'unknown': intent.chmod(0o644)
+        temporary = prefix.with_suffix('.release-tmp')
+        temporary.write_bytes(b'release\n')
+        os.replace(temporary, prefix.with_suffix('.release'))
+        daemon.wait(lambda: daemon.call('d.completed_chunks', h) == daemon.call('d.size_chunks', h),
+                    'actual payload hash completion under P')
+        reason = ('deferred completion admission unavailable' if operation == 'unknown' else 'recovery held')
+        daemon.wait(lambda: reason in daemon.call('d.message', h),
+                    'actual received-finished callback retained on ' + operation)
+        if operation == 'unknown': intent.chmod(0o600)
+        assert daemon.call('d.custom3', h) == ''
+        assert daemon.call('d.complete', h) == 0
+        assert erasedata_call(daemon, 'state', values)['phase'] == 'prepared'
+        if operation == 'stop': daemon.call('d.stop', h)
+        if operation in ('close', 'pause'): daemon.call('d.' + operation, h)
+        if operation.startswith('hook-'):
+            daemon.call('method.set_key', '', 'event.download.finished', 'zz-ed-finished-user',
+                        'd.' + operation[5:] + '=')
+        # Idempotent preparation and a wrong tuple cannot replace or consume
+        # the Stop snapshot belonging to the original successful prepare.
+        assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+        wrong = list(values); wrong[4] = 'f' * 32
+        expect_fault(lambda: erasedata_call(daemon, 'cancel', wrong), 'intent mismatch')
+        assert erasedata_call(daemon, 'state', values)['phase'] == 'prepared'
+        assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+        if operation in ('stop', 'close', 'pause'):
+            expected_held = [int(operation != 'close'), int(operation != 'stop'), 0]
+            assert [daemon.call(m, h) for m in ('d.is_open', 'd.state', 'd.is_active')] == expected_held
+            assert daemon.call('d.custom3', h) == ''
+            daemon.call('d.start' if operation == 'stop' else 'd.resume', h)
+        daemon.wait(lambda: daemon.call('d.custom3', h) == 'x', 'deferred finish replay exactly once')
+        expected_state = int(not operation.startswith('hook-'))
+        daemon.wait(lambda: daemon.call('d.is_active', h) == expected_state,
+                    'current activity intent after deferred finish')
+        assert daemon.call('d.state', h) == 1
+        assert daemon.call('d.is_open', h) == int(operation != 'hook-close')
+        assert daemon.call('d.complete', h) == 1
+        assert daemon.call('d.hash', control) == control
+        assert prefix.with_suffix('.done').exists()
+        assert not prefix.with_suffix('.error').exists()
+        expect_fault(lambda: erasedata_call(daemon, 'cancel', values), 'missing intent')
+        assert daemon.call('d.custom3', h) == 'x'
+        print('OBS real deferred finish last-hash=%s operation=%s hook=x state=%s' %
+              (int(last_hash), operation, expected_state), flush=True)
+        if operation.startswith('hook-'):
+            daemon.call('method.set_key', '', 'event.download.finished', 'zz-ed-finished-user')
+            daemon.call('d.resume', h)
+            daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'explicit resume after finished-hook command')
+            assert daemon.call('d.custom3', h) == 'x'
+        fresh = erasedata_tuple(daemon, h)
+        assert erasedata_call(daemon, 'prepare', fresh) == 'prepared'
+        assert erasedata_call(daemon, 'cancel', fresh) == 'cancelled'
+        assert daemon.call('d.is_active', h) == 1
+        daemon.call('d.erase', h)
+
+
+def erasedata_prepare_refusal(daemon):
+    h = daemon.fixture('erasedata-prepare-refusal', start=False)
+    values = erasedata_tuple(daemon, h)
+    job = 'e' * 32
+    receipt = daemon.call('d.stop_close_claim', h, job)
+    claim = receipt.split('|')[0]
+    assert re.fullmatch(r'[0-9a-f]{32}:[0-9a-f]{16}', claim), receipt
+    assert erasedata_call(daemon, 'prepare', values) == 'refused:independent-file-operation-owner'
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'missing'
+    held = daemon.call('d.stop_close_claim_held', h)
+    assert held == claim, (receipt, held)
+    assert daemon.call('d.release_stop_close_claim', h, claim) == 1
+    # Release publishes a durable terminal lease. The owning job must ack it
+    # before a new independent operation can acquire this download.
+    assert daemon.call('d.ack_stop_close_claim', h, job) == 1
+    assert daemon.call('d.stop_close_claim_held', h) == ''
+    daemon.call('d.stop', h)
+    journal = daemon.session / '.rutorrent-stop-intents' / h
+    assert journal.is_file()
+    journal.chmod(0o644)
+    expect_fault(lambda: erasedata_call(daemon, 'prepare', values), 'stop intent:')
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'missing'
+    assert daemon.call('system.pid') > 0
+    journal.chmod(0o600)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    journal.chmod(0o644)
+    # Idempotence does not refresh the saved Stop token. An unknown current
+    # token cannot consume an existing preparation or crash the RPC process.
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    expect_fault(lambda: erasedata_call(daemon, 'cancel', values), 'stop intent:')
+    assert erasedata_call(daemon, 'state', values)['phase'] == 'prepared'
+    assert daemon.call('system.pid') > 0
+    journal.chmod(0o600)
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    print('OBS exact preflight known refusal leaves no P; exact existing P remains idempotent', flush=True)
+
+
 def erasedata_readd_revokes(daemon):
     h = daemon.fixture('erasedata-readd', start=False)
     (daemon.directory / 'dl' / 'erasedata-readd').write_bytes(b'newbytes')
@@ -2036,8 +2403,14 @@ def move_outcome_acknowledgement(daemon):
     assert daemon.call('system.autotools.move_dispatch', '', 'moveuser') == 'idle'
     assert not expired_record.exists()
     assert 'expired' in daemon.call('d.message', expired)
-    daemon.call('d.message.set', expired, 'independent user message')
+    for message in ('independent user message', 'autotools: move refused: synthetic plugin notice',
+                    'datadir: move refused: synthetic plugin notice', 'autotools: move cancelled: expired prefix'):
+        daemon.call('d.message.set', expired, message)
+        assert daemon.call('d.custom', expired, 'autotools-native-outcome') == 'expired', 'nonempty plugin message acknowledged native outcome'
+        assert daemon.call('d.message', expired) == message
+    daemon.call('d.message.set', expired, '')
     assert daemon.call('d.custom', expired, 'autotools-native-outcome') == ''
+    daemon.call('d.message.set', expired, 'independent user message')
     assert daemon.call('d.message', expired) == 'independent user message'
     daemon.call('d.message.set', expired, '')
     assert daemon.call('d.message', expired) == ''
@@ -2697,7 +3070,18 @@ def shutdown_storage_errors(daemon):
     print(f'  storage error lines for {len(hashes)} torrents: {len(lines)}', flush=True)
 
 
-CASES = {'erasedata-crash-prepared': erasedata_uncertain_erase,
+CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
+         'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
+         'view-filter-reentrant': view_filter_reentrant,
+         'view-sort-reentrant': view_sort_reentrant,
+         'erasedata-cancel-view-filter': erasedata_cancel_view_filter,
+         'erasedata-hash-initial-held': lambda d: erasedata_hash_completion(d, 1),
+         'erasedata-hash-last-held': lambda d: erasedata_hash_completion(d, 2),
+         'erasedata-prepared-recheck': erasedata_prepared_recheck,
+         'erasedata-held-cancel': erasedata_held_cancel,
+         'erasedata-held-cancel-erase': lambda d: erasedata_held_cancel(d, erase_hook=True),
+         'erasedata-prepare-refusal': erasedata_prepare_refusal,
+         'erasedata-crash-prepared': erasedata_uncertain_erase,
          'erasedata-crash-before-erase': erasedata_uncertain_erase,
          'erasedata-crash-after-erase': erasedata_uncertain_erase,
          'erasedata-unproven-session': erasedata_unproven_session,
@@ -2810,6 +3194,7 @@ if __name__ == '__main__':
             CASES[case](daemon)
             print('PASS - ' + case, flush=True)
         except Exception as error:
+            traceback.print_exc()
             failures.append(case)
             print('FAIL - ' + case + ': ' + str(error), flush=True)
             (daemon.directory / 'container.log').write_text(docker('logs', daemon.name, check=False).stdout)

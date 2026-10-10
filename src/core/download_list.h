@@ -57,6 +57,9 @@ public:
   Download*           create(torrent::Object* obj, uint32_t tracker_key, bool printLog);
 
   iterator            insert(Download* d, bool held_recovery = false);
+  bool                initialize_insertion(Download* d);
+  void                release_held_insertion(Download* d, bool resume_allowed);
+  bool                replay_deferred_completion(Download* d);
 
   void                erase_ptr(Download* d);
   iterator            erase(iterator itr, bool retire_stop_intent = true);
@@ -139,6 +142,7 @@ private:
 
   inline void         check_contains(Download* d);
 
+  bool                defer_completion_if_held(Download* d);
   void                received_finished(Download* d);
   void                confirm_finished(Download* d);
 

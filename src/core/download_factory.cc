@@ -478,8 +478,7 @@ DownloadFactory::receive_success() {
   // The action of inserting might cause the torrent to be
   // opened/started or such. Figure out a nicer way of handling this.
   if (m_manager->download_list()->insert(download, erasedata_held) == m_manager->download_list()->end()) {
-    // ATM doesn't really ever get here.
-    delete download;
+    // Insertion owns the download even when a user callback erases it.
 
     m_slot_finished();
     return;

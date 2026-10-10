@@ -174,6 +174,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
 DownloadList::iterator
 DownloadList::insert(Download* download, bool held_recovery) {
   iterator itr = base_type::insert(end(), std::shared_ptr<Download>(download));
+  download->set_insertion_deferred(held_recovery);
 
   LT_LOG_DOWNLOAD_DEBUG("inserting download", 0);
 
@@ -187,11 +188,7 @@ DownloadList::insert(Download* download, bool held_recovery) {
       if (held_recovery && v->name() == "main") v->insert_held_visible(*itr);
       else v->insert(*itr);
     }
-    if (!held_recovery) {
-      for (auto v : *control->view_manager())
-        v->filter_download(download);
-      DL_TRIGGER_EVENT(*itr, "event.download.inserted");
-    }
+    if (!held_recovery && !initialize_insertion(download)) return end();
 
   } catch (torrent::local_error& e) {
     // Should perhaps relax this, just print an error and remove the
@@ -200,6 +197,56 @@ DownloadList::insert(Download* download, bool held_recovery) {
   }
 
   return itr;
+}
+
+bool
+DownloadList::initialize_insertion(Download* download) {
+  const auto lifetime = download->lifetime();
+  const std::vector<View*> views(control->view_manager()->begin(), control->view_manager()->end());
+  for (auto view : views) {
+    view->filter_download(download);
+    if (lifetime.expired()) return false;
+  }
+  DL_TRIGGER_EVENT(download, "event.download.inserted");
+  return !lifetime.expired();
+}
+
+void
+DownloadList::release_held_insertion(Download* download, bool resume_allowed) {
+  check_contains(download);
+  const auto lifetime = download->lifetime();
+  if (download->insertion_deferred()) {
+    // The exact P is already durably cancelled and its lock closed. Consume
+    // before callbacks: a reentrant cancel or erase must not replay insertion.
+    download->set_insertion_deferred(false);
+    if (!initialize_insertion(download)) return;
+    stop_intent::ScopedSuppress suppress;
+    DL_TRIGGER_EVENT(download, "event.download.inserted_session");
+    if (lifetime.expired()) return;
+    return;
+  }
+  if (resume_allowed && replay_deferred_completion(download)) return;
+  if (lifetime.expired()) return;
+  // Preserve a later Stop. A completed hash may already be in the started
+  // view, so merely filtering views would make the next Start a no-op.
+  if (resume_allowed && !download->is_hash_failed() &&
+      rpc::call_command_value("d.hashing", rpc::make_target(download)) == 0 &&
+      rpc::call_command_value("d.state", rpc::make_target(download)) == 1)
+    resume(download, download->resume_flags());
+  else
+    control->core()->hashing_view()->filter_download(download);
+}
+
+bool
+DownloadList::replay_deferred_completion(Download* download) {
+  // Close discards the checked bitfield. Retain the notification until a fresh
+  // hash proves completion; opening alone cannot authorize finished callbacks.
+  if (!download->completion_deferred() || !download->is_hash_checked() ||
+      !download->is_done()) return false;
+  if (defer_completion_if_held(download)) return false;
+  download->set_completion_deferred(false);
+  received_finished(download);
+  return true;
 }
 
 void
@@ -448,7 +495,6 @@ DownloadList::close_throw(Download* download) {
 void
 DownloadList::resume(Download* download, int flags) {
   check_contains(download);
-  erasedata_lifecycle::require_activity(download);
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash()))) {
     lt_log_print(torrent::LOG_TORRENT_EVENTS, "RR candidate resume held until durable release");
@@ -463,6 +509,16 @@ DownloadList::resume(Download* download, int flags) {
   LT_LOG_DOWNLOAD_DEBUG("resuming download : flags:%0x.", flags);
 
   try {
+    // resume is also called from libtorrent completion callbacks. Public RPC
+    // entry points perform their own throwing preflight before reaching here.
+    erasedata_lifecycle::require_activity(download);
+
+    if (download->completion_deferred() && download->is_hash_checked() && download->is_done()) {
+      // An explicit later Resume may discharge a retained notification. Its
+      // completion path owns any rehash/resume and must honor nested Stop.
+      replay_deferred_completion(download);
+      return;
+    }
 
     if (download->download()->info()->is_active())
       return;
@@ -719,12 +775,17 @@ DownloadList::hash_done(Download* download) {
     return;
   }
 
+  const auto lifetime = download->lifetime();
   DL_TRIGGER_EVENT(download, "event.download.hash_done");
+  if (!lifetime.expired()) replay_deferred_completion(download);
 }
 
 void
 DownloadList::hash_queue(Download* download, int type) {
   check_contains(download);
+
+  // Refuse before close, resume-data clearing or hashing state changes.
+  erasedata_lifecycle::require_activity(download);
 
   LT_LOG_DOWNLOAD_DEBUG("hash queue : type:%d", type);
 
@@ -766,18 +827,37 @@ DownloadList::hash_queue(Download* download, int type) {
   DL_TRIGGER_EVENT(download, "event.download.hash_queued");
 }
 
+bool
+DownloadList::defer_completion_if_held(Download* download) {
+  try {
+    if (!erasedata_lifecycle::activity_held(download)) return false;
+  } catch (const torrent::local_error& e) {
+    // These callers own a real completion notification. An unknown admission
+    // retains it just like a positive hold; it cannot authorize completion.
+    download->set_message("erasedata: deferred completion admission unavailable for " +
+        torrent::utils::transform_to_hex_str(download->info()->hash()) + ".erasedata; payload retained");
+    LT_LOG_DOWNLOAD_EVENTS("deferred completion held : %s", e.what());
+  }
+  download->set_completion_deferred(true);
+  return true;
+}
+
 void
 DownloadList::received_finished(Download* download) {
   check_contains(download);
 
   LT_LOG_DOWNLOAD_DEBUG("received finished", 0);
 
-  if (rpc::call_command_value("pieces.hash.on_completion"))
-    // Set some 'checking_finished_thingie' variable to make hash_done
-    // trigger correctly, also so it can bork on missing data.
-    hash_queue(download, Download::variable_hashing_last);
-  else
-    confirm_finished(download);
+  if (defer_completion_if_held(download)) return;
+
+  try {
+    if (rpc::call_command_value("pieces.hash.on_completion"))
+      hash_queue(download, Download::variable_hashing_last);
+    else
+      confirm_finished(download);
+  } catch (const torrent::local_error& e) {
+    LT_LOG_DOWNLOAD_EVENTS("completion held : %s", e.what());
+  }
 }
 
 // The download must be open when we call this function.
@@ -786,6 +866,8 @@ DownloadList::confirm_finished(Download* download) {
   check_contains(download);
 
   LT_LOG_DOWNLOAD_DEBUG("confirming finished", 0);
+
+  if (defer_completion_if_held(download)) return;
 
   if (download->download()->info()->is_meta_download())
     return process_meta_download(download);
@@ -830,8 +912,15 @@ DownloadList::confirm_finished(Download* download) {
   // up/downloaded baseline.
   download->download()->send_completed();
 
-  // The finished event may erase the download.
-  auto lifetime = download->lifetime();
+  // Finished callbacks may erase, Pause or Close the download. The existing
+  // Stop token fences the implicit restart even when d.state remains one.
+  const auto lifetime = download->lifetime();
+  std::optional<std::string> generation;
+  try {
+    generation = rpc::call_command_string("d.stop_generation", rpc::make_target(download));
+  } catch (const torrent::local_error& e) {
+    LT_LOG_DOWNLOAD_EVENTS("completion restart held : %s", e.what());
+  }
 
   DL_TRIGGER_EVENT(download, "event.download.finished");
 
@@ -851,11 +940,17 @@ DownloadList::confirm_finished(Download* download) {
   // being hashed.
   download->set_resume_flags(Download::default_resume_flags);
 
-  if (!download->is_active() && rpc::call_command_value("d.state", rpc::make_target(download)) == 1)
-    resume(download,
-           torrent::Download::start_no_create |
-           torrent::Download::start_skip_tracker |
-           torrent::Download::start_keep_baseline);
+  if (!download->is_active() && rpc::call_command_value("d.state", rpc::make_target(download)) == 1 && generation) {
+    try {
+      if (*generation == rpc::call_command_string("d.stop_generation", rpc::make_target(download)))
+        resume(download,
+               torrent::Download::start_no_create |
+               torrent::Download::start_skip_tracker |
+               torrent::Download::start_keep_baseline);
+    } catch (const torrent::local_error& e) {
+      LT_LOG_DOWNLOAD_EVENTS("completion restart held : %s", e.what());
+    }
+  }
 }
 
 void
