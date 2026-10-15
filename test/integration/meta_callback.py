@@ -41,6 +41,10 @@ PREFIX = r'''
 #include <vector>
 #define lt_log_print_info(...) ((void)0)
 #define lt_log_print(...) ((void)0)
+// download_list.cc defines these above the extracted bodies; the logging
+// they wrap is no part of the callback flow under test.
+#define LT_LOG_DOWNLOAD_DEBUG(...) ((void)0)
+#define LT_LOG_DOWNLOAD_EVENTS(...) ((void)0)
 namespace torrent {
 struct Object {
   int64_t value{};
