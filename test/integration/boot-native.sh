@@ -14,7 +14,7 @@ network.block.ipv6.set = no
 dht.mode.set = disable
 protocol.pex.set = no
 log.open_file.flush = "native", /tmp/native.log
-log.add_output = "error", "native"
+log.add_output = "errors", "native"
 EOF
 native_binary=/native-bin
 [ -x "$native_binary" ] || native_binary=/usr/local/bin/rtorrent

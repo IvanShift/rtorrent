@@ -39,7 +39,7 @@ inline void ordinary_erase(Download* d) {
   std::unique_ptr<SessionPathFd> lifetime(fd < 0 ? nullptr : new SessionPathFd(fd));
   if (erasedata_intent::read(s, h, &record)) {
     erasedata_intent::remove(s, h, record);
-    lt_log_print(torrent::LOG_NOTICE, "erasedata: ordinary Remove revoked %s; payload retained", description(record).c_str());
+    lt_log_print(torrent::LOG_EVENTS, "erasedata: ordinary Remove revoked %s; payload retained", description(record).c_str());
   }
 }
 inline bool activity_held(Download* d) {
@@ -69,12 +69,12 @@ inline bool admit(const std::string& s, const std::string& h, const std::string&
   if (saved && record.incarnation == i) {
     if (record.phase == 'C')
       throw torrent::input_error("erasedata: erased session refused: " + description(record) + "; repair retained session residue");
-    lt_log_print(torrent::LOG_WARN, "erasedata: exact original session held: %s; reconcile or ordinary Remove/re-add to cancel", description(record).c_str());
+    lt_log_print(torrent::LOG_ERRORS, "erasedata: exact original session held: %s; reconcile or ordinary Remove/re-add to cancel", description(record).c_str());
     return true;
   }
   // Main-thread cancellation is durable before the new object becomes visible.
   erasedata_intent::remove(s, h, record);
-  lt_log_print(torrent::LOG_NOTICE, "erasedata: new admission revoked %s; old payload deletion permanently cancelled", description(record).c_str());
+  lt_log_print(torrent::LOG_EVENTS, "erasedata: new admission revoked %s; old payload deletion permanently cancelled", description(record).c_str());
   return false;
 }
 }

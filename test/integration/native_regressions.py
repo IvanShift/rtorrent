@@ -102,8 +102,8 @@ class Daemon:
             'directory.default.set=/data/dl', 'network.scgi.open_local=/data/rtorrent.sock',
             'network.listen.port.range.set=45561-45561', 'network.block.ipv6.set=no',
             'dht.mode.set=disable', 'protocol.pex.set=no', 'trackers.use_udp.set=no',
-            'log.open_file.flush="native",/data/native.log', 'log.add_output="error","native"',
-            'log.add_output="torrent_events","native"', 'log.add_output="warn","native"', '']))
+            'log.open_file.flush="native",/data/native.log', 'log.add_output="errors","native"',
+            'log.add_output="torrent_events","native"', '']))
 
     def start(self):
         self.run()

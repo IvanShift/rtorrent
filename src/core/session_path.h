@@ -39,7 +39,7 @@ inline void report_rename_noreplace_fallback(int error) {
   const char* reason = error == EINVAL ? "EINVAL" : error == ENOSYS ? "ENOSYS" : "EOPNOTSUPP";
   const std::string line = std::string("rtorrent: session publication uses the checked rename "
       "fallback: renameat2 RENAME_NOREPLACE unsupported (") + reason + "); reported once per process";
-  lt_log_print(torrent::LOG_WARN, "%s", line.c_str());
+  lt_log_print(torrent::LOG_ERRORS, "%s", line.c_str());
   const std::string output = line + "\n";
   (void)::write(STDERR_FILENO, output.data(), output.size());
 }

@@ -116,7 +116,7 @@ Download*
 DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) {
   if (!obj->is_map() || download_input_zero_infohash(*obj)) {
     const auto reason = obj->is_map() ? "zero-info-hash" : "invalid-metainfo-root";
-    lt_log_print(torrent::LOG_ERROR, "Download load refused: %s", reason);
+    lt_log_print(torrent::LOG_ERRORS, "Download load refused: %s", reason);
     control->core()->push_log_std(std::string("Download load refused: ") + reason);
     delete obj;
     return nullptr;
@@ -314,7 +314,7 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   if (retire_counter) {
     try { stop_intent::erase_counter(session_thread::manager()->path(), erase_hash); }
     catch (const std::exception& e) {
-      lt_log_print(torrent::LOG_ERROR, "Cannot retire stop intent for %s: %s", erase_hash.c_str(), e.what());
+      lt_log_print(torrent::LOG_ERRORS, "Cannot retire stop intent for %s: %s", erase_hash.c_str(), e.what());
     }
   }
 
@@ -1018,14 +1018,14 @@ DownloadList::process_meta_download(Download* download) {
       if (stop_intent::counter(session, hash, false) != generation) start = 0;
     } catch (const std::exception& e) {
       start = 0;
-      lt_log_print(torrent::LOG_ERROR, "Metadata stop generation unavailable for %s; replacement stopped: %s",
+      lt_log_print(torrent::LOG_ERRORS, "Metadata stop generation unavailable for %s; replacement stopped: %s",
                    hash.c_str(), e.what());
     }
     factory->set_start(start);
     if (retire_counter) {
       try { stop_intent::erase_counter(session, hash); }
       catch (const std::exception& e) {
-        lt_log_print(torrent::LOG_ERROR, "Cannot retire metadata stop intent for %s: %s", hash.c_str(), e.what());
+        lt_log_print(torrent::LOG_ERRORS, "Cannot retire metadata stop intent for %s: %s", hash.c_str(), e.what());
       }
     }
 
@@ -1034,7 +1034,7 @@ DownloadList::process_meta_download(Download* download) {
   } catch (const std::exception& e) {
     // Metadata callbacks run outside an RPC boundary. Contain a refused claim
     // or malformed metadata instead of unwinding the daemon's main loop.
-    lt_log_print(torrent::LOG_ERROR, "Metadata replacement held: %s", e.what());
+    lt_log_print(torrent::LOG_ERRORS, "Metadata replacement held: %s", e.what());
     if (!lifetime.expired()) download->set_message(std::string("Metadata replacement held: ") + e.what());
   }
 

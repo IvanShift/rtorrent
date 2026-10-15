@@ -212,7 +212,7 @@ inline std::string record(core::Download* download, bool require_durable = false
       throw torrent::input_error(std::string("stop intent: ") + e.what());
     const std::string warning = "Stop intent for " + hash + " could not be saved: " + e.what() +
       "; stopped only in memory and may resume after restart";
-    lt_log_print(torrent::LOG_ERROR, "%s", warning.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", warning.c_str());
     control->core()->push_log_std(warning);
     // Container supervisors capture stderr even when the configured file logger is buffered.
     const std::string line = warning + "\n";

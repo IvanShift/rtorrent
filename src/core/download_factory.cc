@@ -315,7 +315,7 @@ DownloadFactory::receive_success() {
         rr_hash, rtorrent->get_key_string("incarnation"), m_session, saved_incarnation_valid);
   } catch (const std::exception& e) {
     const auto message = "erasedata: load refused H=" + rr_hash + ": " + e.what();
-    lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", message.c_str());
     m_manager->push_log_std(message);
     refuse_load();
     return;
@@ -409,7 +409,7 @@ DownloadFactory::receive_success() {
     }
   } catch (const torrent::input_error& e) {
     const std::string msg = "RR load initialization refused: " + rr_hash + ": " + e.what();
-    lt_log_print(torrent::LOG_ERROR, "%s", msg.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", msg.c_str());
     m_manager->push_log_std(msg);
     refuse_load();
     return;
@@ -464,7 +464,7 @@ DownloadFactory::receive_success() {
     }
   } catch (const torrent::input_error& e) {
     const std::string msg = "RR migration reservation load refused: " + rr_hash + ": " + e.what();
-    lt_log_print(torrent::LOG_ERROR, "%s", msg.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", msg.c_str());
     m_manager->push_log_std(msg);
     refuse_load();
     return;
@@ -531,7 +531,7 @@ DownloadFactory::receive_success() {
             rpc::call_command("d.replay_stop_close_claim", claim.job, rpc::make_target(download));
         } catch (const std::exception& e) {
           session_event_ready = false;
-          lt_log_print(torrent::LOG_ERROR, "Stop claim terminal replay held startup: %s", e.what());
+          lt_log_print(torrent::LOG_ERRORS, "Stop claim terminal replay held startup: %s", e.what());
         }
       }
     }
@@ -643,7 +643,7 @@ DownloadFactory::initialize_rtorrent(Download* download, torrent::Object* rtorre
       m_start = false;
       download->set_hash_failed(true);
       download->set_message("Stop intent generation unavailable; new download held");
-      lt_log_print(torrent::LOG_ERROR, "Stop intent generation unavailable for new download: %s", e.what());
+      lt_log_print(torrent::LOG_ERRORS, "Stop intent generation unavailable for new download: %s", e.what());
     }
   }
   // A saved active session older than the last durable Stop must not autostart.
@@ -657,11 +657,11 @@ DownloadFactory::initialize_rtorrent(Download* download, torrent::Object* rtorre
           !stop_intent::startup_hold_token(rpc::call_command_string("session.path"), hash).empty()) {
         rtorrent->insert_key("state", int64_t(0));
         rtorrent->insert_key("stop_generation", static_cast<int64_t>(durable));
-        lt_log_print(torrent::LOG_ERROR, "Stop intent recovery held session startup for %s", hash.c_str());
+        lt_log_print(torrent::LOG_ERRORS, "Stop intent recovery held session startup for %s", hash.c_str());
       }
     } catch (const std::exception& e) {
       rtorrent->insert_key("state", int64_t(0));
-      lt_log_print(torrent::LOG_ERROR, "Stop intent recovery held session startup: %s", e.what());
+      lt_log_print(torrent::LOG_ERRORS, "Stop intent recovery held session startup: %s", e.what());
     }
   }
 

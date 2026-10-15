@@ -1982,7 +1982,7 @@ std::set<std::string> rr_owner_hold_hashes;
 // A daemon without a UI shows only its log files: holds and refusals go to
 // the error log as well as to the UI log, with the hash and reason they name.
 void rr_log_refusal(const std::string& message) {
-  lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+  lt_log_print(torrent::LOG_ERRORS, "%s", message.c_str());
   control->core()->push_log_std(message);
 }
 
@@ -2332,7 +2332,7 @@ bool rr_late_save(core::Download* download) {
   RrOriginalClaim claim;
   if (rr_original_claim_read(hash, &claim)) {
     if (claim.incarnation != incarnation) {
-      lt_log_print(torrent::LOG_INFO, "RR late save skipped: %s: stale-original-incarnation", hash.c_str());
+      lt_log_print(torrent::LOG_EVENTS, "RR late save skipped: %s: stale-original-incarnation", hash.c_str());
       return true;
     }
     rr_late_save_to_prefix(download, hash + ".claim." + claim.tx, hash, incarnation);
@@ -2344,7 +2344,7 @@ bool rr_late_save(core::Download* download) {
   if (rr_owner_read(hash, &owner_incarnation, &retired, &ordinary)) {
     if (retired || ordinary) return false;
     if (owner_incarnation != incarnation) {
-      lt_log_print(torrent::LOG_INFO, "RR late save skipped: %s: stale-owner-incarnation", hash.c_str());
+      lt_log_print(torrent::LOG_EVENTS, "RR late save skipped: %s: stale-owner-incarnation", hash.c_str());
       return true;
     }
     rr_late_save_to_prefix(download, rr_owner_prefix(hash, incarnation), hash, incarnation);
@@ -3938,7 +3938,7 @@ void rr_watch_workers() {
   exited.swap(core::retrackers_process_pool::exited_workers);
   for (const auto& exit : exited) {
     if (exit.identity.rfind("erasedata:", 0) == 0) {
-      lt_log_print(torrent::LOG_NOTICE, "erasedata: worker exited; exact intent retained for retry: %s", exit.identity.c_str());
+      lt_log_print(torrent::LOG_EVENTS, "erasedata: worker exited; exact intent retained for retry: %s", exit.identity.c_str());
     } else if (exit.identity.rfind("move:", 0) == 0) move_recover_exit(exit);
     else rr_recover_exited_worker(exit.identity);
   }
@@ -4086,18 +4086,18 @@ void retrackers_migration_remove_temporaries_startup() {
     if (removed != 0) {
       const std::string message = "RR migration startup removed " + std::to_string(removed) +
           " unpublished temporary files.";
-      lt_log_print(torrent::LOG_INFO, "%s", message.c_str());
+      lt_log_print(torrent::LOG_EVENTS, "%s", message.c_str());
       control->core()->push_log_std(message);
     }
     if (!kept.empty()) {
       const std::string message = "RR migration startup kept " + std::to_string(kept.size()) +
           " temporary-named entries that are not owner-only single-link files, first: " + kept.front();
-      lt_log_print(torrent::LOG_WARN, "%s", message.c_str());
+      lt_log_print(torrent::LOG_ERRORS, "%s", message.c_str());
       control->core()->push_log_std(message);
     }
   } catch (const std::exception& e) {
     const std::string message = std::string("RR migration temporary cleanup held: ") + e.what();
-    lt_log_print(torrent::LOG_ERROR, "%s", message.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", message.c_str());
     control->core()->push_log_std(message);
   }
 }
@@ -4479,7 +4479,7 @@ torrent::Object rr_enqueue_original(core::Download* owner, const torrent::Object
     throw;
   } catch (const torrent::local_error& e) {
     const std::string hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
-    lt_log_print(torrent::LOG_ERROR, "RR enqueue refused: session-storage-failed: %s: %s",
+    lt_log_print(torrent::LOG_ERRORS, "RR enqueue refused: session-storage-failed: %s: %s",
                  hash.c_str(), e.what());
     auto& custom = owner->bencode()->get_key("rtorrent").insert_preserve_copy("custom", torrent::Object::create_map()).first->second;
     custom.insert_key("retrackers-enqueue-refusal", "session-storage-failed");

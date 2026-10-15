@@ -103,7 +103,10 @@ std::string move_begin(core::Download* d,const torrent::Object::list_type& args)
   return "active|"+receipt;
 }
 void move_log(const std::string& h,const std::string& outcome,const std::string& reason) {
-  lt_log_print(torrent::LOG_NOTICE,"autotools: move %s %s: %s",h.c_str(),outcome.c_str(),reason.c_str());
+  // Logging levels are not cascading: a hold or an exhausted retry belongs
+  // with errors, while finished, cancelled and waiting outcomes are events.
+  const int group=(outcome=="held" || outcome=="retries-exhausted") ? torrent::LOG_ERRORS : torrent::LOG_EVENTS;
+  lt_log_print(group,"autotools: move %s %s: %s",h.c_str(),outcome.c_str(),reason.c_str());
 }
 void move_supersede(core::Download* d,const MoveRecord& r) {
   const auto h=move_hash(d);

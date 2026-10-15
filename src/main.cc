@@ -497,10 +497,10 @@ main(int argc, char** argv) {
     retrackers_migration_recover_startup();
     try { stop_intent::cleanup_startup(session_thread::manager()->path()); }
     catch (const std::exception& e) {
-      lt_log_print(torrent::LOG_ERROR, "Stop intent cleanup held: %s", e.what());
+      lt_log_print(torrent::LOG_ERRORS, "Stop intent cleanup held: %s", e.what());
     }
     try { core::file_jobs::startup(session_thread::manager()->path()); }
-    catch (const std::exception&) { lt_log_print(torrent::LOG_ERROR, "autotools: move startup held: session-storage-failed"); }
+    catch (const std::exception&) { lt_log_print(torrent::LOG_ERRORS, "autotools: move startup held: session-storage-failed"); }
     load_arg_torrents(argv + firstArg, argv + argc);
 
     // Make sure we update the display before any scheduled tasks can run, so that loading of

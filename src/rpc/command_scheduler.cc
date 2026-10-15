@@ -72,7 +72,7 @@ CommandScheduler::call_item(value_type item) {
     const bool safe_key = !key.empty() && key.size() <= 128 &&
         key.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-") == std::string::npos;
     const std::string diagnostic = "Scheduled command failed: key=" + (safe_key ? key : std::string("unknown")) + " reason=input-error";
-    lt_log_print(torrent::LOG_ERROR, "%s", diagnostic.c_str());
+    lt_log_print(torrent::LOG_ERRORS, "%s", diagnostic.c_str());
     const std::string line = diagnostic + "\n";
     (void)::write(STDERR_FILENO, line.data(), line.size());
     if (m_slotErrorMessage)

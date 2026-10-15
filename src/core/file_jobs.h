@@ -132,12 +132,12 @@ inline void startup(const std::string& session) {
          !retrackers_migration_source_reserved(hash) && !retrackers_migration_pending(hash) &&
          retrackers_migration_target_source(hash).empty()) {
         remove(session,hash,record.queue);
-        lt_log_print(torrent::LOG_NOTICE,"autotools: move %s cancelled: torrent-absent",hash.c_str());
+        lt_log_print(torrent::LOG_EVENTS,"autotools: move %s cancelled: torrent-absent",hash.c_str());
       }
     }
     catch(const std::exception&) {
       held[hash]="record-malformed";
-      lt_log_print(torrent::LOG_ERROR,"autotools: move %s held: record-malformed; inspect %s/.rutorrent-stop-intents/%s.move",hash.c_str(),session.c_str(),hash.c_str());
+      lt_log_print(torrent::LOG_ERRORS,"autotools: move %s held: record-malformed; inspect %s/.rutorrent-stop-intents/%s.move",hash.c_str(),session.c_str(),hash.c_str());
     }
   }
 }

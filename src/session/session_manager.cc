@@ -555,7 +555,7 @@ SessionManager::flush_all_and_wait_unsafe(std::unique_lock<std::mutex>& lock) {
   // No later session-thread pass reports what this flush suppressed, nor what
   // the session thread suppressed before it; name the two counts apart.
   if (m_ignored_storage_error_count != 0) {
-    lt_log_print(torrent::LOG_ERROR, "Storage errors flushing session data: ignored:%u, earlier ignored:%u",
+    lt_log_print(torrent::LOG_ERRORS, "Storage errors flushing session data: ignored:%u, earlier ignored:%u",
                  suppressed, m_ignored_storage_error_count - suppressed);
     m_ignored_storage_error_count = 0;
   }
