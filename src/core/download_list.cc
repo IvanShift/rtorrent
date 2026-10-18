@@ -294,6 +294,9 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   core::file_jobs::erase_download(itr->get());
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
+  // Callbacks below can add views. New views omit erasing downloads; existing
+  // views are visited through stable pointers rather than manager iterators.
+  const std::vector<View*> views(control->view_manager()->begin(), control->view_manager()->end());
   // Erasure and its view callbacks are internal shutdown, not a newer user Stop.
   stop_intent::ScopedSuppress suppress;
 
@@ -308,8 +311,8 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
 
   DL_TRIGGER_EVENT(*itr, "event.download.erased");
 
-  for (auto v : *control->view_manager())
-    v->erase(itr->get());
+  for (auto view : views)
+    view->erase(itr->get());
 
   if (retire_counter) {
     try { stop_intent::erase_counter(session_thread::manager()->path(), erase_hash); }

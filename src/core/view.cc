@@ -158,7 +158,9 @@ View::initialize(const std::string& name) {
 
   // Urgh, wrong. No filtering being done.
   for (const auto& d : *control->core()->download_list())
-    push_back(d);
+    // Removal callbacks can create views before the list releases the entry.
+    if (!d->is_erasing())
+      push_back(d);
 
   m_size  = base_type::size();
   m_focus = 0;
