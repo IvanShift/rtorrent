@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <memory>
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
+#include <torrent/exceptions.h>
 #include <torrent/torrent.h>
 
 #include "command_helpers.h"
@@ -26,6 +28,8 @@ const char* removed_command = "test.view.event_removed";
 
 std::vector<core::Download*> stub_downloads;
 
+std::function<void(core::Download*)> filter_action;
+std::function<void()> compare_action;
 std::set<core::Download*>    matches_filter;
 std::vector<core::Download*> added_events;
 std::vector<core::Download*> removed_events;
@@ -74,7 +78,14 @@ describe(const std::vector<core::Download*>& downloads) {
 
 torrent::Object
 cmd_filter(core::Download* download, const torrent::Object&) {
+  if (filter_action) filter_action(download);
   return torrent::Object(static_cast<int64_t>(matches_filter.count(download)));
+}
+
+torrent::Object
+cmd_compare(rpc::target_type, const torrent::Object&) {
+  if (compare_action) compare_action();
+  return torrent::Object(int64_t{0});
 }
 
 torrent::Object
@@ -110,10 +121,13 @@ TestView::setUp() {
 
   if (!rpc::commands.has(filter_command)) {
     CMD2_DL(filter_command, &cmd_filter);
+    CMD2_ANY("test.view.compare", &cmd_compare);
     CMD2_DL(added_command, &cmd_event_added);
     CMD2_DL(removed_command, &cmd_event_removed);
   }
 
+  filter_action = {};
+  compare_action = {};
   stub_downloads.clear();
   matches_filter.clear();
   added_events.clear();
@@ -168,4 +182,97 @@ TestView::test_filter_dispatches_events_to_the_right_downloads() {
   CPPUNIT_ASSERT_EQUAL(core::View::size_type(2), view.size_visible());
   CPPUNIT_ASSERT(*view.begin_visible() == d2);
   CPPUNIT_ASSERT(*(view.begin_visible() + 1) == d3);
+}
+
+// A callback can retire another snapshot entry while its shared_ptr is retained.
+// The expired entry must never be filtered or notified afterwards.
+void
+TestView::test_filter_skips_erased_snapshot_entries() {
+  core::View view;
+  view.initialize("test_filter_lifetime");
+  auto first = make_stub_download();
+  auto erased = make_stub_download();
+  auto last = make_stub_download();
+  for (const auto& item : {first, erased, last}) {
+    view.insert(item);
+    view.set_visible(item.get());
+  }
+  view.set_focus(view.begin_visible() + 2);
+  std::vector<core::Download*> visited;
+  filter_action = [&](core::Download* item) {
+    visited.push_back(item);
+    if (item == first.get()) {
+      view.erase(erased.get());
+      erased->release_lifetime();
+    }
+  };
+  matches_filter = {first.get(), last.get()};
+  view.set_filter(command_object(filter_command));
+  view.filter();
+  CPPUNIT_ASSERT_EQUAL(std::string("d0,d2"), describe(visited));
+  CPPUNIT_ASSERT_EQUAL(core::View::size_type(2), view.size_visible());
+  CPPUNIT_ASSERT(*view.begin_visible() == first);
+  CPPUNIT_ASSERT(*(view.begin_visible() + 1) == last);
+  CPPUNIT_ASSERT(*view.focus() == last);
+}
+
+void
+TestView::test_sort_preserves_callback_removal_and_focus() {
+  core::View view;
+  view.initialize("test_sort_lifetime");
+  auto first = make_stub_download();
+  auto erased = make_stub_download();
+  auto last = make_stub_download();
+  for (const auto& item : {first, erased, last}) {
+    view.insert(item);
+    view.set_visible(item.get());
+  }
+  view.set_focus(view.begin_visible() + 2);
+  view.set_sort_current(command_object("test.view.compare"));
+  view.sort();
+  CPPUNIT_ASSERT(*view.begin_visible() == first);
+  CPPUNIT_ASSERT(*(view.begin_visible() + 1) == erased);
+  CPPUNIT_ASSERT(*(view.begin_visible() + 2) == last);
+  CPPUNIT_ASSERT(*view.focus() == last);
+  bool called = false;
+  compare_action = [&]() {
+    CPPUNIT_ASSERT(!called);
+    called = true;
+    view.erase(erased.get());
+    erased->release_lifetime();
+  };
+  view.sort();
+  CPPUNIT_ASSERT(called);
+  CPPUNIT_ASSERT_EQUAL(core::View::size_type(2), view.size_visible());
+  CPPUNIT_ASSERT(*view.begin_visible() == first);
+  CPPUNIT_ASSERT(*(view.begin_visible() + 1) == last);
+  CPPUNIT_ASSERT(*view.focus() == last);
+}
+
+// View::initialize() leaves out downloads being erased, so a view created by
+// an erase callback lacks the download that event.download.erased can still
+// ask it to filter. A download missing for any other reason stays an error.
+void
+TestView::test_filter_download_skips_erasing_download_outside_view() {
+  core::View view;
+  view.initialize("test_filter_erasing");
+  auto held = make_stub_download();
+  auto erasing = make_stub_download();
+  view.insert(held);
+  view.set_visible(held.get());
+  std::vector<core::Download*> visited;
+  filter_action = [&](core::Download* item) { visited.push_back(item); };
+  matches_filter = {held.get(), erasing.get()};
+  view.set_filter(command_object(filter_command));
+  view.set_event_added(command_object(added_command));
+  view.set_event_removed(command_object(removed_command));
+  CPPUNIT_ASSERT_THROW(view.filter_download(erasing.get()), torrent::internal_error);
+  erasing->set_erasing();
+  view.filter_download(erasing.get());
+  CPPUNIT_ASSERT(visited.empty());
+  CPPUNIT_ASSERT(added_events.empty());
+  CPPUNIT_ASSERT(removed_events.empty());
+  CPPUNIT_ASSERT_EQUAL(core::View::size_type(1), view.size_visible());
+  CPPUNIT_ASSERT_EQUAL(core::View::size_type(0), view.size_not_visible());
+  CPPUNIT_ASSERT(*view.begin_visible() == held);
 }

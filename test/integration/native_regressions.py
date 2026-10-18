@@ -1974,6 +1974,97 @@ def view_sort_reentrant(daemon, only_current=False):
         daemon.call('d.erase', expected)
 
 
+def view_filter_erases_other(daemon):
+    first = daemon.fixture('filter-first', start=False)
+    erased = daemon.fixture('filter-erased', start=False)
+    survivor = daemon.fixture('filter-survivor', start=False)
+    daemon.call('view.add', '', 'other')
+    # The filter of the first entry erases a later entry of the same snapshot;
+    # the erased wrapper must never be evaluated or marked afterwards.
+    daemon.call('method.insert', '', 'test.other', 'simple',
+                'd.multicall.filtered=main,"equal=d.hash=,cat=' + erased + '",d.erase=;d.custom.set=visited,yes;cat=1')
+    daemon.call('view.filter', '', 'other', 'test.other=')
+    assert daemon.call('d.multicall2', '', 'other', 'd.hash=', 'd.custom=visited') == [
+        [first, 'yes'], [survivor, 'yes']]
+    assert daemon.call('system.pid') > 0
+
+
+def view_removed_adds_views(daemon):
+    first = daemon.fixture('owner-first', start=False)
+    survivor = daemon.fixture('owner-survivor', start=False)
+    daemon.call('view.add', '', 'owner')
+    daemon.call('method.insert', '', 'test.owner.armed', 'value', 0)
+    # An event_removed callback inside d.erase adds enough views to reallocate
+    # the manager's vector. The new views must not hold the erasing download.
+    added = ['callback-view-' + str(i) for i in range(128)]
+    daemon.call('method.insert', '', 'test.owner.add', 'simple',
+                'test.owner.armed.set=0;' + ';'.join('view.add=' + name for name in added) + ';cat=1')
+    daemon.call('view.event_removed', '', 'owner', 'branch=test.owner.armed=,test.owner.add=,cat=1')
+    daemon.call('test.owner.armed.set', '', 1)
+    daemon.call('d.erase', first)
+    expected = [[survivor]]
+    assert daemon.call('test.owner.armed') == 0
+    for view in ['main', 'owner', *added]:
+        rows = daemon.call('d.multicall2', '', view, 'd.hash=')
+        assert rows == expected, (view, rows, expected)
+        # Unlike multicall, download_list does not skip expired wrappers.
+        assert daemon.call('download_list', '', view) == [row[0] for row in expected]
+    assert daemon.call('d.name', survivor) == 'owner-survivor'
+    witness = daemon.fixture('owner-witness', start=False)
+    for view in ['main', 'owner', *added]:
+        assert daemon.call('download_list', '', view) == [row[0] for row in expected] + [witness]
+    daemon.call('d.erase', witness)
+    for view in ['main', 'owner', *added]:
+        assert daemon.call('download_list', '', view) == [row[0] for row in expected]
+    assert daemon.call('system.pid') > 0
+
+
+def insertion_event_erases(daemon):
+    survivor = daemon.fixture('event-survivor', start=False)
+    daemon.call('method.insert', '', 'test.inserted', 'value', 0)
+    daemon.call('method.set_key', '', 'event.download.inserted', 'test-erase', 'test.inserted.set=1;d.erase=')
+    info = {'length': 8, 'name': 'event-erased', 'piece length': 16384,
+            'pieces': hashlib.sha1(b'xxxxxxxx').digest()}
+    (daemon.directory / 'event.torrent').write_bytes(encode({'info': info}))
+    daemon.call('load.normal', '', '/data/event.torrent')
+    daemon.wait(lambda: daemon.call('test.inserted') == 1, 'erasing insertion callback')
+    # A later asynchronous load is the positive witness that the load finished.
+    daemon.call('method.set_key', '', 'event.download.inserted', 'test-erase', '')
+    witness = daemon.fixture('event-witness', start=False)
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[survivor], [witness]]
+
+
+def load_commands_erase(daemon, one_string=False):
+    survivor = daemon.fixture('load-survivor', start=False)
+    info = {'length': 8, 'name': 'load-erased', 'piece length': 16384,
+            'pieces': hashlib.sha1(b'xxxxxxxx').digest()}
+    (daemon.directory / 'load.torrent').write_bytes(encode({'info': info}))
+    # Commands after the erase, in a later argument or later in the same
+    # ';'-separated argument, must not run on the freed download.
+    commands = ['d.erase=;d.custom1.set=after;d.name='] if one_string else ['d.erase=', 'd.name=']
+    daemon.call('load.normal', '', '/data/load.torrent', *commands)
+    witness = daemon.fixture('load-witness', start=False)
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[survivor], [witness]]
+
+
+def view_late_filter_on_erase(daemon):
+    # A closing callback inside d.erase creates a view and filters it on
+    # event.download.erased; that view never held the erasing download.
+    target = daemon.fixture('late-target', start=True)
+    survivor = daemon.fixture('late-survivor', start=False)
+    daemon.call('method.insert', '', 'test.late.armed', 'value', 0)
+    daemon.call('method.insert', '', 'test.late.add', 'simple',
+                'test.late.armed.set=0;view.add=late;view.filter_on=late,event.download.erased')
+    daemon.call('method.set_key', '', 'event.download.closed', 'late-add',
+                'branch=test.late.armed=,test.late.add=')
+    daemon.call('test.late.armed.set', '', 1)
+    daemon.call('d.erase', target)
+    assert daemon.call('system.pid') > 0
+    assert daemon.call('test.late.armed') == 0
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[survivor]]
+    assert daemon.call('d.multicall2', '', 'late', 'd.hash=') == [[survivor]]
+
+
 def erasedata_cancel_view_filter(daemon):
     h = daemon.fixture('erasedata-cancel-view-filter', start=False)
     values = erasedata_tuple(daemon, h)
@@ -3074,6 +3165,12 @@ CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d,
          'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
          'view-filter-reentrant': view_filter_reentrant,
          'view-sort-reentrant': view_sort_reentrant,
+         'view-filter-erases-other': view_filter_erases_other,
+         'view-removed-adds-views': view_removed_adds_views,
+         'view-late-filter-on-erase': view_late_filter_on_erase,
+         'insertion-event-erases': insertion_event_erases,
+         'load-commands-erase': load_commands_erase,
+         'load-command-string-erase': lambda d: load_commands_erase(d, one_string=True),
          'erasedata-cancel-view-filter': erasedata_cancel_view_filter,
          'erasedata-hash-initial-held': lambda d: erasedata_hash_completion(d, 1),
          'erasedata-hash-last-held': lambda d: erasedata_hash_completion(d, 2),

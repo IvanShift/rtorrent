@@ -5,6 +5,10 @@ class TestView : public TestFixtureWithMainThread {
 
   CPPUNIT_TEST(test_filter_dispatches_events_to_the_right_downloads);
 
+  CPPUNIT_TEST(test_filter_skips_erased_snapshot_entries);
+  CPPUNIT_TEST(test_sort_preserves_callback_removal_and_focus);
+  CPPUNIT_TEST(test_filter_download_skips_erasing_download_outside_view);
+
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -12,4 +16,7 @@ public:
   void tearDown();
 
   void test_filter_dispatches_events_to_the_right_downloads();
+  void test_filter_skips_erased_snapshot_entries();
+  void test_sort_preserves_callback_removal_and_focus();
+  void test_filter_download_skips_erasing_download_outside_view();
 };
