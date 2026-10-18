@@ -46,6 +46,27 @@ is_network_uri(const std::string& uri) {
 
 static constexpr const char* session_invalid_message = "Session data is invalid, ignoring it";
 
+// A session reload has no load options of its own. Keep the start flag and
+// commands the metadata placeholder was saved with, if they are well formed.
+static bool
+has_meta_download_options(const torrent::Object& root) {
+  if (!root.has_key_map("rtorrent_meta_download"))
+    return false;
+
+  const auto& meta = root.get_key("rtorrent_meta_download");
+
+  if (!meta.has_key_value("start") || !meta.has_key_value("print_log") || !meta.has_key_list("commands"))
+    return false;
+
+  // process_meta_download() takes start as the declared load flag.
+  const auto start = meta.get_key_value("start");
+  if (start != 0 && start != 1)
+    return false;
+
+  const auto& commands = meta.get_key_list("commands");
+  return std::all_of(commands.begin(), commands.end(), [](const auto& command) { return command.is_string(); });
+}
+
 static std::unique_ptr<torrent::Object>
 download_factory_load_stream(const char* filename, bool* is_invalid) {
   struct stat sb;
@@ -260,7 +281,7 @@ DownloadFactory::receive_success() {
 
   torrent::Object* root = download->bencode();
 
-  if (download->download()->info()->is_meta_download()) {
+  if (download->download()->info()->is_meta_download() && !(m_session && has_meta_download_options(*root))) {
     int64_t declared_start = m_start;
     // Session reloads do not set m_start. Preserve a valid original load flag:
     // service magnets may have been started solely to retrieve metadata.
