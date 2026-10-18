@@ -486,6 +486,8 @@ DownloadFactory::receive_success() {
 
   // Save the info-hash just in case the commands decide to delete it.
   torrent::HashString infohash = download->info()->hash();
+  // Load commands may erase the target while other snapshots keep its wrapper.
+  const auto lifetime = download->lifetime();
 
   RetrackersMigrationCreation rr_creation(download);
   try {
@@ -503,12 +505,15 @@ DownloadFactory::receive_success() {
       log_created(download, rtorrent);
 
     if (!erasedata_held)
-      for (const auto& command : m_commands)
+      for (const auto& command : m_commands) {
+        if (lifetime.expired())
+          break;
         rpc::parse_command_multiple_std(command, rpc::make_target(download));
+      }
     if (!rr_target_source.empty() && !m_session && !rr_creation.applied())
       throw torrent::input_error("RR migration apply did not finish.");
 
-    if (m_manager->download_list()->find(infohash) == m_manager->download_list()->end())
+    if (lifetime.expired())
       throw torrent::input_error("The newly created download was removed.");
 
     if (!m_session)
