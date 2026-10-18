@@ -339,8 +339,13 @@ View::filter_by(const torrent::Object& condition, View::base_type& result) {
 void
 View::filter_download(core::Download* download) {
   auto itr = std::find_if(base_type::begin(), base_type::end(), entry_is(download));
-  if (itr == base_type::end())
+  if (itr == base_type::end()) {
+    // View::initialize() leaves out erasing downloads, so a view created by
+    // an erase callback can be asked to filter one it never held.
+    if (download->is_erasing())
+      return;
     throw torrent::internal_error("View::filter_download(...) could not find download.");
+  }
 
   const auto entry = *itr;
   const auto lifetime = download->lifetime();
