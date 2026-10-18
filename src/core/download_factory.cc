@@ -527,9 +527,15 @@ DownloadFactory::receive_success() {
 
     if (!erasedata_held)
       for (const auto& command : m_commands) {
+        // A string may hold several ';'-separated commands. Run them one at a
+        // time, as parse_command_multiple() does, and stop once one erases
+        // the download, not only between strings.
+        const char* first = command.c_str();
+        const char* last = first + command.size();
+        while (first != last && !lifetime.expired())
+          first = rpc::parse_command(rpc::make_target(download), first, last).second;
         if (lifetime.expired())
           break;
-        rpc::parse_command_multiple_std(command, rpc::make_target(download));
       }
     if (!rr_target_source.empty() && !m_session && !rr_creation.applied())
       throw torrent::input_error("RR migration apply did not finish.");
