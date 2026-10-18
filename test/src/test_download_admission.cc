@@ -44,3 +44,17 @@ void TestDownloadAdmission::test_selected_topic_and_nonzero_identity() {
   CPPUNIT_ASSERT(!core::download_input_zero_infohash(magnet("magnet:?dn="+zero)));
   CPPUNIT_ASSERT(!core::download_input_zero_infohash(magnet("magnet:?xt=urn:btmh:1220"+std::string(64,'0'))));
 }
+void TestDownloadAdmission::test_tag_runs_to_equals_sign() {
+  const auto zero="xt=urn:btih:"+std::string(40,'0');
+  const auto valid="xt=urn:btih:"+std::string(40,'1');
+  // libtorrent reads "&xt" and "x&xt" as tags, so it keeps the earlier zero topic.
+  CPPUNIT_ASSERT(core::download_input_zero_infohash(magnet("magnet:?"+zero+"&&"+valid)));
+  CPPUNIT_ASSERT(core::download_input_zero_infohash(magnet("magnet:?"+zero+"&x&"+valid)));
+  // The reverse form selects the valid topic and loads.
+  CPPUNIT_ASSERT(!core::download_input_zero_infohash(magnet("magnet:?"+valid+"&x&"+zero)));
+  CPPUNIT_ASSERT(!core::download_input_zero_infohash(magnet("magnet:?"+valid+"&&"+zero)));
+  // A value may hold '='; only the tag ends at the first one.
+  CPPUNIT_ASSERT(core::download_input_zero_infohash(magnet("magnet:?dn=a=b&"+zero)));
+  // A trailing piece without '=' makes libtorrent refuse the whole URI itself.
+  CPPUNIT_ASSERT(!core::download_input_zero_infohash(magnet("magnet:?"+zero+"&&")));
+}

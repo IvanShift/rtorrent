@@ -21,11 +21,15 @@ inline bool download_input_zero_infohash(const torrent::Object& object) {
   bool selected_zero=false;
   size_t begin=8;
   while(begin<uri.size()) {
-    auto end=uri.find('&',begin);
+    // Tokenize like libtorrent's parse_magnet_uri(): the tag runs to '=' across
+    // any '&', the value to the next '&'. A piece without '=' (also the empty
+    // piece of "&&") joins the next tag, so "x&xt" is no exact topic there.
+    const auto equal=uri.find('=',begin);
+    if(equal==std::string::npos) return false; // libtorrent refuses the URI.
+    auto end=uri.find('&',equal+1);
     if(end==std::string::npos) end=uri.size();
-    constexpr const char* prefix="xt=urn:btih:";
-    if(uri.compare(begin,12,prefix)==0) {
-      const auto raw=uri.substr(begin+12,end-begin-12);
+    if(uri.compare(begin,equal-begin,"xt")==0 && uri.compare(equal+1,9,"urn:btih:")==0) {
+      const auto raw=uri.substr(equal+10,end-equal-10);
       // Match the current libtorrent parser's last btih and accepted encodings.
       // Unrelated topics, including a hybrid btmh, do not select an identity.
       selected_zero=raw.size()==32 && std::all_of(raw.begin(),raw.end(),[](char c){return c=='A'||c=='a';});
