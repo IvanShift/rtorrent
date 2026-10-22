@@ -209,8 +209,10 @@ SessionManager::save_full_download_durable(core::Download* download) {
   auto torrent_stream = storer.torrent_stream();
   auto rtorrent_stream = storer.rtorrent_stream();
   auto libtorrent_stream = storer.libtorrent_stream();
-  DownloadStorer::save_and_move_streams(storer.build_path(m_path), true, file_mode(),
-                                        torrent_stream.get(), rtorrent_stream.get(), libtorrent_stream.get());
+  const auto path = storer.build_path(m_path);
+  if (const int error = DownloadStorer::save_and_move_streams(path, true, file_mode(), torrent_stream.get(),
+                                                              rtorrent_stream.get(), libtorrent_stream.get()))
+    report_file_mode_error(path, error);
 }
 
 void
@@ -476,10 +478,11 @@ SessionManager::process_next_save_request_unsafe() {
         };
 
       try {
-        DownloadStorer::save_and_move_streams(itr->second.path, m_use_fsyncdisk, file_mode(),
-                                              itr->second.torrent_stream.get(),
-                                              itr->second.rtorrent_stream.get(),
-                                              itr->second.libtorrent_stream.get());
+        itr->second.mode_error =
+          DownloadStorer::save_and_move_streams(itr->second.path, m_use_fsyncdisk, file_mode(),
+                                                itr->second.torrent_stream.get(),
+                                                itr->second.rtorrent_stream.get(),
+                                                itr->second.libtorrent_stream.get());
       } catch (...) {
         cleanup_fn();
         throw;
@@ -526,6 +529,19 @@ SessionManager::report_storage_error_unsafe(const std::string& what) {
   m_ignored_storage_error_count = 0;
 }
 
+// A file system that refuses the configured mode leaves session files
+// owner-only, which is stricter than any accepted mode. The save completes;
+// only the first such failure of a run is logged, since the rest would
+// repeat it for every file.
+void
+SessionManager::report_file_mode_error(const std::string& path, int error) {
+  if (m_file_mode_error_reported.exchange(true))
+    return;
+
+  lt_log_print(torrent::LOG_ERRORS, "Session file mode %04o could not be set, files stay owner-only; later failures are not logged: fchmod: %s : %s",
+               static_cast<unsigned int>(file_mode()), std::strerror(error), path.c_str());
+}
+
 // The one policy for a finished save, on the session thread and in shutdown
 // flushes: storage errors go to report_storage_error_unsafe(), internal and
 // unknown errors propagate. Callers hold m_mutex.
@@ -547,6 +563,9 @@ SessionManager::consume_finished_save_unsafe(ProcessingSave& request) {
     LT_LOG("error saving download : unknown error : download:%p path:%s", request.second.download, request.second.path.c_str());
     throw;
   }
+
+  if (request.second.mode_error != 0)
+    report_file_mode_error(request.second.path, request.second.mode_error);
 
   LT_LOG("finished saving download : download:%p path:%s", request.second.download, request.second.path.c_str());
 }

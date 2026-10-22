@@ -35,6 +35,7 @@ struct SaveRequest {
   std::unique_ptr<std::stringstream> torrent_stream;
   std::unique_ptr<std::stringstream> rtorrent_stream;
   std::unique_ptr<std::stringstream> libtorrent_stream;
+  int                                mode_error{}; // Set by the save worker.
 };
 
 class SessionManager {
@@ -70,6 +71,9 @@ public:
   void                save_resume_download(core::Download* download);
   void                remove_download(core::Download* download);
   void                drain_download_saves(core::Download* download);
+
+  // Main or session thread only.
+  void                report_file_mode_error(const std::string& path, int error);
 
 protected:
   friend class ::Control;
@@ -137,6 +141,7 @@ private:
 
   std::chrono::microseconds    m_last_storage_error_message{};
   unsigned int                 m_ignored_storage_error_count{};
+  std::atomic<bool>            m_file_mode_error_reported{};
 
   // Pending builds are only ever locked by main thread.
   std::mutex                   m_pending_builds_mutex;

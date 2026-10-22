@@ -34,7 +34,11 @@ public:
   auto                rtorrent_stream()      { return std::move(m_rtorrent_stream); }
   auto                libtorrent_stream()    { return std::move(m_libtorrent_stream); }
 
-  static void         save_and_move_streams(const std::string& path, bool use_fsyncdisk, mode_t file_mode,
+  // Returns 0, or the errno of the first fchmod that could not set file_mode.
+  // Such a file keeps the owner-only mode open() gave it and the save goes on.
+  // The caller reports it: save workers are not libtorrent threads, and the
+  // log writer needs one.
+  static int          save_and_move_streams(const std::string& path, bool use_fsyncdisk, mode_t file_mode,
                                             const std::stringstream* torrent_stream,
                                             const std::stringstream* rtorrent_stream,
                                             const std::stringstream* libtorrent_stream);

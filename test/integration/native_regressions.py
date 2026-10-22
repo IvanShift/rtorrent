@@ -88,6 +88,7 @@ class Daemon:
         self.cut = CUTS.get(case, '')
         self.environment = {}
         self.options = []  # Extra docker run options, such as a tmpfs session.
+        self.seccomp = SETTINGS['seccomp']  # A case may replace the profile.
         self.supervised = False
         self.directory = pathlib.Path(scratch).resolve() / (case + '-' + uuid.uuid4().hex[:8])
         self.directory.mkdir(mode=0o755, parents=True)
@@ -112,7 +113,7 @@ class Daemon:
     def run(self):
         self.socket.unlink(missing_ok=True)
         (self.session / 'rtorrent.lock').unlink(missing_ok=True)
-        seccomp = ['--security-opt', 'seccomp=' + SETTINGS['seccomp']] if SETTINGS['seccomp'] else []
+        seccomp = ['--security-opt', 'seccomp=' + self.seccomp] if self.seccomp else []
         docker('run', '-d', '--pull=never', '--name', self.name, '--network', 'none',
                *container_options(), *seccomp,
                '--stop-timeout', '60', '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'HOME=/tmp',
@@ -3336,6 +3337,87 @@ def session_umask_journal(daemon):
     owner_restored(daemon, job, completed=True)
 
 
+def session_mode_chmod_refused(daemon):
+    # A file system that refuses chmod must not stop session saves under
+    # session.umask.set: each file keeps the owner-only mode open() gave it,
+    # the save completes, and the first failure of a run is logged once. Each
+    # run below starts with a writer that has not reported yet: asynchronous
+    # saves, the durable save of an erasedata prepare, a claimed download's
+    # late save, and the startup rollback of a captured same-hash job, which
+    # writes through rr_session_write_file(). Seccomp refuses only the 0640
+    # the umask asks for, so erasedata's own fchmod to 0600 still works.
+    rules = [{'names': ['fchmod'], 'action': 'SCMP_ACT_ERRNO', 'errnoRet': 1,
+              'args': [{'index': 1, 'value': 0o640, 'op': 'SCMP_CMP_EQ'}]},
+             {'names': ['fchmodat'], 'action': 'SCMP_ACT_ERRNO', 'errnoRet': 1,
+              'args': [{'index': 2, 'value': 0o640, 'op': 'SCMP_CMP_EQ'}]}]
+    if daemon.seccomp:
+        rules += NINEP_SECCOMP['syscalls']
+    profile = daemon.directory / 'chmod-refused-seccomp.json'
+    profile.write_text(json.dumps({'defaultAction': 'SCMP_ACT_ALLOW', 'syscalls': rules}))
+    daemon.seccomp = str(profile)
+    restart_with_rc(daemon, 'session.umask.set=0027')
+    log = daemon.directory / 'native.log'  # Each start truncates it.
+    reported = lambda: [line for line in log.read_text().splitlines() if 'Session file mode' in line]
+
+    def run_reports(hash_):
+        daemon.wait(lambda: reported(), 'session file mode report', timeout=10)
+        time.sleep(.5)
+        lines = reported()
+        assert len(lines) == 1 and lines[0].endswith(
+            ' could not be set, files stay owner-only; later failures are not logged: '
+            'fchmod: Operation not permitted : /data/.session/' + hash_ + '.torrent'), lines
+
+    # Run 1: asynchronous saves, the first from a new download's full save.
+    daemon.start()
+    plain = daemon.fixture('chmod-refused-plain', start=False)
+    run_reports(plain)
+    durable = daemon.fixture('chmod-refused-durable', start=False)
+    claimed = daemon.fixture('chmod-refused-claimed', start=False)
+    labels = {hash_: 'chmod-refused-' + hash_[:8] for hash_ in (plain, durable, claimed)}
+    for hash_, label in labels.items():
+        daemon.call('d.custom1.set', hash_, label)
+    daemon.call('session.save')
+    daemon.wait(lambda: all(label.encode() in session_files(daemon, hash_)[1].read_bytes()
+                            for hash_, label in labels.items()), 'asynchronous saves', timeout=10)
+    # Run 2: the durable save of an erasedata prepare.
+    daemon.stop()
+    daemon.start()
+    assert erasedata_call(daemon, 'prepare', erasedata_tuple(daemon, durable)) == 'prepared'
+    run_reports(durable)
+    # Run 3: a claimed download's redirected late save, through its finish.
+    daemon.stop()
+    daemon.start()
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    local, marker, tx, incarnation, queue = enqueue(daemon, claimed)
+    run_reports(claimed)
+    labels[claimed] = 'chmod-refused-late'
+    daemon.call('d.custom1.set', claimed, labels[claimed])
+    daemon.call('session.save')
+    daemon.wait(lambda: labels[claimed].encode() in session_files(daemon, claimed)[1].read_bytes(), 'late save',
+                timeout=10)
+    assert daemon.call('d.retrackers.finish_original', claimed, tx, incarnation) == 'finalized'
+    assert daemon.call('d.retrackers.dequeue_original', claimed, tx, incarnation, queue) == 'dequeued'
+    job = same_hash_job(daemon, 'chmod-refused-rollback', worker=False)
+    labels[job['hash']] = 'label-' + job['name']
+    assert len(reported()) == 1, reported()
+    # Run 4: startup rolls the captured job back into the session directory.
+    daemon.stop()
+    daemon.start()
+    daemon.wait(lambda: job['hash'] in [row[0] for row in daemon.call('d.multicall2', '', 'main', 'd.hash=')],
+                'startup rollback of the captured job')
+    run_reports(job['hash'])
+    owner_restored(daemon, job, completed=False)
+    files = [path for hash_ in labels for path in session_files(daemon, hash_)]
+    assert set(file_modes(files).values()) == {'0o600'}, file_modes(files)
+    leftovers = sorted(path.name for path in daemon.session.iterdir() if '.new' in path.name or '.tmp.' in path.name)
+    assert not leftovers, 'unfinished session writes: ' + repr(leftovers)
+    assert not [line for line in log.read_text().splitlines() if 'Storage errors' in line]
+    daemon.stop()
+    daemon.start()
+    lost = {hash_: daemon.call('d.custom1', hash_) for hash_, label in labels.items()
+            if daemon.call('d.custom1', hash_) != label}
+    assert not lost, 'labels lost after restart: ' + repr(lost)
+
 CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
          'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
          'view-filter-reentrant': view_filter_reentrant,
@@ -3436,6 +3518,7 @@ CASES.update({'shutdown-storage-errors-sigint': lambda daemon: shutdown_storage_
               'session-umask-refusal': session_umask_refusal,
               'session-umask-saves': session_umask_saves,
               'session-umask-journal': session_umask_journal})
+CASES.update({'session-mode-chmod-refused': session_mode_chmod_refused})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 

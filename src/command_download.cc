@@ -1066,13 +1066,15 @@ std::string rr_migration_read_bytes(const std::string& filename, size_t max_size
 
 // file_mode 0 keeps the owner-only mode the temporary is created with; any
 // other mode is set right after creation, as DownloadStorer::save_stream() does.
-void rr_migration_write_file(int dir, const std::string& name, const std::string& bytes,
-                             mode_t file_mode = 0) {
+// Returns 0, or the errno of an fchmod that failed: that file stays owner-only.
+int rr_migration_write_file(int dir, const std::string& name, const std::string& bytes,
+                            mode_t file_mode = 0) {
   std::string temporary;
   const int fd = rr_migration_create_temporary(dir, name, &temporary);
   if (fd < 0)
     throw torrent::input_error("RR migration durable write could not create temporary file.");
-  bool okay = file_mode == 0 || ::fchmod(fd, file_mode) == 0;
+  const int mode_error = file_mode != 0 && ::fchmod(fd, file_mode) < 0 ? errno : 0;
+  bool okay = true;
   for (size_t offset = 0; okay && offset < bytes.size();) {
     const ssize_t n = ::write(fd, bytes.data() + offset, bytes.size() - offset);
     if (n <= 0) okay = false;
@@ -1085,6 +1087,7 @@ void rr_migration_write_file(int dir, const std::string& name, const std::string
     ::unlinkat(dir, temporary.c_str(), 0);
     throw torrent::input_error("RR migration durable write failed.");
   }
+  return mode_error;
 }
 
 // The ordinary triple in the session directory follows session.umask.set like
@@ -1092,7 +1095,9 @@ void rr_migration_write_file(int dir, const std::string& name, const std::string
 // requires. Only ordinary saves rewrite these files later, and only a full
 // save rewrites the .torrent file.
 void rr_session_write_file(int session, const std::string& name, const std::string& bytes) {
-  rr_migration_write_file(session, name, bytes, session_thread::manager()->file_mode());
+  auto* manager = session_thread::manager();
+  if (const int error = rr_migration_write_file(session, name, bytes, manager->file_mode()))
+    manager->report_file_mode_error(manager->path() + name, error);
 }
 
 bool rr_quiesced_read(const RrMigrationCapsule& state, uint64_t* generation) {
@@ -2133,8 +2138,9 @@ uint64_t rr_late_save_to_prefix(core::Download* download, const std::string& pre
     session::DownloadStorer::save_and_move_streams(
         journal + prefix + ".late." + std::to_string(sequence) + "." + slot + ".torrent",
         true, 0, torrent_stream.get(), rtorrent_stream.get(), resume_stream.get());
-  session::DownloadStorer::save_and_move_streams(ordinary, true, session_thread::manager()->file_mode(),
-      torrent_stream.get(), rtorrent_stream.get(), resume_stream.get());
+  if (const int error = session::DownloadStorer::save_and_move_streams(ordinary, true,
+          session_thread::manager()->file_mode(), torrent_stream.get(), rtorrent_stream.get(), resume_stream.get()))
+    session_thread::manager()->report_file_mode_error(ordinary, error);
   const int dir = rr_migration_dir();
   try {
     rr_migration_write_file(dir, prefix + ".late.receipt",
