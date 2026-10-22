@@ -3130,10 +3130,13 @@ def session_save_overlap_held(daemon):
     assert_saves_intact(daemon, hashes)
 
 
-def shutdown_storage_errors(daemon):
+def shutdown_storage_errors(daemon, signal='SIGTERM'):
     # Shutdown flushes share the session thread's storage-error policy: the
     # first error is logged with its text and later ones are counted, instead
-    # of one error line per torrent and flush.
+    # of one error line per torrent and flush. docker stop's SIGTERM, with no
+    # tracker request pending, leaves the event loop before handle_shutdown()
+    # and main() saves. SIGINT saves in handle_shutdown(); main() must not
+    # save again, and the session cleanup must not count those failures twice.
     hashes = [daemon.fixture('storage-error-' + str(index), start=False) for index in range(12)]
     daemon.call('session.save')
     daemon.wait(lambda: all((daemon.session / (h + '.torrent.rtorrent')).exists() for h in hashes),
@@ -3146,7 +3149,14 @@ def shutdown_storage_errors(daemon):
         # The session thread fails these first: one line, eleven suppressed.
         daemon.call('session.save')
         time.sleep(2)
-        daemon.stop()
+        if signal == 'SIGTERM':
+            daemon.stop()
+        else:
+            docker('kill', '--signal', signal, daemon.name)
+            daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                        'daemon exit after ' + signal)
+            assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '0'
+            docker('rm', daemon.name)
     finally:
         daemon.session.chmod(0o2700)
     lines = [line for line in (daemon.directory / 'native.log').read_text().splitlines()
@@ -3154,8 +3164,9 @@ def shutdown_storage_errors(daemon):
     assert lines and 'failed to' in lines[0], lines
     # Upstream 0.16.26 prints one total for a flush; the fork printed it split
     # as "ignored:N, earlier ignored:M". Accept both and assert the exact sum:
-    # every failed save (the session thread's twelve and the shutdown save's
-    # twelve) is either a detailed line or counted in a summary.
+    # every failed save is either a detailed line or counted in a summary,
+    # twelve from the session thread and twelve from the save at exit (in
+    # main() after SIGTERM, in handle_shutdown() after SIGINT).
     summaries = [re.search(r'flushing session data: ignored:(\d+)(?:, earlier ignored:(\d+))?$', line)
                  for line in lines if 'flushing session data' in line]
     assert summaries and all(summaries), lines
@@ -3167,6 +3178,155 @@ def shutdown_storage_errors(daemon):
     assert accounted == 2 * len(hashes), f'{accounted} of {2 * len(hashes)} failed saves accounted: {lines}'
     assert len(lines) <= 3, f'{len(lines)} storage error lines for {len(hashes)} torrents'
     print(f'  storage error lines for {len(hashes)} torrents: {len(lines)}', flush=True)
+
+
+def shutdown_partial_resume(daemon, hook=False):
+    # The shutdown save follows the downloads' pause, so an incomplete active
+    # download keeps real file mtimes in its resume data. A save made while it
+    # is active writes mtime ~3 ("not trusted") and forces a recheck after the
+    # restart; a kill while stopped announces are held keeps that save. The
+    # hook variant adds the docker-rutorrent rc hook (session.save= in
+    # event.system.shutdown): the saves it queues must wait for the pause too.
+    compile_fixture(daemon, 'stopped-tracker.cc', 'stopped-tracker')
+    port = 45581
+    docker('exec', '-d', daemon.name, '/data/stopped-tracker', str(port), '/data/tracker.ready',
+           '/data/tracker-stopped')
+    daemon.wait(lambda: (daemon.directory / 'tracker.ready').exists(), 'local tracker readiness')
+    hashes = []
+    for index in range(4):
+        name = 'partial-resume-' + str(index)
+        info = {'length': 32768, 'name': name, 'piece length': 16384,
+                'pieces': hashlib.sha1(b'a' * 16384).digest() + hashlib.sha1(b'b' * 16384).digest()}
+        hashes.append(hashlib.sha1(encode(info)).hexdigest().upper())
+        (daemon.directory / 'dl' / name).write_bytes(b'a' * 16384 + b'c' * 16384)  # Second piece wrong.
+        (daemon.directory / (name + '.torrent')).write_bytes(encode({
+            'announce': f'http://127.0.0.1:{port}/announce', 'info': info}))
+        daemon.call('load.start', '', '/data/' + name + '.torrent')
+    daemon.wait(lambda: all(daemon.call('d.is_hash_checked', h) == 1 and daemon.call('d.is_active', h) == 1
+                            and daemon.call('d.completed_chunks', h) == 1 for h in hashes),
+                'incomplete downloads active', timeout=60)
+    daemon.wait(lambda: all((rows := daemon.call('t.multicall', h, '', 't.success_counter=', 't.is_busy='))
+                            and all(row[0] > 0 and row[1] == 0 for row in rows) for h in hashes),
+                'initial announces accepted', timeout=60)
+    resume = lambda h: daemon.session / (h + '.torrent.libtorrent_resume')
+    mtimes = lambda h: [int(value) for value in re.findall(rb'5:mtimei(-?\d+)e', resume(h).read_bytes())]
+    daemon.call('session.save')
+    daemon.wait(lambda: all(mtimes(h) == [~3] for h in hashes), 'active resume data marked untrusted')
+    time.sleep(1)
+    saved = {h: resume(h).stat().st_mtime_ns for h in hashes}
+    if hook:
+        daemon.call('method.set_key', '', 'event.system.shutdown', 'docker_rutorrent_early_save', 'session.save=')
+    docker('kill', '--signal', 'SIGINT', daemon.name)
+    daemon.wait(lambda: (daemon.directory / 'tracker-stopped').exists(), 'first held stopped announce')
+    daemon.wait(lambda: all(resume(h).stat().st_mtime_ns > saved[h] for h in hashes), 'shutdown save')
+    running = docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip()
+    docker('kill', daemon.name)
+    assert running == 'true', 'daemon exited before its held stopped announce could be cut'
+    daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                'killed daemon')
+    docker('rm', daemon.name)
+    untrusted = {h: mtimes(h) for h in hashes if any(value < 0 for value in mtimes(h))}
+    assert not untrusted, 'shutdown saved resume data from before the pause: ' + repr(untrusted)
+    print(f'  paused resume data saved: {len(hashes)}/{len(hashes)}', flush=True)
+
+
+SESSION_SUFFIXES = ('.torrent', '.torrent.rtorrent', '.torrent.libtorrent_resume')
+
+
+def session_files(daemon, hash_):
+    return [daemon.session / (hash_ + suffix) for suffix in SESSION_SUFFIXES]
+
+
+def file_modes(paths):
+    return {path.name: oct(path.stat().st_mode & 0o7777) for path in paths}
+
+
+def restart_with_rc(daemon, *lines):
+    # Options only an rc can carry: replace the daemon the harness started.
+    docker('rm', '-f', daemon.name)
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write(''.join(line + '\n' for line in lines))
+
+
+def session_umask_refusal(daemon):
+    # session.umask.set must keep group and other write masked (0022): another
+    # UID could otherwise plant load commands in session files. A refused rc
+    # value stops startup visibly; 0022 itself is accepted.
+    rc = daemon.directory / 'test.rc'
+    base = rc.read_text()
+    for value in ('0002', '0020', '0022'):
+        docker('rm', '-f', daemon.name)
+        rc.write_text(base + 'session.umask.set=' + value + '\n')
+        if value == '0022':
+            daemon.start()
+            assert daemon.call('session.umask') == 0o022
+            continue
+        daemon.run()
+        daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                    'refused startup with session.umask.set=' + value)
+        code = docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip()
+        logs = docker('logs', daemon.name, check=False)
+        output = logs.stdout + logs.stderr
+        assert code == '255' and 'Session umask must mask group and other write permissions (0022).' in output, \
+            (value, code, output[-300:])
+
+
+def session_umask_saves(daemon):
+    # session.umask.set=0027 is fixed at startup and gives the triples that
+    # DownloadStorer writes mode 0640: asynchronous saves and the durable save
+    # of an erasedata prepare alike. A restart loads such files.
+    restart_with_rc(daemon, 'session.umask.set=0027')
+    daemon.start()
+    assert daemon.call('session.umask') == 0o027
+    expect_fault(lambda: daemon.call('session.umask.set', '', 0o077), 'cannot be changed after startup')
+    hashes = [daemon.fixture('umask-started'), daemon.fixture('umask-stopped', start=False)]
+    daemon.call('session.save')
+    files = [path for hash_ in hashes for path in session_files(daemon, hash_)]
+    daemon.wait(lambda: all(path.exists() for path in files), 'session triples')
+    assert set(file_modes(files).values()) == {'0o640'}, file_modes(files)
+    daemon.stop()
+    daemon.start()
+    assert all(daemon.call('d.hash', hash_) == hash_ for hash_ in hashes)
+    durable = daemon.fixture('umask-durable', start=False)
+    files = session_files(daemon, durable)
+    daemon.wait(lambda: all(path.exists() for path in files), 'durable fixture triple')
+    time.sleep(1)
+    for path in files:
+        path.unlink()
+    assert erasedata_call(daemon, 'prepare', erasedata_tuple(daemon, durable)) == 'prepared'
+    assert set(file_modes(files).values()) == {'0o640'}, file_modes(files)
+
+
+def session_umask_journal(daemon):
+    # Under session.umask.set=0027 the ordinary triple follows the umask while
+    # the retrackers journal copies stay 0600, the only mode their reader,
+    # rr_migration_read_bytes(), admits: a claimed download's redirected late
+    # save (.late.N.{a,b} copies) and a same-hash release, which reads its
+    # .released copies back and removes them when it finalizes.
+    restart_with_rc(daemon, 'session.umask.set=0027')
+    daemon.start()
+    daemon.call('method.insert', '', 'rr.receipts.v1', 'multi|rlookup|static')
+    journal = daemon.session / '.retrackers-migration'
+    hash_ = daemon.fixture('umask-claimed', start=False)
+    local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
+    prefix = hash_ + '.claim.' + tx
+    receipt = journal / (prefix + '.late.receipt')
+    sequence = lambda: int(receipt.read_text().split(':')[4]) if receipt.exists() else 0
+    first = sequence()
+    daemon.call('d.custom1.set', hash_, 'umask-late')
+    daemon.call('session.save')
+    daemon.wait(lambda: sequence() > first, 'late save of the claimed download')
+    copies = [journal / (prefix + '.late.' + str(sequence()) + '.' + slot + suffix)
+              for slot in 'ab' for suffix in SESSION_SUFFIXES]
+    assert set(file_modes(copies).values()) == {'0o600'}, file_modes(copies)
+    ordinary = session_files(daemon, hash_)
+    assert b'umask-late' in ordinary[1].read_bytes()
+    assert set(file_modes(ordinary).values()) == {'0o640'}, file_modes(ordinary)
+    job = same_hash_job(daemon, 'umask-release', paused=True, worker=False)
+    candidate = load_candidate(daemon, job)
+    assert daemon.call('d.retrackers.commit', job['hash'], job['hash'], job['local'], job['tx']) == 'committed'
+    assert daemon.call('d.retrackers.release_committed', job['hash'], job['tx'], candidate) == 'released'
+    owner_restored(daemon, job, completed=True)
 
 
 CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
@@ -3261,6 +3421,14 @@ CASES.update({'owner-cut-before': owner_cut, 'owner-cut-after': owner_cut,
               'owner-cut-retry': owner_cut_retry, 'owner-tombstone-cut': owner_tombstone_cut,
               'owner-tombstone-startup': owner_tombstone_startup})
 CASES.update({'hash-status-after-repair': hash_status_after_repair})
+# The 0.16.26 merge decisions: one shutdown save, after the pause, and
+# session.umask.set with 0600 journal copies.
+CASES.update({'shutdown-storage-errors-sigint': lambda daemon: shutdown_storage_errors(daemon, 'SIGINT'),
+              'shutdown-partial-resume': shutdown_partial_resume,
+              'shutdown-partial-resume-hook': lambda daemon: shutdown_partial_resume(daemon, hook=True),
+              'session-umask-refusal': session_umask_refusal,
+              'session-umask-saves': session_umask_saves,
+              'session-umask-journal': session_umask_journal})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 

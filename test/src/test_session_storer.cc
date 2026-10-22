@@ -116,13 +116,15 @@ TestSessionStorer::test_temp_file_symlink_is_not_followed() {
 }
 
 // Session files carry tracker announce urls, so they must not be readable by
-// other users regardless of the umask rtorrent was started with.
+// other users regardless of the umask rtorrent was started with. File mode 0
+// is the default without session.umask.set: open() alone sets the mode, as
+// it does for the retrackers journal copies.
 void
 TestSessionStorer::test_saved_files_are_owner_only() {
   auto path       = m_session_dir + "/" + entry_name;
   auto prev_umask = ::umask(0);
 
-  save_session_files(path);
+  save_session_files(path, 0);
   ::umask(prev_umask);
 
   CPPUNIT_ASSERT_EQUAL(0600u, permissions_of(path));

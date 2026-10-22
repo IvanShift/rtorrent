@@ -173,7 +173,10 @@ Control::handle_shutdown() {
     // stopped announces can hold the shutdown. A shutdown hook may already
     // have queued these resume builds. The docker-rutorrent rc hook runs
     // session.save= in the shutdown event above; it remains for 0.9.8 and
-    // unpatched daemons, and its pending builds are written here once.
+    // daemons before 0.16.26. The builds it queues are made and written here,
+    // once. A download with a retrackers claim is the exception: the hook's
+    // save of it is redirected to the journal at once, before the pause, and
+    // this save writes it again.
     m_core->download_list()->session_save();
     session_thread::manager()->flush_shutdown_saves();
     m_shutdown_session_saved = true;
