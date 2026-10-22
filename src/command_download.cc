@@ -964,6 +964,8 @@ bool rr_migration_temporary_name(const std::string& name, bool session) {
 
 // Removes our regular, single-link, owner-only temporaries from one attested
 // private directory. Anything else carrying such a name is reported, not touched.
+// Session temporaries take the session file mode when they are created, as
+// DownloadStorer's staging files do, so group and other read may be set there.
 unsigned rr_migration_remove_temporaries(int dir, bool session, std::vector<std::string>* kept) {
   const int scan = ::dup(dir);
   DIR* entries = scan < 0 ? nullptr : ::fdopendir(scan);
@@ -979,7 +981,9 @@ unsigned rr_migration_remove_temporaries(int dir, bool session, std::vector<std:
   for (const auto& name : names) {
     struct stat st{};
     if (::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
-    if (S_ISREG(st.st_mode) && st.st_uid == ::geteuid() && (st.st_mode & 07777) == 0600 &&
+    const mode_t mode = st.st_mode & 07777;
+    if (S_ISREG(st.st_mode) && st.st_uid == ::geteuid() &&
+        (mode == 0600 || (session && (mode & ~0044) == 0600)) &&
         st.st_nlink == 1 && ::unlinkat(dir, name.c_str(), 0) == 0)
       ++removed;
     else
@@ -1060,12 +1064,15 @@ std::string rr_migration_read_bytes(const std::string& filename, size_t max_size
 }
 
 
-void rr_migration_write_file(int dir, const std::string& name, const std::string& bytes) {
+// file_mode 0 keeps the owner-only mode the temporary is created with; any
+// other mode is set right after creation, as DownloadStorer::save_stream() does.
+void rr_migration_write_file(int dir, const std::string& name, const std::string& bytes,
+                             mode_t file_mode = 0) {
   std::string temporary;
   const int fd = rr_migration_create_temporary(dir, name, &temporary);
   if (fd < 0)
     throw torrent::input_error("RR migration durable write could not create temporary file.");
-  bool okay = true;
+  bool okay = file_mode == 0 || ::fchmod(fd, file_mode) == 0;
   for (size_t offset = 0; okay && offset < bytes.size();) {
     const ssize_t n = ::write(fd, bytes.data() + offset, bytes.size() - offset);
     if (n <= 0) okay = false;
@@ -1078,6 +1085,14 @@ void rr_migration_write_file(int dir, const std::string& name, const std::string
     ::unlinkat(dir, temporary.c_str(), 0);
     throw torrent::input_error("RR migration durable write failed.");
   }
+}
+
+// The ordinary triple in the session directory follows session.umask.set like
+// DownloadStorer saves; journal records keep 0600, which rr_migration_read_bytes()
+// requires. Only ordinary saves rewrite these files later, and only a full
+// save rewrites the .torrent file.
+void rr_session_write_file(int session, const std::string& name, const std::string& bytes) {
+  rr_migration_write_file(session, name, bytes, session_thread::manager()->file_mode());
 }
 
 bool rr_quiesced_read(const RrMigrationCapsule& state, uint64_t* generation) {
@@ -1165,7 +1180,7 @@ void rr_migration_finish_rollback(const std::string& hash) {
     for (const char* suffix : {"", ".rtorrent", ".libtorrent_resume"}) {
       const std::string bytes = rr_migration_read_bytes(
           hash + ".rollback.torrent" + suffix, 64 * 1024 * 1024);
-      rr_migration_write_file(session, hash + ".torrent" + suffix, bytes);
+      rr_session_write_file(session, hash + ".torrent" + suffix, bytes);
     }
     if (::fsync(session) < 0)
       throw torrent::input_error("RR rollback session directory fsync failed.");
@@ -1655,7 +1670,7 @@ torrent::Object rr_migration_commit(core::Download* candidate,
   const int session = rr_session_dir();
   try {
     for (const auto& file_bytes : files)
-      rr_migration_write_file(session, new_hash + file_bytes.first.substr(9), file_bytes.second);
+      rr_session_write_file(session, new_hash + file_bytes.first.substr(9), file_bytes.second);
     if (::fsync(session) < 0)
       throw torrent::input_error("RR commit session directory fsync failed.");
   } catch (...) { ::close(session); throw; }
@@ -1957,7 +1972,7 @@ bool rr_late_repair(const std::string& old_hash, const std::string& new_hash) {
   const int session = rr_session_dir();
   try {
     for (const auto& file : files)
-      rr_migration_write_file(session, new_hash + file.first, file.second);
+      rr_session_write_file(session, new_hash + file.first, file.second);
     if (::fsync(session) < 0)
       throw torrent::input_error("RR late ordinary session fsync failed.");
   } catch (...) { ::close(session); throw; }
@@ -2495,7 +2510,7 @@ void rr_original_release_repair(const std::string& hash) {
     } catch (const torrent::input_error&) { matching = false; }
     if (!matching) {
       for (const auto& file : files)
-        rr_migration_write_file(session, hash + file.first, file.second);
+        rr_session_write_file(session, hash + file.first, file.second);
       if (::fsync(session) < 0)
         throw torrent::input_error("RR original release ordinary fsync failed.");
     }
@@ -2619,7 +2634,7 @@ void rr_release_repair(const std::string& hash) {
     }
     if (!ordinary_valid) {
       for (const auto& file : files)
-        rr_migration_write_file(session, owner_hash + file.first, file.second);
+        rr_session_write_file(session, owner_hash + file.first, file.second);
       if (::fsync(session) < 0)
         throw torrent::input_error("RR released session directory fsync failed.");
     }
@@ -3100,7 +3115,7 @@ void rr_finalize_cleanup(const std::string& hash, const std::string& tx,
       } catch (const torrent::input_error&) { matching = false; }
       if (!matching) {
         for (const auto& file : files)
-          rr_migration_write_file(session, hash + file.first, file.second);
+          rr_session_write_file(session, hash + file.first, file.second);
       }
       // A retry after a failed directory sync may see matching renamed bytes.
       // Sync again before relinquishing the durable backup's authority.
@@ -3333,7 +3348,7 @@ void rr_owner_repair_startup() {
           }
           if (!ordinary_matches) {
             for (const auto& file : files)
-              rr_migration_write_file(session, hash + file.first, file.second);
+              rr_session_write_file(session, hash + file.first, file.second);
             if (::fsync(session) < 0)
               throw torrent::input_error("RR owner ordinary repair fsync failed.");
           }
@@ -4019,7 +4034,7 @@ void retrackers_migration_repair_committed_startup() {
       try {
         if (!rr_committed_current_valid(session, new_hash, state, authority)) {
           for (const auto& file_bytes : authority)
-            rr_migration_write_file(session, new_hash + file_bytes.first, file_bytes.second);
+            rr_session_write_file(session, new_hash + file_bytes.first, file_bytes.second);
           if (::fsync(session) < 0)
             throw torrent::input_error("RR committed repair directory fsync failed.");
           control->core()->push_log_std("RR committed session repaired from durable authority: " + new_hash);

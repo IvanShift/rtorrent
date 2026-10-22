@@ -3007,12 +3007,15 @@ def stale_capsule_temp(daemon):
     stale = [plant(journal, '.' + hash_ + '.rollback.torrent.tmp.' + str(pid)),
              plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.3'),
              plant(journal, '.' + hash_ + '.preclaim.receipt.tmp.77.12'),
-             plant(daemon.session, '.' + hash_ + '.torrent.rtorrent.tmp.' + str(pid) + '.5')]
+             plant(daemon.session, '.' + hash_ + '.torrent.rtorrent.tmp.' + str(pid) + '.5'),
+             # Session temporaries are created with the session mode, 0640 here.
+             plant(daemon.session, '.' + hash_ + '.torrent.tmp.' + str(pid) + '.6', 0o640)]
     unsafe = [plant(journal, '.' + hash_ + '.target.tmp.' + str(pid) + '.9', 0o644),
               journal / ('.' + hash_ + '.backup.benc.tmp.' + str(pid) + '.4'),
               journal / ('.' + hash_ + '.target.tmp.' + str(pid) + '.8'),
               plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.6'),
-              plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.7')]
+              plant(journal, '.' + hash_ + '.benc.tmp.' + str(pid) + '.7'),
+              plant(daemon.session, '.' + hash_ + '.torrent.libtorrent_resume.tmp.' + str(pid) + '.7', 0o660)]
     unsafe[1].mkdir(mode=0o700)
     os.symlink('missing', unsafe[2])
     # A second link elsewhere, and another owner, are not our unpublished files.
@@ -3029,7 +3032,7 @@ def stale_capsule_temp(daemon):
     lost = [path.name for path in unsafe + foreign if not os.path.lexists(path)]
     assert not lost, 'startup removed entries it does not own: ' + repr(lost)
     log = (daemon.directory / 'native.log').read_text()
-    assert 'RR migration startup kept 5 temporary-named entries' in log, log[-2000:]
+    assert 'RR migration startup kept 6 temporary-named entries' in log, log[-2000:]
     assert unsafe[3].stat().st_nlink == 2 and unsafe[4].stat().st_uid == 1001
     # A crash in this same process lifetime leaves names with the current PID.
     local, marker, tx, incarnation, queue = enqueue(daemon, hash_)
@@ -3325,6 +3328,10 @@ def session_umask_journal(daemon):
     job = same_hash_job(daemon, 'umask-release', paused=True, worker=False)
     candidate = load_candidate(daemon, job)
     assert daemon.call('d.retrackers.commit', job['hash'], job['hash'], job['local'], job['tx']) == 'committed'
+    # The commit writes the ordinary triple itself; only a full save would
+    # rewrite its .torrent file.
+    committed = daemon.session / (job['hash'] + '.torrent')
+    assert file_modes([committed]) == {committed.name: '0o640'}, file_modes([committed])
     assert daemon.call('d.retrackers.release_committed', job['hash'], job['tx'], candidate) == 'released'
     owner_restored(daemon, job, completed=True)
 
