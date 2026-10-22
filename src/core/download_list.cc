@@ -715,19 +715,22 @@ DownloadList::hash_done(Download* download) {
   if (download->is_done() && download->download()->info()->is_meta_download())
     return process_meta_download(download);
 
-  constexpr auto completed_hash_failure =
-      "Download registered as completed, but hash check returned unfinished chunks.";
+  constexpr auto completed_unfinished_message =
+    "Download registered as completed, but hash check returned unfinished chunks.";
+  constexpr auto final_bad_chunks_message = "Hash check on download completion found bad chunks.";
+  constexpr auto invalid_hashing_message =
+    "Hash check completed but the \"hashing\" variable is in an invalid state.";
 
-  constexpr auto final_hash_failure = "Hash check on download completion found bad chunks.";
-  constexpr auto invalid_hashing_state =
-      "Hash check completed but the \"hashing\" variable is in an invalid state.";
-
-  // Retire exact native diagnoses only after a checked, valid, complete hash.
-  if ((hashing == Download::variable_hashing_initial || hashing == Download::variable_hashing_rehash ||
-       hashing == Download::variable_hashing_last) && download->is_done() &&
-      (download->message() == completed_hash_failure || download->message() == final_hash_failure ||
-       download->message() == invalid_hashing_state))
-    download->set_message({});
+  // A pass that found every chunk retires the diagnoses an earlier pass set
+  // below. Any other message is left alone.
+  if (download->is_done() &&
+      (hashing == Download::variable_hashing_initial ||
+       hashing == Download::variable_hashing_rehash ||
+       hashing == Download::variable_hashing_last) &&
+      (download->message() == completed_unfinished_message ||
+       download->message() == final_bad_chunks_message ||
+       download->message() == invalid_hashing_message))
+    download->set_message("");
 
   switch (hashing) {
   case Download::variable_hashing_initial:
@@ -738,7 +741,7 @@ DownloadList::hash_done(Download* download) {
     // f.ex deleted, then we clear the state and complete.
     if (rpc::call_command_value("d.complete", rpc::make_target(download)) && !download->is_done()) {
       set_state_stopped(download);
-      download->set_message(completed_hash_failure);
+      download->set_message(completed_unfinished_message);
     }
 
     // Save resume data so we update time-stamps and priorities if
@@ -762,7 +765,7 @@ DownloadList::hash_done(Download* download) {
     if (download->is_done()) {
       confirm_finished(download);
     } else {
-      download->set_message(final_hash_failure);
+      download->set_message(final_bad_chunks_message);
       LT_LOG_DOWNLOAD_EVENTS("hash check on download completion found bad chunks", 0);
 
       DL_TRIGGER_EVENT(download, "event.download.hash_final_failed");
@@ -774,7 +777,7 @@ DownloadList::hash_done(Download* download) {
   case Download::variable_hashing_stopped:
   default:
     // Either an error or someone wrote to the hashing variable...
-    download->set_message(invalid_hashing_state);
+    download->set_message(invalid_hashing_message);
     return;
   }
 

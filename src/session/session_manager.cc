@@ -69,6 +69,35 @@ SessionManager::set_use_lock(bool use_lock) {
   m_use_lock = use_lock;
 }
 
+mode_t
+SessionManager::file_mode() const {
+  if (m_umask == 0)
+    return 0;
+
+  return 0666 & ~m_umask;
+}
+
+void
+SessionManager::set_umask(int64_t umask) {
+  assert(torrent::this_thread::thread() == torrent::main_thread::thread());
+
+  if (m_freeze_info)
+    throw torrent::input_error("Session umask option cannot be changed after startup.");
+
+  if (umask < 0 || umask > 0777)
+    throw torrent::input_error("Session umask must be in the range 0 to 0777.");
+
+  if (umask != 0 && (umask & 0600) != 0)
+    throw torrent::input_error("Session umask must not mask owner read/write permissions (0600).");
+
+  // Native: the session directory admission refuses group/other write, and
+  // session files carry load commands, so another UID must not write them.
+  if (umask != 0 && (umask & 0022) != 0022)
+    throw torrent::input_error("Session umask must mask group and other write permissions (0022).");
+
+  m_umask = umask;
+}
+
 void
 SessionManager::save_resume_download(core::Download* download) {
   assert(torrent::this_thread::thread() == torrent::main_thread::thread());
@@ -180,7 +209,7 @@ SessionManager::save_full_download_durable(core::Download* download) {
   auto torrent_stream = storer.torrent_stream();
   auto rtorrent_stream = storer.rtorrent_stream();
   auto libtorrent_stream = storer.libtorrent_stream();
-  DownloadStorer::save_and_move_streams(storer.build_path(m_path), true,
+  DownloadStorer::save_and_move_streams(storer.build_path(m_path), true, file_mode(),
                                         torrent_stream.get(), rtorrent_stream.get(), libtorrent_stream.get());
 }
 
@@ -447,7 +476,7 @@ SessionManager::process_next_save_request_unsafe() {
         };
 
       try {
-        DownloadStorer::save_and_move_streams(itr->second.path, m_use_fsyncdisk,
+        DownloadStorer::save_and_move_streams(itr->second.path, m_use_fsyncdisk, file_mode(),
                                               itr->second.torrent_stream.get(),
                                               itr->second.rtorrent_stream.get(),
                                               itr->second.libtorrent_stream.get());
@@ -483,33 +512,32 @@ SessionManager::process_finished_saves() {
 }
 
 // Storage errors share a five-minute log limit and count what they suppress.
-// Returns true when this one was suppressed. Callers hold m_mutex.
-bool
+// Callers hold m_mutex.
+void
 SessionManager::report_storage_error_unsafe(const std::string& what) {
   if (m_last_storage_error_message + std::chrono::minutes(5) > torrent::this_thread::cached_time()) {
     m_ignored_storage_error_count++;
-    return true;
+    return;
   }
 
   lt_log_print(torrent::LOG_ERRORS, "Storage errors saving session data for download: ignored:%u : %s", m_ignored_storage_error_count, what.c_str());
 
   m_last_storage_error_message = torrent::this_thread::cached_time();
   m_ignored_storage_error_count = 0;
-  return false;
 }
 
 // The one policy for a finished save, on the session thread and in shutdown
 // flushes: storage errors go to report_storage_error_unsafe(), internal and
-// unknown errors propagate. Callers hold m_mutex. Returns true when a storage
-// error was suppressed.
-bool
+// unknown errors propagate. Callers hold m_mutex.
+void
 SessionManager::consume_finished_save_unsafe(ProcessingSave& request) {
   try {
     request.first.get();
 
   } catch (torrent::storage_error& e) {
     LT_LOG("error saving download : storage error :download:%p path:%s : %s", request.second.download, request.second.path.c_str(), e.what());
-    return report_storage_error_unsafe(e.what());
+    report_storage_error_unsafe(e.what());
+    return;
 
   } catch (torrent::internal_error& e) {
     LT_LOG("error saving download : internal error : download:%p path:%s : %s", request.second.download, request.second.path.c_str(), e.what());
@@ -521,7 +549,6 @@ SessionManager::consume_finished_save_unsafe(ProcessingSave& request) {
   }
 
   LT_LOG("finished saving download : download:%p path:%s", request.second.download, request.second.path.c_str());
-  return false;
 }
 
 void
@@ -546,17 +573,15 @@ SessionManager::flush_all_and_wait_unsafe(std::unique_lock<std::mutex>& lock) {
   while (!m_processing_saves.empty())
     m_finished_condition.wait(lock);
 
-  unsigned int suppressed = 0;
   for (auto& request : m_finished_saves)
-    suppressed += consume_finished_save_unsafe(request) ? 1 : 0;
+    consume_finished_save_unsafe(request);
 
   m_finished_saves.clear();
 
-  // No later session-thread pass reports what this flush suppressed, nor what
-  // the session thread suppressed before it; name the two counts apart.
+  // Report and reset what was suppressed since the last error line. The count
+  // includes saves the session thread consumed while this flush waited.
   if (m_ignored_storage_error_count != 0) {
-    lt_log_print(torrent::LOG_ERRORS, "Storage errors flushing session data: ignored:%u, earlier ignored:%u",
-                 suppressed, m_ignored_storage_error_count - suppressed);
+    lt_log_print(torrent::LOG_ERRORS, "Storage errors flushing session data: ignored:%u", m_ignored_storage_error_count);
     m_ignored_storage_error_count = 0;
   }
 

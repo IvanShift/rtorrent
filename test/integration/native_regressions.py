@@ -3152,11 +3152,19 @@ def shutdown_storage_errors(daemon):
     lines = [line for line in (daemon.directory / 'native.log').read_text().splitlines()
              if 'Storage errors' in line]
     assert lines and 'failed to' in lines[0], lines
-    summaries = [re.search(r'flushing session data: ignored:(\d+), earlier ignored:(\d+)', line)
+    # Upstream 0.16.26 prints one total for a flush; the fork printed it split
+    # as "ignored:N, earlier ignored:M". Accept both and assert the exact sum:
+    # every failed save (the session thread's twelve and the shutdown save's
+    # twelve) is either a detailed line or counted in a summary.
+    summaries = [re.search(r'flushing session data: ignored:(\d+)(?:, earlier ignored:(\d+))?$', line)
                  for line in lines if 'flushing session data' in line]
     assert summaries and all(summaries), lines
-    assert all(int(match.group(1)) <= len(hashes) for match in summaries), lines
-    assert int(summaries[0].group(2)) == len(hashes) - 1, lines
+    detailed = [re.search(r'saving session data for download: ignored:(\d+) : ', line)
+                for line in lines if 'flushing session data' not in line]
+    assert all(detailed), lines
+    accounted = len(detailed) + sum(int(match.group(1)) for match in detailed) + \
+        sum(int(match.group(1)) + int(match.group(2) or 0) for match in summaries)
+    assert accounted == 2 * len(hashes), f'{accounted} of {2 * len(hashes)} failed saves accounted: {lines}'
     assert len(lines) <= 3, f'{len(lines)} storage error lines for {len(hashes)} torrents'
     print(f'  storage error lines for {len(hashes)} torrents: {len(lines)}', flush=True)
 

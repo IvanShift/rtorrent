@@ -153,18 +153,6 @@ Control::handle_shutdown() {
   if (scgi_thread::thread()->is_active())
     scgi_thread::thread()->stop_thread_wait();
 
-  if (!m_shutdown_session_saved) {
-    // Persist user state before stopped announces can consume the stop timeout.
-    // The docker-rutorrent rc hook may already have run session.save= in the
-    // shutdown event above; it remains for 0.9.8 and unpatched daemons. Its
-    // resume builds are still pending here, so this call queues none again and
-    // the flush writes each download once.
-    m_core->download_list()->session_save();
-    session_thread::manager()->flush_shutdown_saves();
-    m_shutdown_session_saved = true;
-    if (core::migration_test_cut("after-shutdown-session-save")) ::_exit(137);
-  }
-
   if (!m_shutdown_quick) {
     torrent::runtime::network_manager()->listen_close();
     torrent::runtime::shutdown();
@@ -178,6 +166,18 @@ Control::handle_shutdown() {
   } else {
     torrent::runtime::quick_shutdown();
     m_core->shutdown(true);
+  }
+
+  if (!m_shutdown_session_saved) {
+    // Transfers are stopped, so this is the final state; write it before the
+    // stopped announces can hold the shutdown. A shutdown hook may already
+    // have queued these resume builds. The docker-rutorrent rc hook runs
+    // session.save= in the shutdown event above; it remains for 0.9.8 and
+    // unpatched daemons, and its pending builds are written here once.
+    m_core->download_list()->session_save();
+    session_thread::manager()->flush_shutdown_saves();
+    m_shutdown_session_saved = true;
+    if (core::migration_test_cut("after-shutdown-session-save")) ::_exit(137);
   }
 
   if (!m_task_shutdown_clear_requests.is_scheduled())
