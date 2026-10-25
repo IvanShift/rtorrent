@@ -48,6 +48,7 @@ static constexpr const char* session_invalid_message = "Session data is invalid,
 
 // A session reload has no load options of its own. Keep the start flag and
 // commands the metadata placeholder was saved with, if they are well formed.
+// A new load always rebuilds the section, so one in the loaded data is never used.
 static bool
 has_meta_download_options(const torrent::Object& root) {
   if (!root.has_key_map("rtorrent_meta_download"))
@@ -64,7 +65,7 @@ has_meta_download_options(const torrent::Object& root) {
     return false;
 
   const auto& commands = meta.get_key_list("commands");
-  return std::all_of(commands.begin(), commands.end(), [](const auto& command) { return command.is_string(); });
+  return std::all_of(commands.begin(), commands.end(), rpc::is_valid_command);
 }
 
 static std::unique_ptr<torrent::Object>
@@ -535,17 +536,11 @@ DownloadFactory::receive_success() {
       log_created(download, rtorrent);
 
     if (!erasedata_held)
-      for (const auto& command : m_commands) {
-        // A string may hold several ';'-separated commands. Run them one at a
-        // time, as parse_command_multiple() does, and stop once one erases
-        // the download, not only between strings.
-        const char* first = command.c_str();
-        const char* last = first + command.size();
-        while (first != last && !lifetime.expired())
-          first = rpc::parse_command(rpc::make_target(download), first, last).second;
-        if (lifetime.expired())
-          break;
-      }
+      for (const auto& command : m_commands)
+        rpc::parse_command_multiple_std(command, rpc::make_target(download), [&lifetime]() {
+            if (lifetime.expired())
+              throw torrent::input_error("The newly created download was removed.");
+          });
     if (!rr_target_source.empty() && !m_session && !rr_creation.applied())
       throw torrent::input_error("RR migration apply did not finish.");
 
@@ -593,7 +588,7 @@ DownloadFactory::receive_success() {
       m_manager->push_log_std(msg);
 
     auto existing = m_manager->download_list()->find(infohash);
-    if (existing != m_manager->download_list()->end() && existing->get() == download) {
+    if (!lifetime.expired() && existing != m_manager->download_list()->end() && existing->get() == download) {
       if (rr_creation.attempted()) {
         m_manager->push_log_std("RR migration candidate aborted: " + msg);
         // Keep the input metainfo available for a later recovery attempt.

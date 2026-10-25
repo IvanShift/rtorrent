@@ -132,9 +132,8 @@ is_correct_format(const std::string& f) {
   return true;
 }
 
-void
-save_stream(const std::string& path, bool use_fsyncdisk, mode_t file_mode, const std::stringstream& stream,
-            int& mode_error) {
+int
+save_stream(const std::string& path, bool use_fsyncdisk, mode_t file_mode, const std::stringstream& stream) {
   // Remove any leftover temporary file first so that O_EXCL only ever fails on
   // an entry that appeared after the unlink, and O_NOFOLLOW keeps a symlink
   // planted in the session directory from redirecting the write.
@@ -148,8 +147,10 @@ save_stream(const std::string& path, bool use_fsyncdisk, mode_t file_mode, const
     throw torrent::storage_error("failed to open file for writing : " + path);
 
   // open() applies the process umask, so set the configured mode explicitly.
-  // A file system that refuses it keeps the stricter owner-only file.
-  if (file_mode != 0 && ::fchmod(fd, file_mode) == -1 && mode_error == 0)
+  // If adjustment is unavailable, keep the restrictive file and save its data.
+  int mode_error = 0;
+
+  if (file_mode != 0 && ::fchmod(fd, file_mode) == -1)
     mode_error = errno;
 
   const auto  data      = stream.view();
@@ -187,6 +188,8 @@ save_stream(const std::string& path, bool use_fsyncdisk, mode_t file_mode, const
   // A full disk may only be seen when the descriptor is closed.
   if (::close(fd) == -1)
     throw torrent::storage_error("failed to close file descriptor : " + path);
+
+  return mode_error;
 }
 
 void
@@ -219,14 +222,16 @@ DownloadStorer::save_and_move_streams(const std::string& path, bool use_fsyncdis
   auto torrent_path    = path;
   auto libtorrent_path = path + ".libtorrent_resume";
   auto rtorrent_path   = path + ".rtorrent";
-
-  int mode_error = 0;
+  int  mode_error      = 0;
 
   if (torrent_stream)
-    save_stream(torrent_path + ".new", use_fsyncdisk, file_mode, *torrent_stream, mode_error);
+    mode_error = save_stream(torrent_path + ".new", use_fsyncdisk, file_mode, *torrent_stream);
 
-  save_stream(libtorrent_path + ".new", use_fsyncdisk, file_mode, *libtorrent_stream, mode_error);
-  save_stream(rtorrent_path + ".new", use_fsyncdisk, file_mode, *rtorrent_stream, mode_error);
+  int libtorrent_error = save_stream(libtorrent_path + ".new", use_fsyncdisk, file_mode, *libtorrent_stream);
+  int rtorrent_error   = save_stream(rtorrent_path + ".new", use_fsyncdisk, file_mode, *rtorrent_stream);
+
+  if (mode_error == 0)
+    mode_error = libtorrent_error != 0 ? libtorrent_error : rtorrent_error;
 
   // Test builds can hold a save between staging and renames to expose overlap.
   if (core::migration_test_cut("slow-session-save"))

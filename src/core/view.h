@@ -13,7 +13,6 @@
 #ifndef RTORRENT_CORE_VIEW_DOWNLOADS_H
 #define RTORRENT_CORE_VIEW_DOWNLOADS_H
 
-#include <cstdint>
 #include <functional>
 #include <list>
 #include <memory>
@@ -74,15 +73,18 @@ public:
     emit_changed();
   }
 
-  void insert(const std::shared_ptr<Download>& download) { base_type::push_back(download); ++m_revision; }
+  void insert(const std::shared_ptr<Download>& download) { base_type::push_back(download); }
   // Held recovery is visible without executing user filters, comparators or hooks.
   void insert_held_visible(const std::shared_ptr<Download>& download) {
     base_type::insert(begin() + m_size, download);
     ++m_size;
-    ++m_revision;
     emit_changed();
   }
   void erase(Download* download);
+
+  // Throws while a filter or sort command runs, as changing views or downloads
+  // then would invalidate the iterators of the running algorithm.
+  static void check_unlocked();
 
   void set_visible(Download* download);
   void set_not_visible(Download* download);
@@ -95,8 +97,8 @@ public:
 
   void sort();
 
-  void set_sort_new(const torrent::Object& s) { m_sortNew = s; }
-  void set_sort_current(const torrent::Object& s) { m_sortCurrent = s; }
+  void set_sort_new(const torrent::Object& s) { check_unlocked(); m_sortNew = s; }
+  void set_sort_current(const torrent::Object& s) { check_unlocked(); m_sortCurrent = s; }
 
   // Need to explicity trigger filtering.
   void                   filter();
@@ -104,9 +106,9 @@ public:
   void                   filter_download(core::Download* download);
 
   const torrent::Object& get_filter() const { return m_filter; }
-  void                   set_filter(const torrent::Object& s) { m_filter = s; }
+  void                   set_filter(const torrent::Object& s) { check_unlocked(); m_filter = s; }
   const torrent::Object& get_filter_temp() const { return m_temp_filter; }
-  void                   set_filter_temp(const torrent::Object& s) { m_temp_filter = s; }
+  void                   set_filter_temp(const torrent::Object& s) { check_unlocked(); m_temp_filter = s; }
   void                   set_filter_on_event(const std::string& event);
 
   void                   clear_filter_on();
@@ -130,14 +132,12 @@ public:
   signal_void& signal_changed() { return m_signal_changed; }
 
 private:
-  uint64_t m_revision = 0;
-
   View(const View&);
   void        operator=(const View&);
 
-  void        push_back(const std::shared_ptr<Download>& d) { base_type::push_back(d); ++m_revision; }
+  void        push_back(const std::shared_ptr<Download>& d) { base_type::push_back(d); }
 
-  inline bool insert_visible(const std::shared_ptr<Download>& d);
+  inline void insert_visible(const std::shared_ptr<Download>& d);
   inline void erase_internal(iterator itr);
 
   void        emit_changed();

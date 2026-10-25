@@ -68,6 +68,7 @@ std::string erasedata_prepare(const torrent::Object::list_type& args) {
   return "prepared";
 }
 std::string erasedata_cancel(const torrent::Object::list_type& args) {
+  core::View::check_unlocked();
   const auto wanted = erasedata_args(args);
   core::Download* d;
   bool resume_allowed = false;
@@ -105,6 +106,7 @@ torrent::Object erasedata_state(const torrent::Object::list_type& args) {
   return result;
 }
 std::string erasedata_erase(const torrent::Object::list_type& args) {
+  core::View::check_unlocked();
   const auto wanted = erasedata_args(args);
   core::SessionPathFd lifetime(ed::lock(edlife::session(), wanted.hash, true));
   auto actual = erasedata_require(wanted);

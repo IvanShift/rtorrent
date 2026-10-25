@@ -20,6 +20,7 @@
 #include "globals.h"
 #include "core/download.h"
 #include "core/incarnation.h"
+#include "core/view.h"
 #include "core/retrackers_migration_pending.h"
 #include "rpc/parse_commands.h"
 
@@ -195,6 +196,7 @@ inline void prepare_user_record(core::Download* download);
 inline std::string held(core::Download* download);
 
 inline std::string record(core::Download* download, bool require_durable = false) {
+  core::View::check_unlocked();
   const auto target = rpc::make_target(download);
   const auto hash = rpc::call_command_string("d.hash", target);
   const auto local_id = rpc::call_command_string("d.local_id", target);
@@ -375,6 +377,7 @@ inline std::string next_claim_token(core::Download* download, const std::string&
 }
 
 inline void ensure_claim_generation(core::Download* download, const Lease& claim) {
+  core::View::check_unlocked();
   const auto [session, hash] = identity(download);
   try {
     const auto expected = std::stoull(claim.token.substr(33), nullptr, 16);
@@ -500,6 +503,7 @@ inline void publish_claim_file(int directory, const std::string& staging, const 
 inline Lease create_lease(core::Download* download, const std::string& stop_token,
                           const std::string& job, int state, int open, int active,
                           const std::string& local_id) {
+  core::View::check_unlocked();
   const auto [session, hash] = identity(download);
   if (retrackers_migration_original_claim_active(hash))
     throw torrent::input_error("stop claim: RR original claim is active");
@@ -532,6 +536,7 @@ inline Lease create_lease(core::Download* download, const std::string& stop_toke
 
 inline Lease publish_phase(core::Download* download, const Lease& claim, char phase,
                            char mode, const std::string& path) {
+  core::View::check_unlocked();
   if (!((phase == 'T' && claim.phase == 'A') || (phase == 'D' && claim.phase == 'T')) ||
       held(download) != claim.token || path.size() > 4096 ||
       (mode != 'S' && mode != 'O' && mode != 'R' && mode != 'K'))
@@ -572,6 +577,7 @@ inline Lease publish_done(core::Download* download, const Lease& claim) {
 }
 
 inline bool release_lease(core::Download* download, const std::string& token) {
+  core::View::check_unlocked();
   if (held(download) != token) return false;
   const auto [session, hash] = identity(download);
   try {

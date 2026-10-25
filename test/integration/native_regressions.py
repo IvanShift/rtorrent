@@ -1891,6 +1891,8 @@ def erasedata_held_cancel(daemon, erase_hook=False):
 
 
 def view_filter_reentrant(daemon):
+    survivor = daemon.fixture('view-filter-control', start=False)
+    pid = daemon.call('system.pid')
     daemon.call('method.insert', '', 'ed.filter.armed', 'value', 0)
     expression = 'branch=ed.filter.armed=,"cat=\\\"$d.erase=\\\",MARK",cat=1'
     for mode in ('single', 'bulk', 'filtered', 'insertion'):
@@ -1899,22 +1901,36 @@ def view_filter_reentrant(daemon):
         daemon.call('view.add', '', view)
         daemon.call('view.filter', '', view, expression)
         h = daemon.fixture('view-filter-reentrant-' + mode, start=False)
+        state = [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')]
         daemon.call('ed.filter.armed.set', '', 1)
         if mode == 'single': daemon.call('view.filter_download', h, view)
         if mode == 'bulk': daemon.call('view.filter_all', '', view)
         if mode == 'filtered':
             assert daemon.call('d.multicall.filtered', '', view, expression, 'd.hash=') == []
         if mode == 'insertion':
-            # The existing torrent is removed first, then the same filter
-            # erases a fresh factory insertion before its remaining load tail.
+            # Reload under the armed filter. Its erase must be refused while
+            # the fresh download still completes the ordinary factory tail.
+            torrent_file = daemon.directory / ('view-filter-reentrant-' + mode + '.torrent')
+            metainfo = torrent_file.read_bytes()
             daemon.call('d.erase', h)
-            daemon.call('load.normal', '', '/data/view-filter-reentrant-' + mode + '.torrent')
-            time.sleep(.2)
-        assert daemon.call('system.pid') > 0
-        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
-        assert daemon.call('d.multicall2', '', view, 'd.hash=') == []
+            # Erase removes the tied input; restore it before testing the load.
+            # A new path avoids FileStatusCache's unchanged size/second-mtime
+            # suppression of a same-path reload within the same second.
+            torrent_file = torrent_file.with_name(torrent_file.stem + '-reload.torrent')
+            torrent_file.write_bytes(metainfo)
+            daemon.call('load.normal', '', '/data/' + torrent_file.name)
+            daemon.wait(lambda: daemon.call('d.hash', h) == h, 'guarded filter insertion')
+        assert daemon.call('system.pid') == pid
+        assert sorted(daemon.call('d.multicall2', '', 'main', 'd.hash=')) == sorted([[survivor], [h]])
+        assert [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] == state
+        assert daemon.call('d.hash', survivor) == survivor
+        rows = daemon.call('d.multicall2', '', view, 'd.hash=')
+        # filter_by only reads; the mutating filter routes hide a refused item.
+        assert ([h] in rows) == (mode == 'filtered'), (mode, rows)
         daemon.call('ed.filter.armed.set', '', 0)
-        print('OBS view erasing filter mode=%s preserves daemon and does not resurrect target' % mode,
+        daemon.call('view.filter', '', view, 'cat=1')
+        daemon.call('d.erase', h)
+        print('OBS view erasing filter mode=%s refuses erase and retains both downloads' % mode,
               flush=True)
 
     for inner in ('d.multicall2', 'd.multicall.filtered'):
@@ -1929,12 +1945,14 @@ def view_filter_reentrant(daemon):
                     'branch=ed.filter.armed=,ed.nested.' + inner + '=,cat=1')
         daemon.call('ed.filter.armed.set', '', 1)
         daemon.call('view.filter_download', h, view)
-        assert daemon.call('system.pid') > 0
-        assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
-        assert daemon.call('d.multicall2', '', view, 'd.hash=') == []
+        assert daemon.call('system.pid') == pid
+        assert sorted(daemon.call('d.multicall2', '', 'main', 'd.hash=')) == sorted([[survivor], [h]])
+        assert [h] not in daemon.call('d.multicall2', '', view, 'd.hash=')
+        assert [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] == [0, 0, 0]
         daemon.call('ed.filter.armed.set', '', 0)
-        print('OBS nested %s stops commands at erased lifetime despite outer owned snapshots' % inner,
-              flush=True)
+        daemon.call('view.filter', '', view, 'cat=1')
+        daemon.call('d.erase', h)
+        print('OBS nested %s cannot bypass the outer filter refusal' % inner, flush=True)
 
 
 def view_sort_reentrant(daemon, only_current=False):
@@ -1948,6 +1966,7 @@ def view_sort_reentrant(daemon, only_current=False):
         daemon.call('view.add', '', view)
         daemon.call('view.filter', '', view, 'cat=1')
         before = daemon.call('d.multicall2', '', view, 'd.hash=')
+        states = {h: [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] for h in (a, b)}
         assert sorted(before) == sorted([[a], [b]]), (before, a, b, daemon.call('d.multicall2', '', 'main', 'd.hash='))
         # A non-mutating comparator preserves stable order.
         daemon.call('view.sort_current', '', view, 'false=')
@@ -1959,20 +1978,18 @@ def view_sort_reentrant(daemon, only_current=False):
             daemon.call('view.set_not_visible', a, view)
             daemon.call('view.sort_new', '', view, comparison)
             daemon.call('view.set_visible', a, view)
-            expected = b if mode.endswith('left') else a
-            assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[expected]]
         else:
             daemon.call('view.sort_current', '', view, comparison)
             daemon.call('view.sort', '', view)
-            remaining = daemon.call('d.multicall2', '', 'main', 'd.hash=')
-            assert len(remaining) == 1, remaining
-            expected = remaining[0][0]
         assert daemon.call('system.pid') > 0
-        assert daemon.call('d.multicall2', '', view, 'd.hash=') == [[expected]]
-        print('OBS view erasing comparator mode=%s keeps survivor exactly once' % mode, flush=True)
+        assert sorted(daemon.call('d.multicall2', '', 'main', 'd.hash=')) == sorted([[a], [b]])
+        assert sorted(daemon.call('d.multicall2', '', view, 'd.hash=')) == sorted([[a], [b]])
+        assert {h: [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] for h in (a, b)} == states
+        print('OBS view erasing comparator mode=%s refuses erase and retains both downloads' % mode, flush=True)
         daemon.call('view.sort_new', '', view, 'false=')
         daemon.call('view.sort_current', '', view, 'false=')
-        daemon.call('d.erase', expected)
+        daemon.call('d.erase', a)
+        daemon.call('d.erase', b)
 
 
 def view_filter_erases_other(daemon):
@@ -1980,14 +1997,110 @@ def view_filter_erases_other(daemon):
     erased = daemon.fixture('filter-erased', start=False)
     survivor = daemon.fixture('filter-survivor', start=False)
     daemon.call('view.add', '', 'other')
-    # The filter of the first entry erases a later entry of the same snapshot;
-    # the erased wrapper must never be evaluated or marked afterwards.
+    # A nested filtered multicall must not bypass the outer filter's lock.
+    # The attempted erase is refused before the callback's next command.
     daemon.call('method.insert', '', 'test.other', 'simple',
                 'd.multicall.filtered=main,"equal=d.hash=,cat=' + erased + '",d.erase=;d.custom.set=visited,yes;cat=1')
     daemon.call('view.filter', '', 'other', 'test.other=')
-    assert daemon.call('d.multicall2', '', 'other', 'd.hash=', 'd.custom=visited') == [
-        [first, 'yes'], [survivor, 'yes']]
+    assert daemon.call('d.multicall2', '', 'other', 'd.hash=') == []
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=', 'd.custom=visited') == [
+        [first, ''], [erased, ''], [survivor, '']]
     assert daemon.call('system.pid') > 0
+
+
+def view_refusal_preserves_native_state(daemon):
+    survivor = daemon.fixture('view-refusal-survivor', start=False)
+    pid = daemon.call('system.pid')
+    job = 'c' * 32
+    operations = ('d.stop=', 'd.pause=', 'd.close=', 'd.close.directly=',
+                  'd.try_close=', 'd.stop_claim=', 'view.set_visible=stopped',
+                  'd.stop_close_claim=' + job, 'd.start=')
+    getters = ('d.state', 'd.is_open', 'd.is_active', 'd.hashing_failed', 'd.stop_generation')
+    refusal = "Caught exception: 'View filter and sort commands cannot change views or downloads.'."
+    for index, operation in enumerate(operations):
+        starting = operation == 'd.start='
+        h = daemon.fixture('view-refusal-' + str(index), start=not starting)
+        if starting:
+            daemon.call('d.hashing_failed.set', h, 1)
+        else:
+            daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'active refusal target')
+        before = [daemon.call(method, h) for method in getters]
+        assert daemon.call('d.stop_close_claim_state', h, job) == 'absent'
+        log = daemon.directory / 'native.log'
+        offset = log.stat().st_size
+        method, view = 'test.view.refusal.' + str(index), 'native-refusal-' + str(index)
+        # The real catch command exposes the exact refusal in the errors log.
+        # A successful operation would run the forbidden tail marker.
+        daemon.call('method.insert', '', method, 'simple',
+                    'd.custom1.set=entered;catch="' + operation + ';d.custom2.set=after";cat=1')
+        daemon.call('view.add', '', view)
+        daemon.call('view.filter', '', view,
+                    'branch="equal=d.hash=,cat=' + h + '",' + method + '=,cat=1')
+        messages = log.read_bytes()[offset:].decode(errors='replace')
+        assert refusal in messages, (operation, messages)
+        assert daemon.call('d.custom1', h) == 'entered', operation
+        assert daemon.call('d.custom2', h) == '', operation
+        assert [daemon.call(method, h) for method in getters] == before, operation
+        assert daemon.call('d.stop_close_claim_state', h, job) == 'absent', operation
+        assert daemon.call('system.pid') == pid
+        assert daemon.call('d.hash', survivor) == survivor
+        assert sorted(daemon.call('d.multicall2', '', 'main', 'd.hash=')) == sorted([[survivor], [h]])
+        daemon.call('view.filter', '', view, 'cat=1')
+        daemon.call('d.erase', h)
+        print('OBS filter refusal preserves native state and claim for ' + operation, flush=True)
+
+
+def view_events_replace_their_commands(daemon):
+    survivor = daemon.fixture('event-replace-survivor', start=False)
+    pid = daemon.call('system.pid')
+    daemon.call('method.insert', '', 'test.event.tail', 'string', '')
+    modes = ('bulk-removed', 'bulk-added', 'filter-removed', 'filter-added',
+             'set-visible', 'set-not-visible', 'erase')
+    for mode in modes:
+        a = daemon.fixture('event-replace-a-' + mode, start=False)
+        b = daemon.fixture('event-replace-b-' + mode, start=False)
+        view = 'event-replace-' + mode
+        daemon.call('view.add', '', view)
+        added = mode in ('bulk-added', 'filter-added', 'set-visible')
+        if not added:
+            daemon.call('view.set_not_visible', survivor, view)
+        if added:
+            daemon.call('view.set_not_visible', a, view)
+            daemon.call('view.set_not_visible', b, view)
+        if mode == 'filter-removed':
+            daemon.call('view.filter', '', view, 'false=')
+            daemon.call('view.set_visible', a, view)
+            daemon.call('view.set_visible', b, view)
+        event = 'view.event_added' if added else 'view.event_removed'
+        daemon.call('test.event.tail.set', '', '')
+        command = (event + '=' + view + ',"cat=0";'
+                   'test.event.tail.set="$cat=$test.event.tail=,x";cat=' + 'x' * 1024)
+        daemon.call(event, '', view, command)
+        if mode == 'bulk-removed':
+            daemon.call('view.filter', '', view, 'false=')
+        elif mode == 'bulk-added':
+            daemon.call('view.filter', '', view, 'cat=1')
+        elif mode.startswith('filter-'):
+            daemon.call('view.filter_download', a, view)
+        elif mode == 'set-visible':
+            daemon.call('view.set_visible', a, view)
+        elif mode == 'set-not-visible':
+            daemon.call('view.set_not_visible', a, view)
+        else:
+            daemon.call('d.erase', a)
+        expected = 'xx' if mode.startswith('bulk-') else 'x'
+        assert daemon.call('test.event.tail') == expected, mode
+        assert daemon.call('system.pid') == pid
+        assert daemon.call('d.hash', survivor) == survivor
+        assert daemon.call('d.hash', b) == b
+        if mode != 'erase':
+            assert daemon.call('d.hash', a) == a
+        daemon.call('view.event_added', '', view, '')
+        daemon.call('view.event_removed', '', view, '')
+        if mode != 'erase':
+            daemon.call('d.erase', a)
+        daemon.call('d.erase', b)
+        print('OBS self-replacing view event retains command storage mode=' + mode, flush=True)
 
 
 def view_removed_adds_views(daemon):
@@ -2073,16 +2186,21 @@ def erasedata_cancel_view_filter(daemon):
     with (daemon.directory / 'test.rc').open('a') as rc:
         rc.write('\nmethod.insert=ed.filter.armed,value,0\n')
         rc.write('view.add=ed-erasing-filter\n')
-        rc.write('view.filter=ed-erasing-filter,"branch=ed.filter.armed=,{d.erase=},{true=}"\n')
+        rc.write('view.filter=ed-erasing-filter,"branch=ed.filter.armed=,d.erase=,cat=1"\n')
     daemon.stop(kill=True)
     daemon.start()
     daemon.wait(lambda: daemon.call('d.hash', h) == h, 'held session before erasing view filter')
     daemon.call('ed.filter.armed.set', '', 1)
     assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
     assert daemon.call('system.pid') > 0
-    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == []
+    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[h]]
     assert daemon.call('d.multicall2', '', 'ed-erasing-filter', 'd.hash=') == []
-    print('OBS exact cancel erasing filter did not reuse iterator or resurrect target', flush=True)
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_open', 'd.is_active')] == [0, 0, 0]
+    assert not (daemon.session / '.rutorrent-stop-intents' / (h + '.erasedata')).exists()
+    daemon.call('ed.filter.armed.set', '', 0)
+    daemon.call('view.filter_all', '', 'ed-erasing-filter')
+    assert daemon.call('d.multicall2', '', 'ed-erasing-filter', 'd.hash=') == [[h]]
+    print('OBS exact cancel retains stopped target after refused filter erase', flush=True)
 
 
 def erasedata_finished_deferred(daemon, last_hash, only_unknown=False):
@@ -3423,6 +3541,8 @@ CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d,
          'view-filter-reentrant': view_filter_reentrant,
          'view-sort-reentrant': view_sort_reentrant,
          'view-filter-erases-other': view_filter_erases_other,
+         'view-refusal-preserves-native-state': view_refusal_preserves_native_state,
+         'view-events-replace-their-commands': view_events_replace_their_commands,
          'view-removed-adds-views': view_removed_adds_views,
          'view-late-filter-on-erase': view_late_filter_on_erase,
          'insertion-event-erases': insertion_event_erases,

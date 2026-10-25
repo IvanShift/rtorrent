@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <unordered_map>
 #include <torrent/download.h>
 #include <torrent/exceptions.h>
 
@@ -23,6 +22,14 @@ entry_is(Download* download) {
   return [download](const std::shared_ptr<Download>& entry) { return entry.get() == download; };
 }
 
+// Held while a filter or sort command runs, see View::check_unlocked().
+static unsigned int view_lock_count = 0;
+
+struct view_lock {
+  view_lock() { view_lock_count++; }
+  ~view_lock() { view_lock_count--; }
+};
+
 struct view_downloads_compare {
   view_downloads_compare(const torrent::Object& cmd) :
       m_command(cmd) {}
@@ -35,6 +42,8 @@ struct view_downloads_compare {
     try {
       if (m_command.is_empty())
         return false;
+
+      view_lock lock;
 
       if (!m_command.is_dict_key())
         return rpc::parse_command_single(rpc::make_target_pair(d1, d2), m_command.as_string()).as_value();
@@ -58,7 +67,7 @@ struct view_downloads_compare {
     }
   }
 
-  const torrent::Object m_command;
+  const torrent::Object& m_command;
 };
 
 struct view_downloads_filter {
@@ -70,8 +79,7 @@ struct view_downloads_filter {
   }
 
   bool operator()(Download* d1) const {
-    const auto lifetime = d1->lifetime();
-    return this->evalCmd(m_command, d1) && !lifetime.expired() && this->evalCmd(m_command2, d1);
+    return this->evalCmd(m_command, d1) && this->evalCmd(m_command2, d1);
   }
 
   bool evalCmd(const torrent::Object& cmd, Download* d1) const {
@@ -79,6 +87,7 @@ struct view_downloads_filter {
       return true;
 
     try {
+      view_lock lock;
       torrent::Object result;
 
       if (cmd.is_dict_key()) {
@@ -123,9 +132,22 @@ struct view_downloads_filter {
     }
   }
 
-  const torrent::Object m_command;
-  const torrent::Object m_command2;
+  const torrent::Object& m_command;
+  const torrent::Object& m_command2;
 };
+
+// View events may replace their own configured command while it is executing.
+// Own the Object until the parser and any list traversal have finished.
+static void
+call_view_event(torrent::Object command, Download* download) {
+  rpc::call_object_d_nothrow(command, download);
+}
+
+void
+View::check_unlocked() {
+  if (view_lock_count != 0)
+    throw torrent::input_error("View filter and sort commands cannot change views or downloads.");
+}
 
 void
 View::emit_changed() {
@@ -158,7 +180,7 @@ View::initialize(const std::string& name) {
 
   // Urgh, wrong. No filtering being done.
   for (const auto& d : *control->core()->download_list())
-    // Removal callbacks can create views before the list releases the entry.
+    // Native erase events may add views before the list releases the entry.
     if (!d->is_erasing())
       push_back(d);
 
@@ -177,12 +199,14 @@ View::erase(Download* download) {
 
   } else {
     erase_internal(itr);
-    rpc::call_object_nothrow(m_event_removed, rpc::make_target(download));
+    call_view_event(m_event_removed, download);
   }
 }
 
 void
 View::set_visible(Download* download) {
+  check_unlocked();
+
   iterator itr = std::find_if(begin_filtered(), end_filtered(), entry_is(download));
 
   if (itr == end_filtered())
@@ -192,12 +216,16 @@ View::set_visible(Download* download) {
   // non-visible elements.
   auto entry = *itr;
 
-  if (insert_visible(entry))
-    rpc::call_object_nothrow(m_event_added, rpc::make_target(download));
+  base_type::erase(itr);
+  insert_visible(entry);
+
+  call_view_event(m_event_added, download);
 }
 
 void
 View::set_not_visible(Download* download) {
+  check_unlocked();
+
   iterator itr = std::find_if(begin_visible(), end_visible(), entry_is(download));
 
   if (itr == end_visible())
@@ -212,9 +240,8 @@ View::set_not_visible(Download* download) {
 
   base_type::erase(itr);
   base_type::push_back(entry);
-  ++m_revision;
 
-  rpc::call_object_nothrow(m_event_removed, rpc::make_target(download));
+  call_view_event(m_event_removed, download);
 }
 
 void
@@ -262,109 +289,112 @@ View::prev_focus(unsigned int i) {
 
 void
 View::sort() {
-  Download* curFocus = focus() != end_visible() ? focus()->get() : nullptr;
-  const auto revision = m_revision;
-  base_type sorted(begin_visible(), end_visible());
-  const view_downloads_compare compare(m_sortCurrent);
-  struct Changed {};
-  try {
-    // Comparators may erase or move downloads. Sort an owned snapshot and
-    // abandon publication as soon as a callback changes this view.
-    std::stable_sort(sorted.begin(), sorted.end(), [&](const auto& left, const auto& right) {
-      if (revision != m_revision || left->lifetime().expired() || right->lifetime().expired())
-        throw Changed{};
-      const bool result = compare(left, right);
-      if (revision != m_revision || left->lifetime().expired() || right->lifetime().expired())
-        throw Changed{};
-      return result;
-    });
-  } catch (const Changed&) {
-    emit_changed();
-    return;
-  }
-  std::copy(sorted.begin(), sorted.end(), begin_visible());
-  ++m_revision;
+  check_unlocked();
+
+  Download* curFocus = focus() != end_visible() ? focus()->get() : NULL;
+
+  // Don't go randomly switching around equivalent elements.
+  std::stable_sort(begin(), end_visible(), view_downloads_compare(m_sortCurrent));
+
   m_focus = position(std::find_if(begin(), end_visible(), entry_is(curFocus)));
   emit_changed();
 }
 
 void
 View::filter() {
-  if (m_name == "started" || m_name == "stopped") return;
-  const base_type snapshot(begin(), end_filtered());
-  const view_downloads_filter matches(m_filter, m_temp_filter);
-  std::unordered_map<Download*, bool> selected;
-  for (const auto& entry : snapshot) {
-    if (entry->lifetime().expired()) continue;
-    const bool result = matches(entry.get());
-    if (!entry->lifetime().expired()) selected.emplace(entry.get(), result);
-  }
-  // Publish the stable partition before notifications, as before. Evaluate
-  // callbacks on owned snapshots so they cannot invalidate vector iterators.
-  base_type visible, hidden, added, removed;
-  for (auto itr = begin(); itr != end_filtered(); ++itr) {
-    const auto choice = selected.find(itr->get());
-    const bool was_visible = itr < end_visible();
-    const bool is_visible = choice == selected.end() ? was_visible : choice->second;
-    (is_visible ? visible : hidden).push_back(*itr);
-    if (was_visible != is_visible) (is_visible ? added : removed).push_back(*itr);
-  }
-  base_type::assign(visible.begin(), visible.end());
-  base_type::insert(base_type::end(), hidden.begin(), hidden.end());
-  m_size = visible.size();
-  ++m_revision;
+  check_unlocked();
+
+  // Do NOT allow filter STARTED and STOPPED views: they are special
+  if (m_name == "started" || m_name == "stopped")
+    return;
+
+  // Parition the list in two steps so we know which elements changed.
+  iterator  splitVisible  = std::stable_partition(begin_visible(), end_visible(), view_downloads_filter(m_filter, m_temp_filter));
+  iterator  splitFiltered = std::stable_partition(begin_filtered(), end_filtered(), view_downloads_filter(m_filter, m_temp_filter));
+
+  base_type changed(splitVisible, splitFiltered);
+  iterator  splitChanged = changed.begin() + std::distance(splitVisible, end_visible());
+
+  m_size = std::distance(begin(), std::copy(splitChanged, changed.end(), splitVisible));
+  std::copy(changed.begin(), splitChanged, begin_filtered());
+
+  // Fix this...
   m_focus = std::min(m_focus, m_size);
+
+  // The events run on the 'changed' copy after the filter commands, so
+  // they may change views. Keep this pass's commands if an earlier event
+  // replaces them, and skip downloads an earlier event erased.
   const auto removed_event = m_event_removed, added_event = m_event_added;
-  for (const auto& entry : removed)
-    if (!entry->lifetime().expired() && std::find(begin_filtered(), end_filtered(), entry) != end_filtered())
-      rpc::call_object_d_nothrow(removed_event, entry.get());
-  for (const auto& entry : added)
-    if (!entry->lifetime().expired() && std::find(begin_visible(), end_visible(), entry) != end_visible())
-      rpc::call_object_d_nothrow(added_event, entry.get());
+  if (!removed_event.is_empty())
+    std::for_each(changed.begin(), splitChanged, [&removed_event](const auto& d) {
+        if (!d->lifetime().expired())
+          call_view_event(removed_event, d.get());
+      });
+
+  if (!added_event.is_empty())
+    std::for_each(splitChanged, changed.end(), [&added_event](const auto& d) {
+        if (!d->lifetime().expired())
+          call_view_event(added_event, d.get());
+      });
+
   emit_changed();
 }
 
 void
 View::filter_by(const torrent::Object& condition, View::base_type& result) {
-  const base_type snapshot(begin_visible(), end_visible());
-  const view_downloads_filter matches(condition, m_temp_filter);
-  for (const auto& entry : snapshot) {
-    if (entry->lifetime().expired()) continue;
-    if (matches(entry.get()) && !entry->lifetime().expired() &&
-        std::find(begin_visible(), end_visible(), entry) != end_visible())
-      result.push_back(entry);
-  }
+  // std::copy_if(begin_visible(), end_visible(), result.begin(), view_downloads_filter(condition));
+  view_downloads_filter matches = view_downloads_filter(condition, m_temp_filter);
+
+  for (iterator itr = begin_visible(); itr != end_visible(); ++itr)
+    if (*itr != nullptr && matches(itr->get()))
+      result.push_back(*itr);
 }
 
 void
 View::filter_download(core::Download* download) {
-  auto itr = std::find_if(base_type::begin(), base_type::end(), entry_is(download));
+  check_unlocked();
+
+  iterator itr = std::find_if(base_type::begin(), base_type::end(), entry_is(download));
+
   if (itr == base_type::end()) {
-    // View::initialize() leaves out erasing downloads, so a view created by
-    // an erase callback can be asked to filter one it never held.
+    // A view created by a native erase event never held the erasing download.
     if (download->is_erasing())
       return;
     throw torrent::internal_error("View::filter_download(...) could not find download.");
   }
 
-  const auto entry = *itr;
-  const auto lifetime = download->lifetime();
-  const bool matches = view_downloads_filter(m_filter, m_temp_filter)(download);
-  if (lifetime.expired()) return;
-  // User filters may change this vector, including through another download.
-  itr = std::find_if(base_type::begin(), base_type::end(), entry_is(download));
-  if (itr == base_type::end()) return;
-  const bool was_visible = itr < end_visible();
-  if (matches) {
-    if (!insert_visible(entry)) return;
-    if (!was_visible)
-      rpc::call_object_nothrow(m_event_added, rpc::make_target(download));
+  if (view_downloads_filter(m_filter, m_temp_filter)(download)) {
+    if (itr >= end_visible()) {
+      auto entry = *itr;
+
+      erase_internal(itr);
+      insert_visible(entry);
+
+      call_view_event(m_event_added, download);
+
+    } else {
+      // This makes sure the download is sorted even if it is
+      // already visible.
+      //
+      // Consider removing this.
+      auto entry = *itr;
+
+      erase_internal(itr);
+      insert_visible(entry);
+    }
+
   } else {
-    if (!was_visible) return;
+    if (itr >= end_visible())
+      return;
+
+    auto entry = *itr;
+
     erase_internal(itr);
     base_type::push_back(entry);
-    rpc::call_object_nothrow(m_event_removed, rpc::make_target(download));
+
+    call_view_event(m_event_removed, download);
   }
+
   emit_changed();
 }
 
@@ -378,32 +408,14 @@ View::clear_filter_on() {
   control->object_storage()->rlookup_clear("!view." + m_name);
 }
 
-inline bool
+inline void
 View::insert_visible(const std::shared_ptr<Download>& d) {
-  const auto lifetime = d->lifetime();
-  const base_type candidates(begin_visible(), end_visible());
-  const view_downloads_compare compare(m_sortNew);
-  std::shared_ptr<Download> anchor;
-  // Keep the target in this view until callbacks finish: ordinary erase must
-  // still find it. Never carry vector iterators across a user comparator.
-  for (const auto& candidate : candidates) {
-    if (candidate == d || candidate->lifetime().expired()) continue;
-    const bool before = compare(d, candidate);
-    if (lifetime.expired()) return false;
-    if (before && !candidate->lifetime().expired()) {
-      anchor = candidate;
-      break;
-    }
-  }
-  auto current = std::find_if(begin(), end_filtered(), entry_is(d.get()));
-  if (current == end_filtered()) return false;
-  erase_internal(current);
-  const auto position = anchor ? std::find(begin_visible(), end_visible(), anchor) : end_visible();
-  m_focus += (m_focus >= this->position(position));
-  ++m_size;
-  base_type::insert(position, d);
-  ++m_revision;
-  return true;
+  auto itr = std::find_if(begin_visible(), end_visible(), [this, &d](const auto& d2) { return view_downloads_compare(m_sortNew)(d.get(), d2.get()); });
+
+  m_size++;
+  m_focus += (m_focus >= position(itr));
+
+  base_type::insert(itr, d);
 }
 
 inline void
@@ -415,7 +427,6 @@ View::erase_internal(iterator itr) {
   m_focus -= (m_focus > position(itr));
 
   base_type::erase(itr);
-  ++m_revision;
 }
 
 } // namespace core

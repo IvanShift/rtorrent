@@ -261,6 +261,8 @@ DownloadList::erase_meta_placeholder(Download* download) {
 
 DownloadList::iterator
 DownloadList::erase(iterator itr, bool retire_stop_intent) {
+  View::check_unlocked();
+
   if (itr == end())
     throw torrent::internal_error("DownloadList::erase(...) could not find download.");
 
@@ -343,6 +345,7 @@ DownloadList::open(Download* download) {
 
 void
 DownloadList::open_throw(Download* download) {
+  View::check_unlocked();
   check_contains(download);
   erasedata_lifecycle::require_activity(download);
   if (retrackers_migration_candidate_activity_held(
@@ -380,6 +383,7 @@ DownloadList::close(Download* download) {
 // need the files closed and will keep using the download.
 void
 DownloadList::close_files(Download* download) {
+  View::check_unlocked();
   lt_log_print_hash(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download files");
 
   if (download->download()->info()->is_active()) {
@@ -395,6 +399,9 @@ DownloadList::close_files(Download* download) {
 
 void
 DownloadList::close_directly(Download* download) {
+  // set_state_stopped() would refuse only after the files are closed.
+  View::check_unlocked();
+
   lt_log_print_hash(torrent::LOG_TORRENT_DEBUG, download->info()->hash(), "download_list : closing download directly");
 
   auto lifetime   = download->lifetime();
@@ -497,6 +504,8 @@ DownloadList::close_throw(Download* download) {
 
 void
 DownloadList::resume(Download* download, int flags) {
+  // Refuse before the catch below hides the refusal of the view change.
+  View::check_unlocked();
   check_contains(download);
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash()))) {
@@ -614,6 +623,8 @@ DownloadList::resume(Download* download, int flags) {
 
 void
 DownloadList::pause(Download* download, int flags) {
+  // Refuse before the catch below hides the refusal of the view change.
+  View::check_unlocked();
   check_contains(download);
 
   LT_LOG_DOWNLOAD_DEBUG("pausing download : flags:%0x.", flags);
@@ -665,6 +676,8 @@ DownloadList::pause(Download* download, int flags) {
 
 void
 DownloadList::check_hash(Download* download) {
+  // hash_queue() clears the progress of a closed download before any view change.
+  View::check_unlocked();
   check_contains(download);
 
   LT_LOG_DOWNLOAD_DEBUG("checking hash", 0);

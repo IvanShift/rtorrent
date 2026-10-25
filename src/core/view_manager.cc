@@ -26,6 +26,8 @@ ViewManager::clear() {
 
 ViewManager::iterator
 ViewManager::insert(const std::string& name) {
+  View::check_unlocked();
+
   if (name.empty())
     throw torrent::input_error("View with empty name not supported.");
 
@@ -56,13 +58,13 @@ ViewManager::find_throw(const std::string& name) {
 
 void
 ViewManager::sort(const std::string& name, uint32_t timeout) {
+  // Filter events may add views, so keep a View* rather than an iterator.
   View* view = find_ptr_throw(name);
 
   if (view->last_changed() + std::chrono::seconds(timeout) > torrent::this_thread::cached_time())
     return;
 
   // Should we rename sort, or add a seperate function?
-  // A filter may add views and reallocate the manager vector.
   view->filter();
   view->sort();
 }

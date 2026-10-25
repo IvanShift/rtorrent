@@ -1381,6 +1381,7 @@ void rr_check_claim(core::Download* download, const std::string& claim) {
 
 torrent::Object rr_migration_capture(core::Download* source,
                                      const torrent::Object::list_type& args) {
+  core::View::check_unlocked();
   if (args.size() != 3 && args.size() != 5)
     throw torrent::input_error("RR capture requires local ID, marker, successor hash, optional transaction and digest.");
   const std::string& local_id = args.front().as_string();
@@ -2828,6 +2829,7 @@ void rr_reopen_paused_owner(core::Download* owner, const RrMigrationCapsule& sta
 torrent::Object rr_release_owner(core::Download* owner,
                                  const torrent::Object::list_type& args,
                                  const bool committed) {
+  core::View::check_unlocked();
   if (args.size() != 2)
     throw torrent::input_error("RR release requires transaction and incarnation.");
   const std::string owner_hash = rpc::call_command_string("d.hash", rpc::make_target(owner));
@@ -4241,6 +4243,7 @@ stop_with_generation(core::Download* download, bool require_durable = false) {
 
 int64_t
 set_directory_if_stop_close_claim(core::Download* download, const torrent::Object::list_type& args, bool base) {
+  core::View::check_unlocked();
   if (args.size() != 2 || !args[0].is_string() || !args[1].is_string())
     throw torrent::input_error("stop claim: expected token and directory");
   bool current = false;
@@ -4254,6 +4257,7 @@ set_directory_if_stop_close_claim(core::Download* download, const torrent::Objec
 
 int64_t
 replay_stop_close_terminal(core::Download* download, const std::string& job) {
+  core::View::check_unlocked();
   auto claim = stop_intent::lease(download);
   if (claim.job != job) return 0;
   if (claim.phase != 'T' && claim.phase != 'D') return 0;
@@ -4868,6 +4872,7 @@ initialize_command_download() {
   CMD2_DL         ("d.delete_tied", std::bind(&apply_d_delete_tied, std::placeholders::_1));
 
   CMD2_DL("d.start", [](core::Download* download, const torrent::Object&) {
+    core::View::check_unlocked();
     core::erasedata_lifecycle::require_activity(download);
     if (retrackers_migration_candidate_activity_held(
         rpc::call_command_string("d.hash", rpc::make_target(download))))
@@ -5059,6 +5064,7 @@ initialize_command_download() {
   });
   CMD2_DL_V       ("d.erase",      std::bind(&core::DownloadList::erase_ptr, control->core()->download_list(), std::placeholders::_1));
   CMD2_DL_LIST("d.erase_preserving_tied", [](core::Download* download, const torrent::Object::list_type& args) {
+    core::View::check_unlocked();
     if (args.size() != 5 || !args[0].is_string() || !args[1].is_string() ||
         !args[2].is_value() || !args[3].is_value() || !args[4].is_value())
       throw torrent::input_error("Preserving erase requires tied path, Stop token, state, open and active.");
