@@ -3536,6 +3536,87 @@ def session_mode_chmod_refused(daemon):
             if daemon.call('d.custom1', hash_) != label}
     assert not lost, 'labels lost after restart: ' + repr(lost)
 
+
+def resume_failure_torrent(daemon, name):
+    # ruTorrent's fastResume() shape: every chunk done and the raw file mtimes,
+    # while path.utf-8 makes the daemon open another name. libtorrent then
+    # clears that file's create flag and the start fails "Could not open file".
+    one, two = b'a' * 600, b'b' * 400
+    root = daemon.directory / 'dl' / name
+    (root / 'sub').mkdir(parents=True)
+    (root / 'one.data').write_bytes(one)
+    (root / 'sub' / 'two.data').write_bytes(two)
+    info = {'name': name, 'piece length': 16384, 'pieces': hashlib.sha1(one + two).digest(),
+            'files': [{'length': 600, 'path': ['one.data'], 'path.utf-8': ['selected.data']},
+                      {'length': 400, 'path': ['sub', 'two.data']}]}
+    files = [{'priority': 2, 'mtime': int((root / path).stat().st_mtime)} for path in ('one.data', 'sub/two.data')]
+    h = hashlib.sha1(encode(info)).hexdigest().upper()
+    daemon.call('load.raw_start', '', xmlrpc.client.Binary(encode(
+        {'info': info, 'libtorrent_resume': {'bitfield': 1, 'files': files}})))
+    daemon.wait(lambda: daemon.call('d.hash', h) == h and daemon.call('d.is_hash_checked', h) == 1 and
+                daemon.call('d.hashing', h) == 0, 'fast-resumed ' + name)
+    return h
+
+
+def resume_failure_visible(daemon):
+    # rakshasa/rtorrent#2081: a start that fails says why, before the 'active'
+    # removal hook runs, and leaves 'active', so scheduler.max_active admits
+    # the next download. The state stays started, both scheduler loops count
+    # the view rather than their attempts, and a later successful start
+    # retires only that message.
+    restart_with_rc(daemon, 'view.event_removed = active,((d.custom.set,seen,((d.message))))')
+    daemon.start()
+    daemon.call('scheduler.max_active.set', '', 1)
+    active = lambda: sorted(row[0] for row in daemon.call('d.multicall2', '', 'active', 'd.hash='))
+    failed = resume_failure_torrent(daemon, 'resume-failure')
+    daemon.wait(lambda: daemon.call('d.message', failed).startswith('Could not resume download: '),
+                'resume failure reported')
+    message = daemon.call('d.message', failed)
+    assert 'Could not open file' in message, message
+    assert daemon.call('d.custom', failed, 'seen') == message, 'the active removal hook did not see the reason'
+    assert [daemon.call(m, failed) for m in ('d.state', 'd.is_active')] == [1, 0]
+    assert failed not in active(), 'failed start kept its active slot'
+    healthy = daemon.fixture('resume-failure-healthy', start=False)
+    daemon.call('d.message.set', healthy, 'independent note')
+    daemon.call('d.start', healthy)
+    daemon.wait(lambda: daemon.call('d.is_active', healthy) == 1, 'next download admitted to the freed slot')
+    assert daemon.call('d.message', healthy) == 'independent note', 'a successful start cleared another message'
+    # Started order: failed, then three downloads waiting for the one slot.
+    waiting = [daemon.fixture('resume-failure-waiting-' + str(n)) for n in range(3)]
+    assert active() == [healthy]
+    daemon.call('d.stop', healthy)  # scheduler.simple.removed: failed is tried, then one fills the slot.
+    assert active() == [waiting[0]], active()
+    daemon.wait(lambda: daemon.call('d.is_active', waiting[0]) == 1, 'scheduler start after the failed attempt')
+    daemon.call('scheduler.max_active.set', '', 2)
+    daemon.call('scheduler.simple.update', waiting[0])  # Tries failed again, then fills one slot.
+    assert active() == sorted(waiting[:2]), active()
+    (daemon.directory / 'dl' / 'resume-failure' / 'selected.data').write_bytes(b'a' * 600)
+    daemon.call('scheduler.max_active.set', '', 3)
+    daemon.call('scheduler.simple.update', waiting[0])
+    daemon.wait(lambda: daemon.call('d.is_active', failed) == 1, 'scheduler start of the repaired download')
+    assert daemon.call('d.message', failed) == '', daemon.call('d.message', failed)
+    assert active() == sorted([failed] + waiting[:2]), active()
+
+
+def resume_erasedata_hold(daemon):
+    # The 0.16.27 merge decision for #2081: an erasedata hold that reaches
+    # resume() through the scheduler keeps its own message, as the RPC
+    # preflight sets it; a hold is not a failed start. Once the intent is
+    # cancelled, the same scheduler path starts the download.
+    daemon.call('scheduler.max_active.set', '', 0)
+    h = daemon.fixture('resume-erasedata-hold')
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [1, 0]
+    values = erasedata_tuple(daemon, h)
+    assert erasedata_call(daemon, 'prepare', values) == 'prepared'
+    daemon.call('scheduler.max_active.set', '', 5)
+    daemon.call('scheduler.simple.update', h)
+    message = daemon.call('d.message', h)
+    assert message.startswith('erasedata: recovery held: ') and h + '.erasedata' in message, message
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [1, 0]
+    assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
+    daemon.call('scheduler.simple.update', h)
+    daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'scheduler start after cancellation')
+
 CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
          'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
          'view-filter-reentrant': view_filter_reentrant,
@@ -3639,6 +3720,9 @@ CASES.update({'shutdown-storage-errors-sigint': lambda daemon: shutdown_storage_
               'session-umask-saves': session_umask_saves,
               'session-umask-journal': session_umask_journal})
 CASES.update({'session-mode-chmod-refused': session_mode_chmod_refused})
+# The 0.16.27 merge: rakshasa/rtorrent#2081 next to the native erasedata hold.
+CASES.update({'resume-failure-visible': resume_failure_visible,
+              'resume-erasedata-hold': resume_erasedata_hold})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 
