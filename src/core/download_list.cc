@@ -523,10 +523,12 @@ DownloadList::resume(Download* download, int flags) {
   try {
     // resume is also called from libtorrent completion callbacks. Public RPC
     // entry points perform their own throwing preflight before reaching here.
-    // A held erase recovery owns its message and is not a failed start.
+    // A held erase recovery is a refusal, not a failed start.
     erasedata_lifecycle::require_activity(download);
   } catch (torrent::local_error& e) {
-    LT_LOG_DOWNLOAD_EVENTS("could not resume download : %s", e.what());
+    LT_LOG_DOWNLOAD_EVENTS("resume held : %s", e.what());
+    // A hold has set this text already; an unreadable intent states its own reason.
+    download->set_message(e.what());
     return;
   }
 

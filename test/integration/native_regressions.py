@@ -3601,21 +3601,40 @@ def resume_failure_visible(daemon):
 def resume_erasedata_hold(daemon):
     # The 0.16.27 merge decision for #2081: an erasedata hold that reaches
     # resume() through the scheduler keeps its own message, as the RPC
-    # preflight sets it; a hold is not a failed start. Once the intent is
-    # cancelled, the same scheduler path starts the download.
+    # preflight sets it; a hold is not a failed start, so the download is not
+    # queued for hashing or added to 'active', and the log names it a hold.
+    # Once the intent is cancelled, the same scheduler path starts the
+    # download. An intent that cannot be read holds it as visibly.
     daemon.call('scheduler.max_active.set', '', 0)
     h = daemon.fixture('resume-erasedata-hold')
     assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [1, 0]
     values = erasedata_tuple(daemon, h)
     assert erasedata_call(daemon, 'prepare', values) == 'prepared'
     daemon.call('scheduler.max_active.set', '', 5)
+    active = lambda: [row[0] for row in daemon.call('d.multicall2', '', 'active', 'd.hash=')]
     daemon.call('scheduler.simple.update', h)
     message = daemon.call('d.message', h)
     assert message.startswith('erasedata: recovery held: ') and h + '.erasedata' in message, message
-    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active')] == [1, 0]
+    assert [daemon.call(m, h) for m in ('d.state', 'd.is_active', 'd.hashing')] == [1, 0, 0]
+    assert h not in active(), 'a held download took an active slot'
+    log = lambda: (daemon.directory / 'native.log').read_text()
+    assert 'resume held : erasedata: recovery held: ' in log(), 'hold not logged as a hold'
+    assert 'could not resume download : erasedata' not in log(), 'hold logged as a failed start'
     assert erasedata_call(daemon, 'cancel', values) == 'cancelled'
     daemon.call('scheduler.simple.update', h)
     daemon.wait(lambda: daemon.call('d.is_active', h) == 1, 'scheduler start after cancellation')
+    # An intent that cannot be read holds the download too, and says why.
+    daemon.call('scheduler.max_active.set', '', 0)
+    other = daemon.fixture('resume-erasedata-unreadable')
+    assert erasedata_call(daemon, 'prepare', erasedata_tuple(daemon, other)) == 'prepared'
+    (daemon.session / '.rutorrent-stop-intents' / (other + '.erasedata')).write_bytes(b'unreadable\n')
+    daemon.call('d.message.set', other, '')
+    daemon.call('scheduler.max_active.set', '', 5)
+    daemon.call('scheduler.simple.update', other)
+    message = daemon.call('d.message', other)
+    assert message.startswith('erasedata: malformed-record; inspect ') and other + '.erasedata' in message, message
+    assert [daemon.call(m, other) for m in ('d.state', 'd.is_active', 'd.hashing')] == [1, 0, 0]
+    assert other not in active() and 'resume held : erasedata: malformed-record; inspect ' in log()
 
 CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
          'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
