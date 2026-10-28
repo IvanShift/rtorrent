@@ -523,8 +523,16 @@ DownloadList::resume(Download* download, int flags) {
   try {
     // resume is also called from libtorrent completion callbacks. Public RPC
     // entry points perform their own throwing preflight before reaching here.
+    // A held erase recovery owns its message and is not a failed start.
     erasedata_lifecycle::require_activity(download);
+  } catch (torrent::local_error& e) {
+    LT_LOG_DOWNLOAD_EVENTS("could not resume download : %s", e.what());
+    return;
+  }
 
+  constexpr auto resume_failed_message = "Could not resume download: ";
+
+  try {
     if (download->completion_deferred() && download->is_hash_checked() && download->is_done()) {
       // An explicit later Resume may discharge a retained notification. Its
       // completion path owns any rehash/resume and must honor nested Stop.
@@ -612,12 +620,21 @@ DownloadList::resume(Download* download, int flags) {
     download->set_priority(download->priority());
     download->download()->start(download->resume_flags());
 
+    // A start that works retires the failure an earlier resume reported.
+    if (download->message().starts_with(resume_failed_message))
+      download->set_message("");
+
     download->set_resume_flags(Download::default_resume_flags);
 
     DL_TRIGGER_EVENT(download, "event.download.resumed");
 
   } catch (torrent::local_error& e) {
     LT_LOG_DOWNLOAD_EVENTS("could not resume download : %s", e.what());
+
+    // The download did not start: report why and give up its slot in the 'active' view,
+    // which the scheduler counts. The state stays as the user set it.
+    download->set_message(resume_failed_message + std::string(e.what()));
+    control->view_manager()->find_ptr_throw("active")->set_not_visible(download);
   }
 }
 
