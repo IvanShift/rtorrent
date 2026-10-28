@@ -20,6 +20,7 @@
 #include <torrent/utils/string_manip.h>
 
 #include "rpc/parse_commands.h"
+#include "utils/functional.h"
 
 #include "control.h"
 #include "globals.h"
@@ -45,6 +46,9 @@
   rpc::commands.call_catch(event_name, rpc::make_target(download), torrent::Object(), "Event '" event_name "' failed: ");
 
 namespace core {
+
+// Set while resume() reports a failed start to the 'active' removal hooks.
+static bool resume_failure_reporting = false;
 
 inline void
 DownloadList::check_contains([[maybe_unused]] Download* d) {
@@ -507,6 +511,11 @@ DownloadList::resume(Download* download, int flags) {
   // Refuse before the catch below hides the refusal of the view change.
   View::check_unlocked();
   check_contains(download);
+
+  // A removal hook that resumes again would repeat the failed start without end.
+  if (resume_failure_reporting)
+    throw torrent::input_error("Cannot resume a download while a failed start is reported.");
+
   if (retrackers_migration_candidate_activity_held(
       torrent::utils::transform_to_hex_str(download->info()->hash()))) {
     lt_log_print(torrent::LOG_TORRENT_EVENTS, "RR candidate resume held until durable release");
@@ -636,6 +645,10 @@ DownloadList::resume(Download* download, int flags) {
     // The download did not start: report why and give up its slot in the 'active' view,
     // which the scheduler counts. The state stays as the user set it.
     download->set_message(resume_failed_message + std::string(e.what()));
+
+    resume_failure_reporting = true;
+    utils::scope_guard guard([]() { resume_failure_reporting = false; });
+
     control->view_manager()->find_ptr_throw("active")->set_not_visible(download);
   }
 }
