@@ -3636,6 +3636,26 @@ def resume_erasedata_hold(daemon):
     assert [daemon.call(m, other) for m in ('d.state', 'd.is_active', 'd.hashing')] == [1, 0, 0]
     assert other not in active() and 'resume held : erasedata: malformed-record; inspect ' in log()
 
+
+def resume_failure_hook_reentry(daemon, hook):
+    # The #2081 re-entrancy guard: an 'active' removal hook that starts the
+    # failed download again is refused while the failure is reported. The
+    # start fails and is reported once instead of recursing until the stack
+    # overflows, and the next start is not refused.
+    restart_with_rc(daemon, 'view.event_removed = active,' + hook)
+    daemon.start()
+    active = lambda: [row[0] for row in daemon.call('d.multicall2', '', 'active', 'd.hash=')]
+    failed = resume_failure_torrent(daemon, 'resume-reentry')
+    daemon.wait(lambda: 'Could not open file' in daemon.call('d.message', failed), 'failure reported')
+    time.sleep(.5)
+    reports = (daemon.directory / 'native.log').read_text().count('could not resume download : ')
+    assert reports == 1, 'failed start reported %d times' % reports
+    message = daemon.call('d.message', failed)
+    assert message.startswith('Could not resume download: Could not open file'), message
+    assert [daemon.call(m, failed) for m in ('d.state', 'd.is_active')] == [1, 0] and failed not in active()
+    healthy = daemon.fixture('resume-reentry-healthy')
+    daemon.wait(lambda: daemon.call('d.is_active', healthy) == 1, 'start after the report')
+
 CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d, False),
          'erasedata-finished-deferred-last': lambda d: erasedata_finished_deferred(d, True),
          'view-filter-reentrant': view_filter_reentrant,
@@ -3742,6 +3762,9 @@ CASES.update({'session-mode-chmod-refused': session_mode_chmod_refused})
 # The 0.16.27 merge: rakshasa/rtorrent#2081 next to the native erasedata hold.
 CASES.update({'resume-failure-visible': resume_failure_visible,
               'resume-erasedata-hold': resume_erasedata_hold})
+CASES.update({'resume-reentry-resume': lambda daemon: resume_failure_hook_reentry(daemon, '((d.resume))'),
+              'resume-reentry-update': lambda daemon: resume_failure_hook_reentry(daemon, '((scheduler.simple.update))'),
+              'resume-reentry-stop-start': lambda daemon: resume_failure_hook_reentry(daemon, '{(d.stop),(d.start)}')})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 
