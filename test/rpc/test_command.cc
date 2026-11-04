@@ -2,14 +2,141 @@
 
 #include "test/rpc/test_command.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <torrent/exceptions.h>
+#include <torrent/object.h>
+#include <torrent/torrent.h>
 
 #include "command_helpers.h"
+#include "control.h"
+#include "core/download.h"
+#include "core/download_list.h"
+#include "core/incarnation.h"
+#include "core/manager.h"
+#include "core/retrackers_migration_pending.h"
+#include "globals.h"
 #include "rpc/command.h"
 #include "rpc/parse_commands.h"
+#include "session/session_manager.h"
+#include "session/thread_session.h"
 
 CPPUNIT_TEST_SUITE_REGISTRATION(TestCommand);
+
+void initialize_command_download();
+void initialize_command_local();
+
+namespace {
+
+int64_t     ran_count = 0;
+std::string session_path;
+
+core::Download*
+insert_download(const std::string& name) {
+  torrent::Object info = torrent::Object::create_map();
+  info.insert_key("name", name);
+  info.insert_key("length", int64_t{16});
+  info.insert_key("piece length", int64_t{262144});
+  info.insert_key("pieces", std::string(20, char(0)));
+
+  auto object = new torrent::Object(torrent::Object::create_map());
+  object->insert_key("info", info);
+  // These downloads bypass DownloadFactory, so supply the ordinary native
+  // metadata that its lifecycle owners read during a real erase.
+  auto& rtorrent = object->insert_key("rtorrent", torrent::Object::create_map());
+  rtorrent.insert_key("incarnation", core::fresh_incarnation());
+  for (const auto* key : {"state", "state_counter", "stop_generation", "hashing", "complete"})
+    rtorrent.insert_key(key, int64_t{0});
+  for (const auto* key : {"custom1", "custom2", "custom3", "custom4", "custom5", "tied_to_file"})
+    rtorrent.insert_key(key, std::string());
+  rtorrent.insert_key("custom", torrent::Object::create_map());
+  rtorrent.insert_key("views", torrent::Object::create_list());
+
+  auto download = new core::Download(torrent::download_add(object, 0));
+  control->core()->download_list()->insert(download);
+
+  return download;
+}
+
+// The two commands, as a list and as a multi-handler with keys in that order.
+torrent::Object
+command_list(const char* first, const char* second) {
+  auto list = torrent::Object::create_list();
+  list.as_list().push_back(rpc::parse_command_object(first));
+  list.as_list().push_back(rpc::parse_command_object(second));
+  return list;
+}
+
+torrent::Object
+command_map(const char* first, const char* second) {
+  auto map = torrent::Object::create_map();
+  map.insert_key("a", rpc::parse_command_object(first));
+  map.insert_key("b", rpc::parse_command_object(second));
+  return map;
+}
+
+} // namespace
+
+void
+TestCommand::setUp() {
+  test_fixture::setUp();
+
+  // torrent::download_add() opens a socket through the mocked fd functions,
+  // and DownloadList::erase() needs the session manager.
+  mock_redirect_defaults();
+
+  torrent::initialize_main_thread();
+  torrent::initialize();
+  session::ThreadSession::create_thread();
+
+  if (control == nullptr)
+    control = new Control;
+
+  // Native erase owns session/Stop/retrackers cleanup; register its real commands.
+  // initialize_command_local() also seeds argument.0-3 with "placeholder.N",
+  // and test_stack expects an empty stack.
+  if (!rpc::commands.has("session.path")) {
+    initialize_command_local();
+    std::fill(rpc::command_base::stack_begin(), rpc::command_base::stack_end(), torrent::Object());
+  }
+  if (!rpc::commands.has("d.hash"))
+    initialize_command_download();
+
+  if (!rpc::commands.has("test.erase")) {
+    CMD2_DL("test.erase", [](core::Download* download, auto&) {
+      control->core()->download_list()->erase_ptr(download);
+      return torrent::Object();
+    });
+    CMD2_ANY("test.ran", [](auto, auto&) { return torrent::Object(++ran_count); });
+  }
+
+  char temporary[] = "/tmp/rtorrent_test_command_XXXXXX";
+  CPPUNIT_ASSERT(mkdtemp(temporary) != nullptr);
+  session_path = temporary;
+  session_thread::manager()->set_path(session_path);
+  session_thread::thread()->start_thread();
+
+  ran_count = 0;
+}
+
+void
+TestCommand::tearDown() {
+  control->core()->download_list()->clear();
+
+  // Retire the erased owners now rather than from a scheduled task that
+  // outlives the session directory.
+  retrackers_migration_flush_erased_owners();
+  session_thread::thread()->stop_thread_wait();
+  session::ThreadSession::destroy_thread();
+  torrent::cleanup();
+  std::filesystem::remove_all(session_path);
+  session_path.clear();
+
+  test_fixture::tearDown();
+}
 
 bool
 command_stack_all_empty() {
@@ -181,4 +308,36 @@ TestCommand::test_parse_command_multiple_after_each() {
 
   CPPUNIT_ASSERT_EQUAL(int64_t(2), command_count);
   CPPUNIT_ASSERT_EQUAL(2, calls);
+}
+
+// 'test.erase' erases the download it is called on. Each form runs on a new
+// download, and 'test.ran' after the erase must not get the erased download.
+void
+TestCommand::test_call_object_stops_at_erased_download() {
+  auto string = torrent::Object(std::string("test.erase= ;test.ran="));
+  auto list   = command_list("test.erase=", "test.ran=");
+  auto map    = command_map("test.erase=", "test.ran=");
+
+  CPPUNIT_ASSERT_THROW(rpc::call_object(string, rpc::make_target(insert_download("string"))), torrent::input_error);
+  CPPUNIT_ASSERT_THROW(rpc::call_object(list, rpc::make_target(insert_download("list"))), torrent::input_error);
+  CPPUNIT_ASSERT_THROW(rpc::call_object(map, rpc::make_target(insert_download("map"))), torrent::input_error);
+
+  CPPUNIT_ASSERT_EQUAL(int64_t(0), ran_count);
+  CPPUNIT_ASSERT(control->core()->download_list()->empty());
+}
+
+// Erasing in the last command, as in "d.stop= ;d.close= ;d.erase=", is not an
+// error.
+void
+TestCommand::test_call_object_erase_in_last_command() {
+  auto string = torrent::Object(std::string("test.ran= ;test.erase="));
+  auto list   = command_list("test.ran=", "test.erase=");
+  auto map    = command_map("test.ran=", "test.erase=");
+
+  rpc::call_object(string, rpc::make_target(insert_download("string")));
+  rpc::call_object(list, rpc::make_target(insert_download("list")));
+  rpc::call_object(map, rpc::make_target(insert_download("map")));
+
+  CPPUNIT_ASSERT_EQUAL(int64_t(3), ran_count);
+  CPPUNIT_ASSERT(control->core()->download_list()->empty());
 }
