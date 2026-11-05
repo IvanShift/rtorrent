@@ -462,8 +462,8 @@ main(int argc, char** argv) {
         rpc::parse_command_single(rpc::make_target(), "try_import=" + path);
       });
 
-    // Use the raw system call: libtorrent's family helper can silently fall
-    // back to IPv4. Apply detection after rc imports so config cannot undo it.
+    // Apply detection after rc imports so config cannot undo it. Call socket()
+    // directly: fd_open_family() logs a failure without preserving errno.
     int ipv6_socket_type = SOCK_STREAM;
 #ifdef SOCK_CLOEXEC
     ipv6_socket_type |= SOCK_CLOEXEC;
