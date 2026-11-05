@@ -2094,34 +2094,36 @@ def view_events_replace_their_commands(daemon):
         print('OBS self-replacing view event retains command storage mode=' + mode, flush=True)
 
 
-def view_removed_adds_views(daemon):
-    first = daemon.fixture('owner-first', start=False)
-    survivor = daemon.fixture('owner-survivor', start=False)
+def view_add_refused(daemon):
+    # An event handler that adds a view while a download is inserted or erased
+    # ends the daemon with upstream's internal error (#2055), visibly.
+    def refused(trigger):
+        try:
+            trigger()
+        except (OSError, RuntimeError):
+            pass
+        daemon.wait(lambda: docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'false',
+                    'internal error exit')
+        logs = docker('logs', daemon.name, check=False)
+        assert docker('inspect', '-f', '{{.State.ExitCode}}', daemon.name).stdout.strip() == '255'
+        assert 'an event handler added a view while a download was inserted or erased' in logs.stdout + logs.stderr
+        docker('rm', daemon.name)
+        daemon.start()
+
+    target = daemon.fixture('view-add-erase', start=False)
     daemon.call('view.add', '', 'owner')
-    daemon.call('method.insert', '', 'test.owner.armed', 'value', 0)
-    # An event_removed callback inside d.erase adds enough views to reallocate
-    # the manager's vector. The new views must not hold the erasing download.
-    added = ['callback-view-' + str(i) for i in range(128)]
-    daemon.call('method.insert', '', 'test.owner.add', 'simple',
-                'test.owner.armed.set=0;' + ';'.join('view.add=' + name for name in added) + ';cat=1')
-    daemon.call('view.event_removed', '', 'owner', 'branch=test.owner.armed=,test.owner.add=,cat=1')
-    daemon.call('test.owner.armed.set', '', 1)
-    daemon.call('d.erase', first)
-    expected = [[survivor]]
-    assert daemon.call('test.owner.armed') == 0
-    for view in ['main', 'owner', *added]:
-        rows = daemon.call('d.multicall2', '', view, 'd.hash=')
-        assert rows == expected, (view, rows, expected)
-        # Unlike multicall, download_list does not skip expired wrappers.
-        assert daemon.call('download_list', '', view) == [row[0] for row in expected]
-    assert daemon.call('d.name', survivor) == 'owner-survivor'
-    witness = daemon.fixture('owner-witness', start=False)
-    for view in ['main', 'owner', *added]:
-        assert daemon.call('download_list', '', view) == [row[0] for row in expected] + [witness]
-    daemon.call('d.erase', witness)
-    for view in ['main', 'owner', *added]:
-        assert daemon.call('download_list', '', view) == [row[0] for row in expected]
-    assert daemon.call('system.pid') > 0
+    daemon.call('view.event_removed', '', 'owner', 'view.add=callback-removed')
+    refused(lambda: daemon.call('d.erase', target))
+    # A view created on event.download.closed inside d.erase.
+    target = daemon.fixture('view-add-closed', start=True)
+    daemon.call('method.set_key', '', 'event.download.closed', 'late-add', 'view.add=callback-closed')
+    refused(lambda: daemon.call('d.erase', target))
+    daemon.call('view.add', '', 'owner')
+    daemon.call('view.event_added', '', 'owner', 'view.add=callback-added')
+    (daemon.directory / 'view-add-insert.torrent').write_bytes(encode({'info': {
+        'length': 8, 'name': 'view-add-insert', 'piece length': 16384,
+        'pieces': hashlib.sha1(b'xxxxxxxx').digest()}}))
+    refused(lambda: daemon.call('load.normal', '', '/data/view-add-insert.torrent'))
 
 
 def insertion_event_erases(daemon):
@@ -2150,24 +2152,6 @@ def load_commands_erase(daemon, one_string=False):
     daemon.call('load.normal', '', '/data/load.torrent', *commands)
     witness = daemon.fixture('load-witness', start=False)
     assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[survivor], [witness]]
-
-
-def view_late_filter_on_erase(daemon):
-    # A closing callback inside d.erase creates a view and filters it on
-    # event.download.erased; that view never held the erasing download.
-    target = daemon.fixture('late-target', start=True)
-    survivor = daemon.fixture('late-survivor', start=False)
-    daemon.call('method.insert', '', 'test.late.armed', 'value', 0)
-    daemon.call('method.insert', '', 'test.late.add', 'simple',
-                'test.late.armed.set=0;view.add=late;view.filter_on=late,event.download.erased')
-    daemon.call('method.set_key', '', 'event.download.closed', 'late-add',
-                'branch=test.late.armed=,test.late.add=')
-    daemon.call('test.late.armed.set', '', 1)
-    daemon.call('d.erase', target)
-    assert daemon.call('system.pid') > 0
-    assert daemon.call('test.late.armed') == 0
-    assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[survivor]]
-    assert daemon.call('d.multicall2', '', 'late', 'd.hash=') == [[survivor]]
 
 
 def erasedata_cancel_view_filter(daemon):
@@ -3654,8 +3638,7 @@ CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d,
          'view-filter-erases-other': view_filter_erases_other,
          'view-refusal-preserves-native-state': view_refusal_preserves_native_state,
          'view-events-replace-their-commands': view_events_replace_their_commands,
-         'view-removed-adds-views': view_removed_adds_views,
-         'view-late-filter-on-erase': view_late_filter_on_erase,
+         'view-add-refused': view_add_refused,
          'insertion-event-erases': insertion_event_erases,
          'load-commands-erase': load_commands_erase,
          'load-command-string-erase': lambda d: load_commands_erase(d, one_string=True),

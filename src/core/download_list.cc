@@ -197,6 +197,14 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
   return new Download(download);
 }
 
+// Event handlers must not add views while a download is inserted or erased,
+// as the loops below iterate over the view manager.
+static void
+check_view_count(ViewManager::size_type count) {
+  if (control->view_manager()->size() != count)
+    throw torrent::internal_error("DownloadList: an event handler added a view while a download was inserted or erased.");
+}
+
 DownloadList::iterator
 DownloadList::insert(Download* download, bool held_recovery) {
   if (!base_type::insert_back(std::shared_ptr<Download>(download)))
@@ -231,11 +239,17 @@ DownloadList::insert(Download* download, bool held_recovery) {
 bool
 DownloadList::initialize_insertion(Download* download) {
   const auto lifetime = download->lifetime();
-  const std::vector<View*> views(control->view_manager()->begin(), control->view_manager()->end());
-  for (auto view : views) {
-    view->filter_download(download);
-    if (lifetime.expired()) return false;
+  auto view_count = control->view_manager()->size();
+
+  for (auto v : *control->view_manager()) {
+    v->filter_download(download);
+    check_view_count(view_count);
+
+    // The filter events may erase the download.
+    if (lifetime.expired())
+      return false;
   }
+
   DL_TRIGGER_EVENT(download, "event.download.inserted");
   return !lifetime.expired();
 }
@@ -325,9 +339,8 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
   core::file_jobs::erase_download(itr->get());
   retrackers_migration_retire_released(itr->get());
   (*itr)->set_erasing();
-  // Callbacks below can add views. New views omit erasing downloads; existing
-  // views are visited through stable pointers rather than manager iterators.
-  const std::vector<View*> views(control->view_manager()->begin(), control->view_manager()->end());
+
+  auto view_count = control->view_manager()->size();
   // Erasure and its view callbacks are internal shutdown, not a newer user Stop.
   stop_intent::ScopedSuppress suppress;
 
@@ -342,8 +355,10 @@ DownloadList::erase(iterator itr, bool retire_stop_intent) {
 
   DL_TRIGGER_EVENT(*itr, "event.download.erased");
 
-  for (auto view : views)
-    view->erase(itr->get());
+  for (auto v : *control->view_manager()) {
+    v->erase(itr->get());
+    check_view_count(view_count);
+  }
 
   if (retire_counter) {
     try { stop_intent::erase_counter(session_thread::manager()->path(), erase_hash); }

@@ -481,33 +481,24 @@ TestView::test_filter_events_may_change_views() {
   CPPUNIT_ASSERT_EQUAL(size_t(2), control->core()->download_list()->size());
 }
 
-// Native erase events may add views. Existing views are visited through stable
-// pointers; newly created views must omit the download being erased.
+// An erase handler that adds a view stops the erase with an internal error,
+// before the new view could keep the erased download.
 void
-TestView::test_erase_event_adds_views() {
+TestView::test_erase_refuses_added_view() {
   auto d0 = insert_download();
-  insert_download();
+  auto d1 = insert_download();
   auto view = insert_view("test_view");
 
   view->set_event_removed(command_object(removed_command));
-  removed_action = [](core::Download*) {
-    for (int i = 0; i != 128; ++i)
-      control->view_manager()->insert("test_added_" + std::to_string(i));
-  };
 
-  control->core()->download_list()->erase_ptr(d0);
+  removed_action = [](core::Download*) { control->view_manager()->insert("test_added"); };
 
-  CPPUNIT_ASSERT_EQUAL(size_t(1), control->core()->download_list()->size());
-  CPPUNIT_ASSERT_EQUAL(size_t(129), control->view_manager()->size());
-  for (auto item : *control->view_manager())
-    CPPUNIT_ASSERT_EQUAL(std::string("d1"), describe_visible(*item));
+  CPPUNIT_ASSERT_THROW(control->core()->download_list()->erase_ptr(d0), torrent::internal_error);
 
-  auto d2 = insert_download();
-  for (auto item : *control->view_manager())
-    CPPUNIT_ASSERT_EQUAL(std::string("d1,d2"), describe_visible(*item));
-  control->core()->download_list()->erase_ptr(d2);
-  for (auto item : *control->view_manager())
-    CPPUNIT_ASSERT_EQUAL(std::string("d1"), describe_visible(*item));
+  CPPUNIT_ASSERT(d0->is_erasing());
+  CPPUNIT_ASSERT_EQUAL(std::string("d1"), describe_visible(*view));
+  CPPUNIT_ASSERT_EQUAL(size_t(2), control->core()->download_list()->size());
+  CPPUNIT_ASSERT_EQUAL(size_t(2), control->view_manager()->size());
 }
 
 // Held recovery bypasses user code while making the download visible in main.

@@ -180,9 +180,7 @@ View::initialize(const std::string& name) {
 
   // Urgh, wrong. No filtering being done.
   for (const auto& d : *control->core()->download_list())
-    // Native erase events may add views before the list releases the entry.
-    if (!d->is_erasing())
-      push_back(d);
+    push_back(d);
 
   m_size  = base_type::size();
   m_focus = 0;
@@ -356,12 +354,8 @@ View::filter_download(core::Download* download) {
 
   iterator itr = std::find_if(base_type::begin(), base_type::end(), entry_is(download));
 
-  if (itr == base_type::end()) {
-    // A view created by a native erase event never held the erasing download.
-    if (download->is_erasing())
-      return;
+  if (itr == base_type::end())
     throw torrent::internal_error("View::filter_download(...) could not find download.");
-  }
 
   if (view_downloads_filter(m_filter, m_temp_filter)(download)) {
     if (itr >= end_visible()) {

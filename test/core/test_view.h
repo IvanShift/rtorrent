@@ -9,7 +9,7 @@ class TestView : public test_fixture {
   CPPUNIT_TEST(test_filter_refuses_view_changes);
   CPPUNIT_TEST(test_insert_refuses_view_changes);
   CPPUNIT_TEST(test_filter_events_may_change_views);
-  CPPUNIT_TEST(test_erase_event_adds_views);
+  CPPUNIT_TEST(test_erase_refuses_added_view);
   CPPUNIT_TEST(test_held_insertion_defers_view_events);
   CPPUNIT_TEST(test_insert_stops_at_erased_download);
   CPPUNIT_TEST(test_multicall_skips_moved_entries);
@@ -26,7 +26,7 @@ public:
   void test_filter_refuses_view_changes();
   void test_insert_refuses_view_changes();
   void test_filter_events_may_change_views();
-  void test_erase_event_adds_views();
+  void test_erase_refuses_added_view();
   void test_held_insertion_defers_view_events();
   void test_insert_stops_at_erased_download();
   void test_multicall_skips_moved_entries();
