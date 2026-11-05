@@ -1,7 +1,6 @@
 #include "config.h"
 #include "stop_intent.h"
 #include "core/file_jobs.h"
-#include "core/download_admission.h"
 #include "core/erasedata_lifecycle.h"
 
 #include <algorithm>
@@ -144,13 +143,6 @@ DownloadList::find_hex_ptr(const char* hash) {
 
 Download*
 DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) {
-  if (!obj->is_map() || download_input_zero_infohash(*obj)) {
-    const auto reason = obj->is_map() ? "zero-info-hash" : "invalid-metainfo-root";
-    lt_log_print(torrent::LOG_ERRORS, "Download load refused: %s", reason);
-    control->core()->push_log_std(std::string("Download load refused: ") + reason);
-    delete obj;
-    return nullptr;
-  }
   torrent::Download download;
 
   try {
@@ -173,6 +165,7 @@ DownloadList::create(torrent::Object* obj, uint32_t tracker_key, bool printLog) 
 Download*
 DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
   torrent::Object* object = new torrent::Object;
+  torrent::Download download;
 
   try {
     *str >> *object;
@@ -188,7 +181,7 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
       return NULL;
     }
 
-    return create(object, tracker_key, printLog);
+    download = torrent::download_add(object, tracker_key);
 
   } catch (torrent::local_error& e) {
     delete object;
@@ -199,6 +192,9 @@ DownloadList::create(std::istream* str, uint32_t tracker_key, bool printLog) {
     return NULL;
   }
 
+  // There's no non-critical exceptions that should be throwable by
+  // the ctor, so don't catch.
+  return new Download(download);
 }
 
 DownloadList::iterator

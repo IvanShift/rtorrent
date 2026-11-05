@@ -1698,45 +1698,36 @@ def move_supersede(daemon):
 
 
 def zero_infohash_refusal(daemon):
-    # Captured direct-RPC crash: libtorrent's tracker manager rejects the
-    # decoded zero identity after construction. Refuse it before that point.
+    # libtorrent's download_add() refuses a zero info hash as input before the
+    # tracker manager sees it (c923cfba1), and a non-map root as a bencode type
+    # error. Verbose loads log either refusal; the daemon and others stay.
     control = daemon.fixture('zero-infohash-control', start=False)
     pid = daemon.call('system.pid')
-    cases = [
-        'magnet:?xt=urn:btih:' + 'A' * 32 + '&xt=urn:btmh:1220' + 'ab' * 32,
-        'magnet:?xt=urn:btih:' + '0' * 40,
-        'magnet:?xt=urn:btih:' + '%00' * 20,
-        'magnet:?xt=urn:btih:' + '%30' * 40,
-    ]
     log = daemon.directory / 'native.log'
-    for index, uri in enumerate(cases):
-        daemon.call('load.normal', '', uri)
-        daemon.wait(lambda: log.exists() and log.read_text().count('zero-info-hash') >= index + 1,
-                    'visible zero infohash refusal')
-        assert daemon.call('system.pid') == pid, 'zero infohash stopped the daemon'
-        assert daemon.call('d.hash', control) == control, 'zero infohash disturbed unrelated download'
+
+    def refuse(method, source, reason):
+        line = 'could not create download : ' + reason
+        count = lambda: log.read_text().count(line) if log.exists() else 0
+        before = count()
+        daemon.call(method, '', source)
+        daemon.wait(lambda: count() > before, 'visible refusal: ' + reason)
+        assert daemon.call('system.pid') == pid, reason + ' stopped the daemon'
         assert daemon.call('d.multicall2', '', 'main', 'd.hash=') == [[control]]
-    # A raw/session metadata envelope has the same dangerous identity without
-    # any magnet URI; path admission must share the guard.
+
+    for uri in ['magnet:?xt=urn:btih:' + 'A' * 32 + '&xt=urn:btmh:1220' + 'ab' * 32,
+                'magnet:?xt=urn:btih:' + '0' * 40,
+                'magnet:?xt=urn:btih:' + '%00' * 20,
+                'magnet:?xt=urn:btih:' + '%30' * 40]:
+        refuse('load.verbose', uri, 'Info hash is zero.')
+    # A raw/session metadata envelope has the same identity without a magnet URI.
     raw = encode({'info': {'meta_download': 1, 'name': 'zero.meta', 'pieces': b'\0' * 20}})
     (daemon.directory / 'zero-envelope.torrent').write_bytes(raw)
-    daemon.call('load.normal', '', '/data/zero-envelope.torrent')
-    daemon.wait(lambda: log.read_text().count('zero-info-hash') >= len(cases) + 1,
-                'visible zero metadata envelope refusal')
-    assert daemon.call('system.pid') == pid
-    assert daemon.call('d.hash', control) == control
-    # Invalid bencoded scalar/list roots retain the old nonfatal admission path.
+    refuse('load.verbose', '/data/zero-envelope.torrent', 'Info hash is zero.')
     for index, malformed in enumerate((b'i7e', b'le')):
         path = daemon.directory / ('malformed-root-' + str(index) + '.torrent')
         path.write_bytes(malformed)
-        for method, source in [('load.normal', '/data/' + path.name),
-                               ('load.raw', xmlrpc.client.Binary(malformed))]:
-            before = log.read_text().count('invalid-metainfo-root')
-            daemon.call(method, '', source)
-            daemon.wait(lambda: log.read_text().count('invalid-metainfo-root') > before,
-                        'visible malformed metainfo root refusal')
-            assert daemon.call('system.pid') == pid, 'malformed root stopped the daemon'
-            assert daemon.call('d.hash', control) == control
+        refuse('load.verbose', '/data/' + path.name, 'Wrong object type')
+        refuse('load.raw_verbose', xmlrpc.client.Binary(malformed), 'Wrong object type')
     # Valid v1 magnets, including a hybrid's extra btmh, remain admissible.
     valid = '11' * 20
     daemon.call('load.normal', '', 'magnet:?xt=urn:btih:' + valid + '&xt=urn:btmh:1220' + 'ab' * 32)

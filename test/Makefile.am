@@ -79,8 +79,6 @@ rtorrent_Test_Src_SOURCES = $(rtorrent_Test_Common) \
 	src/test_command_throttle.h \
 	src/test_command_tracker.cc \
 	src/test_command_tracker.h \
-	src/test_download_admission.cc \
-	src/test_download_admission.h \
 	src/test_erasedata_intent.cc \
 	src/test_erasedata_intent.h \
 	src/test_download_list.cc \
