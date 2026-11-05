@@ -1,7 +1,5 @@
 #include "config.h"
 
-#include <torrent/runtime/network_config.h>
-
 #include "control.h"
 
 #include <unistd.h>
@@ -86,10 +84,6 @@ Control::initialize() {
 
 void
 Control::cleanup() {
-  // A startup or late network option may still own its 200ms notification
-  // timer. Drain it while subscribers and the main scheduler are alive;
-  // destroying libtorrent with that scheduled entry aborts early shutdown.
-  torrent::runtime::network_config()->force_notify_changes();
   // Shutdown kills live workers; their transactions are left to startup.
   retrackers_migration_stop_worker_watch();
   core::retrackers_process_pool::shutdown();
