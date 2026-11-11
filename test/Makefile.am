@@ -91,6 +91,8 @@ rtorrent_Test_Src_SOURCES = $(rtorrent_Test_Common) \
 	src/test_retrackers_queue_receipts.h \
 	src/test_session_commit.cc \
 	src/test_session_commit.h \
+	src/test_session_manager.cc \
+	src/test_session_manager.h \
 	src/test_stop_intent_permissions.cc \
 	src/test_stop_intent_permissions.h \
 	src/test_session_storer.cc \

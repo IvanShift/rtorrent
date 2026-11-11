@@ -2,7 +2,6 @@
 
 #include "session/session_manager.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <torrent/exceptions.h>
@@ -426,12 +425,7 @@ SessionManager::process_save_request() {
       throw torrent::internal_error("SessionManager::process_save_request() called while not active.");
 
     while (!m_save_requests.empty()) {
-      if (m_processing_saves.size() >= max_concurrent_processing)
-        break;
-
-      // The rest wait for in-flight saves of their downloads; each finished
-      // save schedules this pass again.
-      if (!process_next_save_request_unsafe())
+      if (m_processing_saves.size() >= max_concurrent_processing || !process_next_save_request_unsafe())
         break;
     }
   }
@@ -439,17 +433,10 @@ SessionManager::process_save_request() {
   callback_pending_builds();
 }
 
-// Saves of one download share its fixed ".new" staging names: an overlapping
-// writer unlinks the other's staging files and can leave a torn triple, such
-// as a missing .rtorrent sidecar. Only one save per path runs; a later request
-// stays queued, where newer data can still replace it. Returns false when every
-// queued request waits for such an in-flight save.
 bool
 SessionManager::process_next_save_request_unsafe() {
-  auto next = std::find_if(m_save_requests.begin(), m_save_requests.end(), [this](const auto& queued) {
-      return std::none_of(m_processing_saves.begin(), m_processing_saves.end(), [&queued](const auto& running) {
-          return running.second.path == queued.path;
-        });
+  auto next = std::find_if(m_save_requests.begin(), m_save_requests.end(), [this](auto& req) {
+      return !m_processing_saves.contains(req.path);
     });
 
   if (next == m_save_requests.end())
@@ -460,17 +447,17 @@ SessionManager::process_next_save_request_unsafe() {
   m_save_requests.erase(next);
   m_save_request_counter = m_save_requests.size();
 
-  auto itr = m_processing_saves.insert(m_processing_saves.end(), ProcessingSave{});
+  auto itr = m_processing_saves.try_emplace(request.path).first;
   m_processing_save_counter = m_processing_saves.size();
 
-  itr->second = std::move(request);
-  itr->first = std::async(std::launch::async, [this, itr]() {
+  itr->second.second = std::move(request);
+  itr->second.first = std::async(std::launch::async, [this, itr]() {
       auto cleanup_fn = [this, itr]() {
           std::unique_lock<std::mutex> lock(m_mutex);
 
           callback_finished_saves();
 
-          m_finished_saves.push_back(std::move(*itr));
+          m_finished_saves.push_back(std::move(itr->second));
           m_finished_condition.notify_all();
 
           m_processing_saves.erase(itr);
@@ -480,10 +467,10 @@ SessionManager::process_next_save_request_unsafe() {
       int mode_error;
 
       try {
-        mode_error = DownloadStorer::save_and_move_streams(itr->second.path, m_use_fsyncdisk, file_mode(),
-                                                           itr->second.torrent_stream.get(),
-                                                           itr->second.rtorrent_stream.get(),
-                                                           itr->second.libtorrent_stream.get());
+        mode_error = DownloadStorer::save_and_move_streams(itr->first, m_use_fsyncdisk, file_mode(),
+                                                           itr->second.second.torrent_stream.get(),
+                                                           itr->second.second.rtorrent_stream.get(),
+                                                           itr->second.second.libtorrent_stream.get());
       } catch (...) {
         cleanup_fn();
         throw;
@@ -493,7 +480,7 @@ SessionManager::process_next_save_request_unsafe() {
       return mode_error;
     });
 
-  LT_LOG("started save of download : download:%p path:%s", itr->second.download, itr->second.path.c_str());
+  LT_LOG("started save of download : download:%p path:%s", itr->second.second.download, itr->first.c_str());
   return true;
 }
 
@@ -690,7 +677,7 @@ SessionManager::remove_completely_unsafe(core::Download* download, std::unique_l
   // This may block for a relatively long time if fdatasync is in use, however this is necessary.
   while (true) {
     auto itr = std::find_if(m_processing_saves.begin(), m_processing_saves.end(), [download](auto& req) {
-        return req.second.download == download;
+        return req.second.second.download == download;
       });
 
     if (itr == m_processing_saves.end())

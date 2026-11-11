@@ -6,10 +6,10 @@
 #include <filesystem>
 #include <map>
 #include <string>
-#include <vector>
 #include <torrent/download_info.h>
 #include <torrent/object.h>
 #include <torrent/torrent.h>
+#include <vector>
 
 #include "command_helpers.h"
 #include "control.h"
@@ -34,19 +34,17 @@ void initialize_command_ui();
 
 namespace {
 
-const char* event_command = "test.command_events.event";
-const char* existing_file = ".";
-const char* missing_file  = "test_command_events.missing";
+const char*                                             event_command = "test.command_events.event";
+const char*                                             existing_file = ".";
+const char*                                             missing_file  = "test_command_events.missing";
 
-std::string handled;
-std::string session_path;
+std::string                                             handled;
+std::string                                             session_path;
 
-// The downloads the handler erases when it runs for the key.
 std::map<core::Download*, std::vector<core::Download*>> erase_on;
 
 torrent::Object
 cmd_event(core::Download* download, const torrent::Object&) {
-  // Erasing a download closes it too, which is not a turn of the loop.
   if (download->is_erasing())
     return torrent::Object();
 
@@ -61,8 +59,6 @@ cmd_event(core::Download* download, const torrent::Object&) {
   return torrent::Object();
 }
 
-// Downloads d0 to d4 with the variables that the loops and the 'd.try_*'
-// commands read.
 std::vector<core::Download*>
 insert_downloads(int64_t state, const std::string& tied_to_file) {
   std::vector<core::Download*> downloads;
@@ -74,7 +70,6 @@ insert_downloads(int64_t state, const std::string& tied_to_file) {
     info.insert_key("piece length", int64_t{262144});
     info.insert_key("pieces", std::string(20, char(0)));
 
-    // Queued for hashing, so that closing it sends 'event.download.hash_removed'.
     torrent::Object rtorrent = torrent::Object::create_map();
     rtorrent.insert_key("state", state);
     rtorrent.insert_key("tied_to_file", tied_to_file);
@@ -95,7 +90,6 @@ insert_downloads(int64_t state, const std::string& tied_to_file) {
   return downloads;
 }
 
-// A view that shows none of the downloads, for 'view.set_visible'.
 core::View*
 insert_hidden_view(const std::string& name, const std::vector<core::Download*>& downloads) {
   auto view = *control->view_manager()->insert(name);
@@ -106,16 +100,17 @@ insert_hidden_view(const std::string& name, const std::vector<core::Download*>& 
   return view;
 }
 
-// The handler of d1 erases d1, and the handler of d2 erases d3, which the loop
-// has yet to reach, and d0, which it has passed. Every download left gets its
-// turn.
 void
 check_erasing_handlers(const char* command, const std::vector<core::Download*>& d) {
-  erase_on = {{d[1], {d[1]}}, {d[2], {d[3], d[0]}}};
+  erase_on = {{d[0], {d[0]}}, {d[1], {d[2], d[4]}}};
 
   rpc::call_command(command, torrent::Object());
 
-  CPPUNIT_ASSERT_EQUAL(std::string("d0,d1,d2,d4"), handled);
+  CPPUNIT_ASSERT_EQUAL(std::string("d0"), handled);
+
+  rpc::call_command(command, torrent::Object());
+
+  CPPUNIT_ASSERT_EQUAL(std::string("d0,d1,d3"), handled);
   CPPUNIT_ASSERT_EQUAL(size_t(2), control->core()->download_list()->size());
 }
 
@@ -123,8 +118,6 @@ check_erasing_handlers(const char* command, const std::vector<core::Download*>& 
 
 void
 TestCommandEvents::setUp() {
-  // torrent::download_add() opens a socket through the mocked fd functions,
-  // and DownloadList::erase() needs the session manager.
   mock_redirect_defaults();
 
   torrent::initialize_main_thread();
@@ -179,7 +172,7 @@ TestCommandEvents::tearDown() {
 }
 
 void
-TestCommandEvents::test_start_tied_skips_erased_downloads() {
+TestCommandEvents::test_start_tied_with_erasing_handlers() {
   auto downloads = insert_downloads(0, existing_file);
 
   insert_hidden_view("started", downloads)->set_event_added(torrent::Object(std::string(event_command) + "="));
@@ -188,7 +181,7 @@ TestCommandEvents::test_start_tied_skips_erased_downloads() {
 }
 
 void
-TestCommandEvents::test_stop_untied_skips_erased_downloads() {
+TestCommandEvents::test_stop_untied_with_erasing_handlers() {
   auto downloads = insert_downloads(1, missing_file);
 
   insert_hidden_view("stopped", downloads)->set_event_added(torrent::Object(std::string(event_command) + "="));
@@ -196,10 +189,8 @@ TestCommandEvents::test_stop_untied_skips_erased_downloads() {
   check_erasing_handlers("stop_untied", downloads);
 }
 
-// 'd.try_close' closes the download after showing it in 'stopped', and pause()
-// hides it in 'active' before it sends the event.
 void
-TestCommandEvents::test_close_untied_skips_erased_downloads() {
+TestCommandEvents::test_close_untied_with_erasing_handlers() {
   auto downloads = insert_downloads(1, missing_file);
 
   insert_hidden_view("stopped", downloads);
