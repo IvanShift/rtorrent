@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <sys/resource.h>
@@ -127,7 +128,8 @@ TestSessionManager::tearDown() {
   }
 
   m_downloads.clear();
-  ::rmdir(m_session_dir.c_str());
+  // Native saves also create the retrackers journal directory in it.
+  std::filesystem::remove_all(m_session_dir);
 
   torrent::cleanup();
 
