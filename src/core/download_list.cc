@@ -587,6 +587,9 @@ DownloadList::resume(Download* download, int flags) {
     return;
   }
 
+  if (download->is_hash_failed())
+    return;
+
   try {
     if (download->completion_deferred() && download->is_hash_checked() && download->is_done()) {
       // An explicit later Resume may discharge a retained notification. Its
@@ -611,11 +614,6 @@ DownloadList::resume(Download* download, int flags) {
     // It is also assumed the is_hash_checked flag gets cleared when
     // 'hashing' was set.
     if (!download->is_hash_checked()) {
-      // If the hash failed flag wasn't cleared then hashing won't be
-      // initiated.
-      if (download->is_hash_failed())
-        return;
-
       if (rpc::call_command_value("d.hashing", rpc::make_target(download)) == Download::variable_hashing_stopped)
         rpc::call_command("d.hashing.set", Download::variable_hashing_initial, rpc::make_target(download));
 
@@ -784,6 +782,13 @@ DownloadList::hash_done(Download* download) {
     auto& msg = download->download()->hash_error_message();
     if (!msg.empty())
       download->set_message(msg);
+
+    auto lifetime = download->lifetime();
+
+    control->view_manager()->find_ptr_throw("active")->set_not_visible(download);
+
+    if (lifetime.expired())
+      return;
 
     DL_TRIGGER_EVENT(download, "event.download.hash_failed");
     return;
