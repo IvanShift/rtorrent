@@ -7,16 +7,21 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <torrent/data/download_data.h>
 #include <torrent/download_info.h>
 #include <torrent/object.h>
+
 #include <torrent/torrent.h>
 #include <vector>
+
+#include <torrent/system/scheduler.h>
 
 #include "command_helpers.h"
 #include "control.h"
 #include "core/download.h"
 #include "core/download_list.h"
+#include "core/erasedata_intent.h"
 #include "core/incarnation.h"
 #include "core/manager.h"
 #include "core/retrackers_migration_pending.h"
@@ -36,6 +41,11 @@ void initialize_command_scheduler();
 void initialize_command_ui();
 
 namespace {
+
+// Expose the existing scheduler operation as a base-class member pointer.
+struct TestSchedulerAccess : torrent::system::Scheduler {
+  using torrent::system::Scheduler::perform;
+};
 
 const char*                                             event_command = "test.command_events.event";
 const char*                                             existing_file = ".";
@@ -163,6 +173,7 @@ TestCommandEvents::setUp() {
     CMD2_DL(event_command, &cmd_event);
     CMD2_DL("event.download.hash_removed", &cmd_event);
     CMD2_DL("event.download.hash_failed", &cmd_hash_failed);
+    CMD2_DL("event.download.finished", &cmd_event);
   }
 
   char temporary[] = "/tmp/rtorrent_test_command_events_XXXXXX";
@@ -267,14 +278,53 @@ TestCommandEvents::test_hash_failure_preserves_erasedata_refusal() {
   const auto hash = rpc::call_command_string("d.hash", rpc::make_target(download));
   std::filesystem::create_directory(session_path + "/.rutorrent-stop-intents");
   std::filesystem::permissions(session_path + "/.rutorrent-stop-intents", std::filesystem::perms::owner_all);
-  std::ofstream(session_path + "/.rutorrent-stop-intents/" + hash + ".erasedata") << "unreadable\n";
-  std::filesystem::permissions(session_path + "/.rutorrent-stop-intents/" + hash + ".erasedata",
-                               std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+  const auto path = session_path + "/.rutorrent-stop-intents/" + hash + ".erasedata";
+  const core::erasedata_intent::Record record{hash, std::string(32, 'a'), std::string(16, '1'),
+                                             "test", std::string(32, 'b'), std::string(64, 'c'), 'P'};
+  std::ofstream(path) << core::erasedata_intent::format(record);
+  std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
   download->set_hash_failed(true);
 
   control->core()->download_list()->resume(download, 0);
+  CPPUNIT_ASSERT_MESSAGE(download->message(), download->message().find("erasedata: recovery held: ") == 0);
+  CPPUNIT_ASSERT(download->message().find(hash + ".erasedata") != std::string::npos);
 
+  std::ofstream(path) << "unreadable\n";
+  download->set_message("");
+  control->core()->download_list()->resume(download, 0);
   CPPUNIT_ASSERT_MESSAGE(download->message(), download->message().find("erasedata: malformed-record; inspect ") == 0);
   CPPUNIT_ASSERT(download->message().find(hash + ".erasedata") != std::string::npos);
-  std::filesystem::remove(session_path + "/.rutorrent-stop-intents/" + hash + ".erasedata");
+  std::filesystem::remove(path);
+}
+
+void
+TestCommandEvents::test_hash_failure_keeps_deferred_completion() {
+  auto downloads = insert_downloads(1, missing_file);
+  auto download = downloads[0];
+  auto active = insert_hidden_view("active", {download});
+  download->file_list()->set_root_dir(session_path);
+  download->download()->open();
+  download->download()->set_bitfield(true);
+  auto saved_callback = download->data()->slot_initial_hash();
+  download->data()->slot_initial_hash() = [] {};
+  CPPUNIT_ASSERT(download->download()->hash_check(true));
+  auto perform = &TestSchedulerAccess::perform;
+  static_assert(std::is_same_v<decltype(perform), void (torrent::system::Scheduler::*)(torrent::system::Scheduler::time_type)>);
+  (torrent::this_thread::scheduler()->*perform)(torrent::this_thread::cached_time());
+  download->data()->slot_initial_hash() = saved_callback;
+  CPPUNIT_ASSERT(download->is_hash_checked());
+  CPPUNIT_ASSERT(download->is_done());
+  rpc::call_command("d.hashing.set", int64_t{0}, rpc::make_target(download));
+  download->set_completion_deferred(true);
+  download->set_hash_failed(true);
+  download->set_resume_flags(42);
+  handled.clear();
+  const auto visible = active->size();
+
+  control->core()->download_list()->resume(download, 0);
+
+  CPPUNIT_ASSERT(download->completion_deferred());
+  CPPUNIT_ASSERT(handled.empty());
+  CPPUNIT_ASSERT_EQUAL(visible, active->size());
+  CPPUNIT_ASSERT_EQUAL(uint32_t{42}, download->resume_flags());
 }

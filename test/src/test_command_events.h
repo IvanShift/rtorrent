@@ -11,6 +11,7 @@ class TestCommandEvents : public test_fixture {
   CPPUNIT_TEST(test_hash_failure_lets_scheduler_start_another);
   CPPUNIT_TEST(test_hash_failure_with_erasing_handler);
   CPPUNIT_TEST(test_hash_failure_preserves_erasedata_refusal);
+  CPPUNIT_TEST(test_hash_failure_keeps_deferred_completion);
 
   CPPUNIT_TEST_SUITE_END();
 
@@ -25,4 +26,5 @@ public:
   void test_hash_failure_lets_scheduler_start_another();
   void test_hash_failure_with_erasing_handler();
   void test_hash_failure_preserves_erasedata_refusal();
+  void test_hash_failure_keeps_deferred_completion();
 };
