@@ -78,7 +78,7 @@ inline bool parse(const std::string& bytes, Record* output) {
 }
 
 inline std::string path(const std::string& session, const std::string& hash, const std::string& suffix) {
-  return session_path_child(session, ".rutorrent-stop-intents/" + hash + suffix);
+  return stop_intent::intent_path(session, hash + suffix);
 }
 
 [[noreturn]] inline void fail(const std::string& reason, const std::string& document) {
@@ -87,6 +87,11 @@ inline std::string path(const std::string& session, const std::string& hash, con
 
 inline int directory(const std::string& session, bool create) {
   try { return stop_intent::open_directory(session, create); }
+  catch (const std::exception& error) { throw torrent::input_error(std::string("erasedata: ") + error.what()); }
+}
+
+inline SidecarDirectory read_directory(const std::string& session) {
+  try { return stop_intent::read_directory(session); }
   catch (const std::exception& error) { throw torrent::input_error(std::string("erasedata: ") + error.what()); }
 }
 
@@ -116,9 +121,8 @@ inline int lock(const std::string& session, const std::string& hash, bool create
   check_hash(hash);
   if (session.empty() && !create) return -1;
   if (session.empty()) throw torrent::input_error("erasedata: session-directory-required");
-  const int opened_directory = directory(session, create);
-  if (opened_directory < 0) return -1;
-  SessionPathFd dir(opened_directory);
+  const auto dir = create ? SidecarDirectory(directory(session, true), true) : read_directory(session);
+  if (dir.get() < 0) return -1;
   const auto name = hash + ".erasedata.lock";
   const auto document = path(session, hash, ".erasedata.lock");
   bool created = false;
@@ -176,10 +180,8 @@ inline bool read_at(int dir, const std::string& session, const std::string& hash
 inline bool read(const std::string& session, const std::string& hash, Record* output) {
   check_hash(hash);
   if (session.empty()) return false;
-  const int opened = directory(session, false);
-  if (opened < 0) return false;
-  SessionPathFd dir(opened);
-  return read_at(dir.get(), session, hash, output);
+  const auto dir = read_directory(session);
+  return dir.get() >= 0 && read_at(dir.get(), session, hash, output);
 }
 
 // The caller holds the stable lock across all record and destructive operations.
@@ -201,7 +203,7 @@ inline void write(const std::string& session, const std::string& hash, const Rec
   SessionPathFd file(opened);
   temporary.owned = true;
   if (::fchmod(file.get(), 0600) != 0) fail("record-stage-failed", document);
-  attest_file(file.get(), session_path_child(session, ".rutorrent-stop-intents/" + temporary.name), true);
+  attest_file(file.get(), stop_intent::intent_path(session, temporary.name), true);
   const auto bytes = format(record);
   size_t offset = 0;
   while (offset < bytes.size()) {

@@ -1,13 +1,17 @@
 #ifndef RTORRENT_CORE_MANAGER_H
 #define RTORRENT_CORE_MANAGER_H
 
+#include <chrono>
 #include <iosfwd>
 #include <memory>
 #include <vector>
 #include <torrent/utils/log_buffer.h>
 #include <torrent/object.h>
+#include <torrent/system/scheduler.h>
 
 #include "download_list.h"
+
+class TestCommandEvents;
 
 namespace torrent {
   class Bencode;
@@ -80,6 +84,8 @@ public:
       std::unique_ptr<torrent::Object> bencode, const std::string& metafile);
 
 private:
+  static constexpr auto hashing_slice_delay = std::chrono::milliseconds(1);
+
   void                create_http(const std::string& uri);
   void                create_final(std::istream* s);
 
@@ -93,6 +99,21 @@ private:
   std::unique_ptr<HttpQueue>       m_http_queue;
 
   View*               m_hashingView{};
+
+  // Fork-only: the next-pass continuation of a start-up walk (pieces.hash.slice_yield) and the
+  // one startup-load record per process (doc/manual/startup-hashing.md).
+  friend class ::TestCommandEvents;
+
+  void                startup_record_walk(std::chrono::microseconds begin, int opened, bool finished);
+  void                startup_record_write();
+
+  torrent::system::SchedulerEntry m_task_hashing_slice;
+  torrent::system::SchedulerEntry m_task_startup_record;
+  std::chrono::microseconds       m_startup_begin{};
+  std::string                     m_startup_settings;
+  uint32_t                        m_startup_downloads{};
+  uint32_t                        m_startup_slices{};
+  bool                            m_startup_written{};
 
   ThrottleMap         m_throttles;
 

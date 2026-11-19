@@ -5,6 +5,7 @@
 #include <torrent/exceptions.h>
 #include <torrent/utils/string_manip.h>
 
+#include "core/session_path.h"
 #include "parse_commands.h"
 #include "rpc/rpc_manager.h"
 
@@ -111,6 +112,9 @@ RpcManager::object_to_target(const torrent::Object& obj, int call_flags, rpc::ta
 
 bool
 RpcManager::process(RPCType type, const char* in_buffer, uint32_t length, slot_response_callback callback) {
+  // Requests run after the event wait; nothing the pass held before it carries over.
+  core::session_directory_end();
+
   switch (type) {
   case RPCType::XML:
     if (!m_xmlrpc.is_valid() || !m_use_xmlrpc) {

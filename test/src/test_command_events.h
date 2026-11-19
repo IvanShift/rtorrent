@@ -12,6 +12,13 @@ class TestCommandEvents : public test_fixture {
   CPPUNIT_TEST(test_hash_failure_with_erasing_handler);
   CPPUNIT_TEST(test_hash_failure_preserves_erasedata_refusal);
   CPPUNIT_TEST(test_hash_failure_keeps_deferred_completion);
+  CPPUNIT_TEST(test_hash_done_skips_unchanged_resume_save);
+  CPPUNIT_TEST(test_walk_waits_for_quick_checked_download);
+  CPPUNIT_TEST(test_hash_done_keeps_files_the_walk_opened);
+  CPPUNIT_TEST(test_startup_record_guards);
+  CPPUNIT_TEST(test_startup_record_clamps_slice_ms);
+
+  CPPUNIT_TEST(test_journal_readers_in_session_pass);
 
   CPPUNIT_TEST_SUITE_END();
 
@@ -27,4 +34,10 @@ public:
   void test_hash_failure_with_erasing_handler();
   void test_hash_failure_preserves_erasedata_refusal();
   void test_hash_failure_keeps_deferred_completion();
+  void test_hash_done_skips_unchanged_resume_save();
+  void test_walk_waits_for_quick_checked_download();
+  void test_hash_done_keeps_files_the_walk_opened();
+  void test_startup_record_guards();
+  void test_startup_record_clamps_slice_ms();
+  void test_journal_readers_in_session_pass();
 };

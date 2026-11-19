@@ -4,6 +4,7 @@
 
 #include "core/manager.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -16,10 +17,12 @@
 #include <torrent/exceptions.h>
 #include <torrent/object_stream.h>
 #include <torrent/throttle.h>
+#include <torrent/data/file_manager.h>
 #include <torrent/net/http_stack.h>
 #include <torrent/net/socket_address.h>
 #include <torrent/runtime/network_config.h>
 #include <torrent/runtime/network_manager.h>
+#include <torrent/utils/chrono.h>
 #include <torrent/utils/log.h>
 #include <torrent/utils/string_manip.h>
 
@@ -61,6 +64,9 @@ Manager::Manager()
   torrent::Throttle* unthrottled = torrent::Throttle::create_throttle();
   unthrottled->set_max_rate(0);
   m_throttles["NULL"] = std::make_pair(unthrottled, unthrottled);
+
+  m_task_hashing_slice.slot()  = [this]() { receive_hashing_changed(); };
+  m_task_startup_record.slot() = [this]() { startup_record_write(); };
 }
 
 Manager::~Manager() {
@@ -147,6 +153,9 @@ void
 Manager::cleanup() {
   // Need to disconnect log signals? Not really since we won't receive
   // any more.
+
+  torrent::this_thread::scheduler()->erase(&m_task_hashing_slice);
+  torrent::this_thread::scheduler()->erase(&m_task_startup_record);
 
   m_download_list->clear();
 
@@ -385,6 +394,47 @@ Manager::try_create_download_expand(const std::string& uri, int flags, command_l
     try_create_download(uri, flags, commands);
 }
 
+static int64_t
+hashing_slice_ms() {
+  return std::clamp<int64_t>(rpc::call_command_value("pieces.hash.slice_ms"), 0, 60000);
+}
+
+void
+Manager::startup_record_walk(std::chrono::microseconds begin, int opened, bool finished) {
+  if (m_startup_written)
+    return;
+
+  if (m_startup_settings.empty())
+    m_startup_settings = "slice_ms=" + std::to_string(hashing_slice_ms()) +
+                         " slice_yield=" + std::to_string(rpc::call_command_value("pieces.hash.slice_yield")) +
+                         " skip_unchanged_save=" + std::to_string(rpc::call_command_value("pieces.hash.skip_unchanged_save"));
+
+  if (opened != 0) {
+    if (m_startup_slices++ == 0)
+      m_startup_begin = begin;
+
+    m_startup_downloads += opened;
+  }
+
+  if (finished)
+    torrent::this_thread::scheduler()->update_wait_for(&m_task_startup_record, hashing_slice_delay);
+}
+
+void
+Manager::startup_record_write() {
+  if (m_task_hashing_slice.is_scheduled() || control->is_shutdown_received() || control->is_shutdown_started())
+    return;
+
+  m_startup_written = true;
+
+  auto total = m_startup_slices == 0 ? 0 : (torrent::utils::time_since_epoch() - m_startup_begin).count() / 1000;
+
+  lt_log_print(torrent::LOG_ERRORS, "startup-load: %s downloads=%u slices=%u total_ms=%lld files_opened=%llu files_closed=%llu",
+               m_startup_settings.c_str(), m_startup_downloads, m_startup_slices, (long long)total,
+               (unsigned long long)torrent::file_manager()->files_opened_counter(),
+               (unsigned long long)torrent::file_manager()->files_closed_counter());
+}
+
 // DownloadList's hashing related functions don't actually start the
 // hashing, it only reacts to events. This functions checks the
 // hashing view and starts hashing if nessesary.
@@ -392,8 +442,23 @@ void
 Manager::receive_hashing_changed() {
   constexpr auto hashing_failed_message = "Hashing failed: ";
 
-  bool foundHashing = std::any_of(m_hashingView->begin_visible(), m_hashingView->end_visible(),
-                                   std::mem_fn(&Download::is_hash_checking));
+  if (m_task_hashing_slice.is_scheduled())
+    return;
+
+  bool foundHashing = false;
+
+  for (View::iterator itr = m_hashingView->begin_visible(), last = m_hashingView->end_visible(); itr != last; ++itr) {
+    if ((*itr)->is_hash_checking() && (*itr)->is_quick_hashed())
+      return;
+
+    foundHashing = foundHashing || (*itr)->is_hash_checking();
+  }
+
+  auto walk_begin = torrent::utils::time_since_epoch();
+  auto budget     = std::chrono::milliseconds(hashing_slice_ms());
+  bool yield      = rpc::call_command_value("pieces.hash.slice_yield");
+  int  quick      = 0;
+  int  opened     = 0;
 
   // Try quick hashing all those with hashing == initial, set them to
   // something else when failed.
@@ -412,11 +477,22 @@ Manager::receive_hashing_changed() {
       continue;
 
     try {
+      if ((yield ? opened : quick) != 0 && budget.count() != 0 && torrent::utils::time_since_epoch() >= walk_begin + budget) {
+        if (yield)
+          torrent::this_thread::scheduler()->wait_for(&m_task_hashing_slice, hashing_slice_delay);
+
+        startup_record_walk(walk_begin, opened, false);
+        return;
+      }
+
       // P may have been prepared by a hash-queued callback. Keep that queue
       // pending without treating an intentional hold as a failed hash.
       if (erasedata_lifecycle::activity_held(itr->get())) continue;
       if (!stop_intent::held(itr->get()).empty() &&
           !stop_intent::terminal_activity_allowed(itr->get())) continue;
+
+      bool closed = !(*itr)->is_open();
+      opened += closed;
       m_download_list->open_throw(itr->get());
 
       // An open that works retires the failure an earlier pass reported.
@@ -431,8 +507,11 @@ Manager::receive_hashing_changed() {
         torrent::resume_load_progress(*(*itr)->download(), (*itr)->download()->bencode()->get_key("libtorrent_resume"));
 
       if (tryQuick) {
-        if ((*itr)->download()->hash_check(true))
+        if ((*itr)->download()->hash_check(true)) {
+          (*itr)->set_quick_hashed(true, closed);
+          quick++;
           continue;
+        }
 
         (*itr)->download()->hash_stop();
 
@@ -442,6 +521,7 @@ Manager::receive_hashing_changed() {
         }
       }
 
+      (*itr)->set_quick_hashed(false);
       (*itr)->download()->hash_check(false);
       foundHashing = true;
 
@@ -459,6 +539,8 @@ Manager::receive_hashing_changed() {
       }
     }
   }
+
+  startup_record_walk(walk_begin, opened, true);
 }
 
 }

@@ -810,40 +810,42 @@ std::string rr_candidate_ready_marker(const RrMigrationCapsule& state) {
                      "v1:candidate-ready:") + state.tx;
 }
 
+constexpr const char* rr_journal_directory = ".retrackers-migration";
+
 // Both the journal and ordinary session files must resolve through trusted ancestors.
-int rr_session_dir() {
+template <typename Open>
+auto rr_session_open(Open&& open) {
   const std::string path = rpc::call_command_string("session.path");
   if (path.empty())
     throw torrent::input_error("RR migration requires a session directory.");
-  try { return core::open_trusted_session_directory(path); }
+  try { return open(path); }
   catch (const std::runtime_error& e) {
     throw torrent::input_error(std::string("RR migration session path refused: ") + e.what());
   }
 }
 
-// Prototype journal is daemon-owned and keyed only by the daemon's info hash.
-// An outstanding journal needs explicit reconciliation before a production API can use it.
-int rr_migration_dir(bool create = true) {
-  const int session = rr_session_dir();
+int rr_session_dir() {
+  return rr_session_open([](const std::string& path) { return core::open_trusted_session_directory(path); });
+}
+
+// Opens and attests the journal directory below the open session directory:
+// -1 when it is missing and not created; `identity` gets its stat.
+int rr_journal_dir_at(int session, bool create, struct stat* identity = nullptr) {
   const std::string journal_path = core::session_path_child(
-      session_thread::manager()->path(), ".retrackers-migration");
+      session_thread::manager()->path(), rr_journal_directory);
   if (create) {
-    const int made = ::mkdirat(session, ".retrackers-migration", 0700);
+    const int made = ::mkdirat(session, rr_journal_directory, 0700);
     if (made < 0 && errno != EEXIST) {
       const int error = errno;
-      ::close(session);
       throw torrent::input_error("RR migration cannot create journal directory: " + journal_path +
           ": " + std::strerror(error));
     }
-    if (made == 0 && ::fsync(session) < 0) {
-      ::close(session);
+    if (made == 0 && ::fsync(session) < 0)
       throw torrent::input_error("RR migration journal parent fsync failed: " + journal_path +
           "; source retained.");
-    }
   }
-  const int dir = ::openat(session, ".retrackers-migration", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  const int dir = ::openat(session, rr_journal_directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   const int open_error = errno;
-  ::close(session);
   if (!create && dir < 0 && open_error == ENOENT) return -1;
   if (dir < 0)
     throw torrent::input_error("RR migration cannot open journal directory: " + journal_path +
@@ -855,13 +857,33 @@ int rr_migration_dir(bool create = true) {
     throw torrent::input_error("RR migration cannot inspect journal directory: " + journal_path +
         ": " + std::strerror(error));
   }
-  if (!S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
+  if (!core::private_sidecar_directory(st)) {
     ::close(dir);
     throw torrent::input_error("RR migration journal directory has unsafe ownership or mode: " +
         journal_path + " " + core::session_path_metadata(st) + "; require uid=" +
         std::to_string(::geteuid()) + " mode=0700 (setgid is allowed)");
   }
+  if (identity) *identity = st;
   return dir;
+}
+
+// Prototype journal is daemon-owned and keyed only by the daemon's info hash.
+// An outstanding journal needs explicit reconciliation before a production API can use it.
+// The writable gateway: a descriptor of its own, the directory created when missing.
+int rr_migration_dir() {
+  core::session_sidecar_created(rr_journal_directory);
+  const core::SessionPathFd session(rr_session_dir());
+  return rr_journal_dir_at(session.get(), true);
+}
+
+// The read-only gateway: never creates the directory; on the main thread it
+// returns the session directory pass's descriptor.
+core::SidecarDirectory rr_migration_read_dir() {
+  return rr_session_open([](const std::string& path) {
+    return core::read_session_sidecar(path, rr_journal_directory, [](int session, struct stat* identity) {
+      return rr_journal_dir_at(session, false, identity);
+    });
+  });
 }
 
 torrent::Object rr_migration_encode(const RrMigrationCapsule& state) {
@@ -1040,9 +1062,9 @@ void rr_migration_publish(const RrMigrationCapsule& state, core::Download* sourc
 }
 
 std::string rr_migration_read_bytes(const std::string& filename, size_t max_size) {
-  const int dir = rr_migration_dir();
-  const int fd = ::openat(dir, filename.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
-  ::close(dir);
+  const auto dir = rr_migration_read_dir();
+  const int fd = dir.get() < 0 ? -1 :
+      ::openat(dir.get(), filename.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   struct stat st;
   if (fd < 0 || ::fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
       st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0600 ||
@@ -1343,7 +1365,7 @@ torrent::Object rr_migration_rollback(const std::string& hash) {
   }
   std::string path = rpc::call_command_string("session.path");
   if (path.back() != '/') path += '/';
-  path += ".retrackers-migration/" + hash + ".rollback.torrent";
+  path += std::string(rr_journal_directory) + "/" + hash + ".rollback.torrent";
   auto* factory = new core::DownloadFactory(control->core());
   factory->set_session(true);
   factory->set_retrackers_rollback_hash(hash);
@@ -2015,8 +2037,8 @@ bool rr_journal_exists_at(int dir, const std::string& name, const char* error_me
 }
 
 bool rr_journal_exists(const std::string& name, const char* error_message) {
-  const core::SessionPathFd dir(rr_migration_dir());
-  return rr_journal_exists_at(dir.get(), name, error_message);
+  const auto dir = rr_migration_read_dir();
+  return dir.get() >= 0 && rr_journal_exists_at(dir.get(), name, error_message);
 }
 
 // A failed publication may leave its first durable file before .benc exists.
@@ -2132,7 +2154,7 @@ uint64_t rr_late_save_to_prefix(core::Download* download, const std::string& pre
     {".torrent", torrent_stream->str()},
     {".torrent.rtorrent", rtorrent_stream->str()},
     {".torrent.libtorrent_resume", resume_stream->str()}};
-  const std::string journal = session_thread::manager()->path() + ".retrackers-migration/";
+  const std::string journal = session_thread::manager()->path() + rr_journal_directory + "/";
   // Journal copies stay 0600 for rr_migration_read_bytes(); only the ordinary
   // triple follows session.umask.set.
   for (char slot : {'a', 'b'})
@@ -2531,11 +2553,11 @@ std::set<std::string> rr_unproven_finalized_receipts;
 
 bool rr_release_present(const std::string& hash) {
   if (rr_unproven_release_receipts.count(hash)) return false;
-  const int dir = rr_migration_dir();
+  const auto dir = rr_migration_read_dir();
+  if (dir.get() < 0) return false;
   struct stat st;
-  const int found = ::fstatat(dir, (hash + ".released.receipt").c_str(), &st, AT_SYMLINK_NOFOLLOW);
+  const int found = ::fstatat(dir.get(), (hash + ".released.receipt").c_str(), &st, AT_SYMLINK_NOFOLLOW);
   const int lookup_error = errno;
-  ::close(dir);
   if (found == 0) return true;
   if (lookup_error == ENOENT) return false;
   throw torrent::input_error("RR release receipt presence cannot be checked.");
@@ -2931,7 +2953,7 @@ torrent::Object rr_release_owner(core::Download* owner,
       {".torrent", torrent_stream->str()},
       {".torrent.rtorrent", rtorrent_stream->str()},
       {".torrent.libtorrent_resume", resume_stream->str()}};
-    const std::string journal = session_thread::manager()->path() + ".retrackers-migration/";
+    const std::string journal = session_thread::manager()->path() + rr_journal_directory + "/";
     // A journal copy: the default 0600 that rr_migration_read_bytes() admits.
     session::DownloadStorer::save_and_move_streams(journal + old_hash + ".released.torrent",
         true, 0, torrent_stream.get(), rtorrent_stream.get(), resume_stream.get());
@@ -4130,11 +4152,11 @@ void retrackers_migration_remove_temporaries_startup() {
 
 std::string retrackers_migration_target_source(const std::string& hash) {
   if (hash.size() != 40 || rpc::call_command_string("session.path").empty()) return {};
-  const int dir = rr_migration_dir();
+  const auto dir = rr_migration_read_dir();
+  if (dir.get() < 0) return {};
   struct stat st;
-  const int found = ::fstatat(dir, (hash + ".target").c_str(), &st, AT_SYMLINK_NOFOLLOW);
+  const int found = ::fstatat(dir.get(), (hash + ".target").c_str(), &st, AT_SYMLINK_NOFOLLOW);
   const int lookup_error = errno;
-  ::close(dir);
   if (found < 0 && lookup_error == ENOENT) return {};
   const std::string bytes = rr_migration_read_bytes(hash + ".target", 128);
   if (bytes.size() != 41 || bytes.back() != '\n' ||
@@ -4221,13 +4243,12 @@ std::string retrackers_migration_candidate_digest(const std::string& hash) {
 
 bool retrackers_migration_pending(const std::string& hash) {
   if (rpc::call_command_string("session.path").empty()) return false;
-  const int dir = rr_migration_dir(false);
-  if (dir < 0) return false;
+  const auto dir = rr_migration_read_dir();
+  if (dir.get() < 0) return false;
   struct stat st;
-  const int found = ::fstatat(dir, (hash + ".rollback.torrent").c_str(),
+  const int found = ::fstatat(dir.get(), (hash + ".rollback.torrent").c_str(),
                                &st, AT_SYMLINK_NOFOLLOW);
   const int lookup_error = errno;
-  ::close(dir);
   if (found < 0 && lookup_error != ENOENT)
     throw torrent::input_error("RR pending snapshot presence cannot be checked.");
   return found == 0 && !rr_migration_receipt_present(hash);

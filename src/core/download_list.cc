@@ -551,7 +551,7 @@ DownloadList::close_throw(Download* download) {
 }
 
 void
-DownloadList::resume(Download* download, int flags) {
+DownloadList::resume(Download* download, int flags, bool keep_files) {
   // Refuse before the catch below hides the refusal of the view change.
   View::check_unlocked();
   check_contains(download);
@@ -671,7 +671,7 @@ DownloadList::resume(Download* download, int flags) {
     // Update the priority to ensure it has the correct
     // seeding/unfinished modifiers.
     download->set_priority(download->priority());
-    download->download()->start(download->resume_flags());
+    download->download()->start(keep_files ? download->resume_flags() | torrent::Download::start_keep_files : download->resume_flags());
 
     // A start that works retires the failure an earlier resume reported.
     if (download->message().starts_with(resume_failed_message))
@@ -841,12 +841,15 @@ DownloadList::hash_done(Download* download) {
     // Save resume data so we update time-stamps and priorities if
     // they were invalid/changed while loading/hashing.
     rpc::call_command("d.complete.set", (int64_t)download->is_done(), rpc::make_target(download));
-    torrent::resume_save_progress(*download->download(), download->download()->bencode()->get_key("libtorrent_resume"));
+
+    if (!download->is_quick_hashed() || !rpc::call_command_value("pieces.hash.skip_unchanged_save") ||
+        !torrent::resume_progress_unchanged(*download->download(), download->download()->bencode()->get_key("libtorrent_resume")))
+      torrent::resume_save_progress(*download->download(), download->download()->bencode()->get_key("libtorrent_resume"));
 
     if (rpc::call_command_value("d.state", rpc::make_target(download)) == 1) {
       auto lifetime = download->lifetime();
 
-      resume(download, download->resume_flags());
+      resume(download, download->resume_flags(), download->is_quick_hashed_after_open());
 
       if (lifetime.expired())
         return;

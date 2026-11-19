@@ -4,6 +4,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <inttypes.h>
 #include <typeinfo>
 #include <unistd.h>
@@ -40,6 +41,7 @@
 
 #include "control.h"
 #include "core/retrackers_process_pool.h"
+#include "core/session_path.h"
 #include "command_helpers.h"
 #include "globals.h"
 #include "setup.h"
@@ -92,6 +94,9 @@ initialize_rpc_slots() {
 
 static void
 client_perform() {
+  // Main-thread callbacks and scheduled tasks of this iteration start a new
+  // session directory pass.
+  core::session_directory_end();
   core::retrackers_process_pool::reap();
   // Use throw exclusively.
   if (control->is_shutdown_completed())
@@ -175,6 +180,7 @@ main(int argc, char** argv) {
 
     torrent::initialize();
     torrent::main_thread::set_client_callback(&client_perform);
+    core::session_directory_pass().serve(std::this_thread::get_id());
 
     scgi::ThreadScgi::create_thread();
     session::ThreadSession::create_thread();

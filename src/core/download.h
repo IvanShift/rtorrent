@@ -24,7 +24,7 @@ public:
   typedef torrent::ConnectionList       connection_list_type;
   typedef download_type::ConnectionType connection_type;
 
-  static constexpr uint32_t default_resume_flags = ~uint32_t{} & ~torrent::Download::open_enable_fallocate;
+  static constexpr uint32_t default_resume_flags = ~uint32_t{} & ~torrent::Download::open_enable_fallocate & ~torrent::Download::start_keep_files;
 
   static const int variable_hashing_stopped = 0;
   static const int variable_hashing_initial = 1;
@@ -52,6 +52,8 @@ public:
   bool                is_hash_checking() const                 { return m_download.is_hash_checking(); }
 
   bool                is_hash_failed() const                   { return m_hashFailed; }
+  bool                is_quick_hashed() const                  { return m_quickHashed; }
+  bool                is_quick_hashed_after_open() const       { return m_quickHashedAfterOpen; }
 
   // Expires once the download is erased, even if other owners keep the
   // object alive. Take it before triggering events that may erase.
@@ -70,6 +72,7 @@ public:
   bool                is_erasing() const                       { return m_erasing; }
   void                set_erasing()                            { m_erasing = true; }
   void                set_hash_failed(bool v)                  { m_hashFailed = v; }
+  void                set_quick_hashed(bool v, bool opened = false) { m_quickHashed = v; m_quickHashedAfterOpen = opened; }
 
   download_type*       download()                              { return &m_download; }
   const download_type* c_download() const                      { return &m_download; }
@@ -121,6 +124,8 @@ private:
   // Store the FileList instance so we can use slots etc on it.
   download_type       m_download;
   bool                m_hashFailed{};
+  bool                m_quickHashed{};
+  bool                m_quickHashedAfterOpen{};
   bool                m_erasing{};
   bool                m_insertionDeferred{};
   bool                m_completionDeferred{};

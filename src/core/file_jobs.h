@@ -137,7 +137,7 @@ inline void startup(const std::string& session) {
     }
     catch(const std::exception&) {
       held[hash]="record-malformed";
-      lt_log_print(torrent::LOG_ERRORS,"autotools: move %s held: record-malformed; inspect %s/.rutorrent-stop-intents/%s.move",hash.c_str(),session.c_str(),hash.c_str());
+      lt_log_print(torrent::LOG_ERRORS,"autotools: move %s held: record-malformed; inspect %s/%s/%s.move",hash.c_str(),session.c_str(),stop_intent::intent_directory,hash.c_str());
     }
   }
 }
@@ -151,7 +151,7 @@ inline std::string message(const std::string& session,const std::string& hash) {
     return retry.terminal() ? "autotools: move retries exhausted: "+retry.reason+"; inspect journal and reset with tools/autotools-move-reset.php "+hash+" --apply" :
         "autotools: move waiting: "+retry.reason+"; retried automatically";
   } catch(const std::exception&) {
-    return "autotools: move held: record-malformed; inspect "+session+"/.rutorrent-stop-intents/"+hash+".move";
+    return "autotools: move held: record-malformed; inspect "+session+"/"+stop_intent::intent_directory+"/"+hash+".move";
   }
 }
 inline void erase_download(core::Download* owner) {

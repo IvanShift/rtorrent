@@ -111,6 +111,10 @@ initialize_command_local() {
 
   CMD_ANY         ("pieces.hash.queue_size",          std::bind(&torrent::main_thread::hash_queue_size));
   CMD_VAR_BOOL    ("pieces.hash.on_completion",       true);
+  // Fork-only start-up switches, see doc/manual/startup-hashing.md.
+  CMD_VAR_VALUE   ("pieces.hash.slice_ms",            100);
+  CMD_VAR_BOOL    ("pieces.hash.slice_yield",         false);
+  CMD_VAR_BOOL    ("pieces.hash.skip_unchanged_save", true);
 
   CMD_VAR_STRING  ("directory.default",               "./");
   CMD_ANY         ("directory.default.realpath.or_empty", [](auto, auto)    { return resolve_path(rpc::call_command_string("directory.default")); });

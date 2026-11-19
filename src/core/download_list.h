@@ -91,7 +91,7 @@ public:
   void                close_quick(Download* d);
   void                close_throw(Download* d);
 
-  void                resume(Download* d, int flags = 0);
+  void                resume(Download* d, int flags = 0, bool keep_files = false);
   void                pause(Download* d, int flags = 0);
 
   void                resume_default(Download* d) { resume(d); }

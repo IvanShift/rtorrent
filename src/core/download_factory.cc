@@ -32,6 +32,7 @@
 #include "core/download.h"
 #include "core/http_queue.h"
 #include "core/manager.h"
+#include "core/session_path.h"
 #include "rpc/parse_commands.h"
 
 namespace core {
@@ -224,6 +225,11 @@ DownloadFactory::receive_commit() {
 
 void
 DownloadFactory::receive_success() {
+  // Each load is a unit of work: check() ends the pass when a walk now would
+  // refuse or find other directories than the pass holds, so this load walks
+  // again, refusing or following as a walk does.
+  session_directory_check();
+
   bool session_invalid = false;
 
   std::unique_ptr<torrent::Object> rtorrent_object;

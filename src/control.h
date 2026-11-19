@@ -8,6 +8,8 @@
 #include <torrent/torrent.h>
 #include <torrent/system/scheduler.h>
 
+class TestCommandEvents;
+
 namespace ui {
   class Root;
 }
@@ -85,6 +87,9 @@ public:
   void                set_working_directory(const std::string& dir);
 
 private:
+  // Fork-only: the startup-load record test sets the shutdown flags.
+  friend class ::TestCommandEvents;
+
   Control(const Control&);
   void operator = (const Control&);
 

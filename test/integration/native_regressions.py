@@ -553,6 +553,288 @@ def unsafe_async_path(daemon):
     ancestor.chmod(0o755)
 
 
+
+def blocking_hook(daemon, name):
+    # A hook that holds the main thread inside its current pass until the test
+    # creates <name>-go; <name>-held says it is holding.
+    script = daemon.directory / (name + '.sh')
+    script.write_text('touch /data/%s-held; i=0\n'
+                      'while [ ! -e /data/%s-go ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done\n'
+                      % (name, name))
+    return 'execute.nothrow=sh,/data/' + name + '.sh'
+
+
+def wait_file(daemon, name):
+    daemon.wait(lambda: (daemon.directory / name).exists(), name, timeout=20)
+
+
+def untrusted_uid():
+    # The actor is a different Unix UID; same-UID processes remain trusted.
+    return 1001 if os.getuid() != 1001 else 1002
+
+
+def move_session_below_ancestor(daemon):
+    daemon.stop()
+    ancestor = daemon.directory / 'ancestor'
+    ancestor.mkdir(mode=0o755)
+    daemon.session.rename(ancestor / '.session')
+    daemon.session = ancestor / '.session'
+    rc = daemon.directory / 'test.rc'
+    rc.write_text(rc.read_text().replace('session.path.set=/data/.session',
+                                         'session.path.set=/data/ancestor/.session'))
+    return ancestor
+
+
+def pass_external_writer(daemon):
+    # The SB-09 image gate inside one pass: a scheduled command reads the stop
+    # intents of every download, then holds the main thread while a writer
+    # outside the daemon (same UID) records the stop counter of an erased hash,
+    # then loads that hash in the same pass. The load must take the recorded
+    # generation, so the torrent still runs after a restart.
+    hash_ = daemon.fixture('pass-writer')
+    daemon.fixture('pass-writer-unrelated')
+    (daemon.directory / 'pass-reload.torrent').write_bytes((daemon.directory / 'pass-writer.torrent').read_bytes())
+    daemon.call('d.stop', hash_)
+    daemon.call('d.start', hash_)
+    daemon.call('d.erase', hash_)
+    journal = daemon.session / '.rutorrent-stop-intents' / hash_
+    assert not journal.exists()
+    daemon.call('method.insert', '', 'pass.writer', 'simple',
+                'd.multicall2=main,d.stop_generation=;' + blocking_hook(daemon, 'writer') +
+                ';load.start=/data/pass-reload.torrent')
+    daemon.call('schedule', '', 'pass_writer', '0', '0', 'pass.writer=')
+    wait_file(daemon, 'writer-held')
+    journal.write_bytes(b'0000000000000008\n')
+    journal.chmod(0o600)
+    (daemon.directory / 'writer-go').touch()
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_, 'same-pass reload')
+    daemon.call('session.save')
+    saved = daemon.session / (hash_ + '.torrent.rtorrent')
+    daemon.wait(lambda: b'15:stop_generation' in saved.read_bytes(), 'session save')
+    data = saved.read_bytes()
+    begin = data.index(b'15:stop_generationi') + 19
+    assert data[begin:data.index(b'e', begin)] == b'8', 'saved stop_generation ' + data[begin:begin + 20].decode()
+    daemon.stop()
+    daemon.start()
+    assert daemon.call('d.state', hash_) == 1
+
+
+def pass_rpc_boundary(daemon):
+    # An RPC request runs after the event wait of the iteration whose scheduled
+    # work pinned the session directory. It must walk again: a directory that
+    # another UID replaced under a writable ancestor during the wait is refused.
+    ancestor = move_session_below_ancestor(daemon)
+    daemon.start()
+    hash_ = daemon.fixture('rpc-boundary')
+    daemon.call('method.insert', '', 'pass.pin', 'simple',
+                'd.multicall2=main,d.stop_generation=;' + blocking_hook(daemon, 'pin'))
+    daemon.call('schedule', '', 'pass_pin', '0', '0', 'pass.pin=')
+    wait_file(daemon, 'pin-held')
+    ancestor.chmod(0o777)
+    untrusted = untrusted_uid()
+    docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'sh', '-c',
+           'mv /data/ancestor/.session /data/ancestor/.original-session && '
+           'mkdir -m 0700 /data/ancestor/.session')
+    (daemon.directory / 'pin-go').touch()
+    time.sleep(.3)  # The main thread finishes the scheduled work and waits for events.
+    try:
+        token = daemon.call('d.stop_generation', hash_)
+        raise AssertionError('RPC used the pass of the scheduled work: ' + token)
+    except xmlrpc.client.Fault as fault:
+        assert 'unsafe session path ancestor ownership or mode: /data/ancestor ' in fault.faultString, fault.faultString
+    assert daemon.call('system.pid') > 0
+    docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'rmdir', '/data/ancestor/.session')
+    (ancestor / '.original-session').rename(daemon.session)
+    ancestor.chmod(0o755)
+
+
+
+def pass_iteration_boundary(daemon):
+    # Scheduled work of a later main-loop iteration starts a new pass: a Stop
+    # run there must refuse a session directory that another UID replaced
+    # under a writable ancestor after an earlier iteration attested it, not
+    # record the Stop in the detached original. No RPC runs in between.
+    ancestor = move_session_below_ancestor(daemon)
+    daemon.start()
+    hash_ = daemon.fixture('iteration-boundary')
+    daemon.call('method.insert', '', 'pass.pin', 'simple',
+                'd.multicall2=main,d.stop_generation=;' + blocking_hook(daemon, 'pin'))
+    daemon.call('method.insert', '', 'pass.stop', 'simple', 'd.multicall2=main,d.stop=')
+    daemon.call('schedule', '', 'pass_pin', '0', '0', 'pass.pin=')
+    daemon.call('schedule', '', 'pass_stop', '3', '0', 'pass.stop=')
+    wait_file(daemon, 'pin-held')
+    ancestor.chmod(0o777)
+    untrusted = untrusted_uid()
+    docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'sh', '-c',
+           'mv /data/ancestor/.session /data/ancestor/.original-session && '
+           'mkdir -m 0700 /data/ancestor/.session')
+    (daemon.directory / 'pin-go').touch()
+    log = daemon.directory / 'native.log'
+    daemon.wait(lambda: 'Scheduled command failed: key=pass_stop' in log.read_text() or
+                (ancestor / '.original-session' / '.rutorrent-stop-intents' / hash_).exists(),
+                'scheduled Stop')
+    assert not (ancestor / '.original-session' / '.rutorrent-stop-intents' / hash_).exists()
+    assert daemon.call('d.state', hash_) == 1
+    docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'rmdir', '/data/ancestor/.session')
+    (ancestor / '.original-session').rename(daemon.session)
+    ancestor.chmod(0o755)
+
+def session_changed_mid_load(daemon, what):
+    # While the start-up load pass holds the main thread inside the first
+    # loaded torrent, the session path changes as `what` names:
+    #   session             root replaces the session directory with a copy
+    #                       that another UID owns;
+    #   ancestor            another UID swaps the session directory under an
+    #                       ancestor that the daemon's UID made writable;
+    #   ancestor-widened, session-widened, sidecar-widened: the daemon's UID
+    #                       gives the ancestor, the session directory or
+    #                       .rutorrent-stop-intents a mode that a walk refuses;
+    #   ancestor-symlinked  the daemon's UID replaces the ancestor with a
+    #                       symlink to its moved original (every inode stays);
+    #   planted             the daemon's UID makes the session directory
+    #                       writable for others, then another UID plants each
+    #                       torrent's .torrent and a .torrent.rtorrent of its own.
+    # Every torrent loaded after the first is refused with a walk's reason in a
+    # log line that names it, the daemon and the first torrent stay, no planted
+    # state is loaded, and nothing more is written into a detached original.
+    ancestor = move_session_below_ancestor(daemon)
+    daemon.start()
+    hashes = [daemon.fixture('mid-load-%d' % index) for index in range(6)]
+    planted = daemon.directory / 'planted'
+    if what == 'planted':
+        # Each torrent's own saved state with custom1=planted, readable by the other UID.
+        planted.mkdir(mode=0o755)
+        for hash_ in hashes:
+            daemon.call('d.custom1.set', hash_, 'planted')
+        daemon.call('session.save')
+        for hash_ in hashes:
+            state = daemon.session / (hash_ + '.torrent.rtorrent')
+            daemon.wait(lambda: b'7:planted' in state.read_bytes(), 'planted state saved')
+            for suffix in ('.torrent', '.torrent.rtorrent'):
+                (planted / (hash_ + suffix)).write_bytes((daemon.session / (hash_ + suffix)).read_bytes())
+                (planted / (hash_ + suffix)).chmod(0o644)
+            daemon.call('d.custom1.set', hash_, '')
+    if what == 'sidecar-widened':
+        # A Stop creates .rutorrent-stop-intents, which the load pass then holds.
+        daemon.call('d.stop', hashes[0])
+        daemon.call('d.start', hashes[0])
+    daemon.call('session.save')
+    daemon.stop()
+    if what == 'planted':
+        assert not any(b'7:planted' in (daemon.session / (hash_ + '.torrent.rtorrent')).read_bytes()
+                       for hash_ in hashes)
+    blocking_hook(daemon, 'swap')
+    (daemon.directory / 'swap-once.sh').write_text(
+        '[ -e /data/swap-fired ] && exit 0\ntouch /data/swap-fired\necho "$1" > /data/swap-first\n'
+        'exec sh /data/swap.sh\n')
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('method.set_key=event.download.inserted_session,swap_once,'
+                 '"execute.nothrow=sh,/data/swap-once.sh,$d.hash="\n')
+    daemon.run()
+    original = ancestor / '.original-session'
+    untrusted = untrusted_uid()
+    try:
+        wait_file(daemon, 'swap-held')
+        if what in ('session', 'ancestor'):
+            # The replacement is a readable copy, so upstream still reads each
+            # .torrent by path and only the native sidecar checks refuse.
+            docker('exec', '--user', '0:0', daemon.name, 'sh', '-c',
+                   'cp -a /data/ancestor/.session /data/ancestor/.replacement && '
+                   'find /data/ancestor/.replacement -type d -exec chmod 0755 {} + && '
+                   'find /data/ancestor/.replacement -type f -exec chmod 0644 {} +')
+        if what == 'session':
+            docker('exec', '--user', '0:0', daemon.name, 'sh', '-c',
+                   f'chown -R {untrusted}:{untrusted} /data/ancestor/.replacement && '
+                   'chmod 0777 /data/ancestor/.replacement && '
+                   'mv /data/ancestor/.session /data/ancestor/.original-session && '
+                   'mv /data/ancestor/.replacement /data/ancestor/.session')
+            reason = 'unsafe session path component ownership or mode: /data/ancestor/.session '
+        elif what == 'ancestor':
+            ancestor.chmod(0o777)
+            docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'sh', '-c',
+                   'mv /data/ancestor/.session /data/ancestor/.original-session && '
+                   'mv /data/ancestor/.replacement /data/ancestor/.session')
+            reason = 'unsafe session path ancestor ownership or mode: /data/ancestor '
+        elif what == 'ancestor-widened':
+            ancestor.chmod(0o777)
+            reason = 'unsafe session path ancestor ownership or mode: /data/ancestor '
+        elif what == 'session-widened':
+            daemon.session.chmod(0o2777)
+            reason = 'unsafe session directory ownership or mode: /data/ancestor/.session/ '
+        elif what == 'sidecar-widened':
+            (daemon.session / '.rutorrent-stop-intents').chmod(0o750)
+            reason = ('unsafe stop intent directory ownership or mode: '
+                      '/data/ancestor/.session/.rutorrent-stop-intents ')
+        elif what == 'ancestor-symlinked':
+            ancestor.rename(daemon.directory / 'ancestor-moved')
+            os.symlink('ancestor-moved', ancestor)
+            reason = 'cannot open session path component: /data/ancestor: '
+        else:
+            daemon.session.chmod(0o2777)
+            docker('exec', '--user', f'{untrusted}:{untrusted}', daemon.name, 'sh', '-c',
+                   'for f in /data/planted/*; do cp "$f" /data/ancestor/.session/.planted && '
+                   'mv /data/ancestor/.session/.planted "/data/ancestor/.session/${f##*/}" || exit 1; done')
+            reason = 'unsafe session directory ownership or mode: /data/ancestor/.session/ '
+        def sidecars():
+            return sorted((str(path.relative_to(original)), path.stat().st_size, path.stat().st_mtime_ns)
+                          for name in ('.rutorrent-stop-intents', '.retrackers-migration')
+                          for path in (original / name).rglob('*'))
+        before = sidecars() if original.exists() else None
+        (daemon.directory / 'swap-go').touch()
+        daemon.wait(lambda: daemon.call('system.pid') > 0, 'SCGI readiness after the load pass')
+        time.sleep(1)
+        lines = (daemon.directory / 'native.log').read_text().splitlines()
+        first = (daemon.directory / 'swap-first').read_text().strip()
+        rows = daemon.call('d.multicall2', '', '', 'd.hash=', 'd.state=', 'd.is_open=', 'd.hashing=',
+                           'd.custom1=', 'd.message=')
+        for row in rows:
+            print('OBS mid-load %s row %s' % (what, ' | '.join(str(v) for v in row)), flush=True)
+        unseen = [hash_ for hash_ in hashes if hash_ != first and
+                  not any(hash_ in line and reason in line for line in lines)]
+        print('OBS mid-load %s rows=%d refused-with-reason=%d of %d' %
+              (what, len(rows), len(hashes) - 1 - len(unseen), len(hashes) - 1), flush=True)
+        assert first in hashes, first
+        assert not unseen, 'no log line with the refusal reason for ' + ' '.join(unseen)
+        assert [row[0] for row in rows] == [first], rows
+        assert daemon.call('system.pid') > 0
+        if before is not None:
+            assert sidecars() == before
+    finally:
+        docker('rm', '-f', daemon.name, check=False)
+        docker('run', '--rm', '--network', 'none', '--user', '0:0', '-v', str(daemon.directory) + ':/data',
+               '--entrypoint', 'sh', daemon.image, '-c',
+               'if [ -L /data/ancestor ]; then rm /data/ancestor && mv /data/ancestor-moved /data/ancestor; fi; '
+               'if [ -d /data/ancestor/.original-session ]; then rm -rf /data/ancestor/.session && '
+               'mv /data/ancestor/.original-session /data/ancestor/.session; fi; '
+               'rm -rf /data/ancestor/.replacement; '
+               f'chown -R {os.getuid()}:{os.getgid()} /data && chmod 0755 /data/ancestor && '
+               'chmod 02700 /data/ancestor/.session && '
+               'if [ -d /data/ancestor/.session/.rutorrent-stop-intents ]; then '
+               'chmod 0700 /data/ancestor/.session/.rutorrent-stop-intents; fi')
+
+
+def rr_same_pass(daemon, journal_missing):
+    # An RR journal written and read inside one request: one system.multicall
+    # runs d.retrackers.begin_original twice for the same torrent, and the second
+    # call and every later status see the first call's preclaim receipt. With the
+    # journal directory removed first, the readers find it missing and the
+    # writer that creates it must make them look again.
+    hash_ = daemon.fixture('samepass')
+    if journal_missing:
+        (daemon.session / '.retrackers-migration').rmdir()
+    args = [hash_, daemon.call('d.local_id', hash_), '0' * 64, str(daemon.call('d.state', hash_))]
+    calls = [{'methodName': 'system.retrackers.status', 'params': ['', hash_]},
+             {'methodName': 'd.retrackers.begin_original', 'params': args},
+             {'methodName': 'system.retrackers.status', 'params': ['', hash_]},
+             {'methodName': 'd.retrackers.begin_original', 'params': args},
+             {'methodName': 'system.retrackers.status', 'params': ['', hash_]}]
+    results = [r[0] if isinstance(r, list) else r for r in daemon.call('system.multicall', calls)]
+    assert results[0] == 'none', results
+    assert results[1].startswith('v2:original:1:') and results[3] == results[1], results
+    assert results[2] == results[4] == 'claimed-original', results
+    assert daemon.call('system.retrackers.status', '', hash_) == 'claimed-original'
+    assert (daemon.session / '.retrackers-migration' / (hash_ + '.preclaim.receipt')).exists()
+
 def erase_guard_preflight(daemon):
     hash_ = daemon.fixture('erase-guard')
     unrelated = daemon.fixture('erase-unrelated')
@@ -3662,7 +3944,19 @@ CASES = {'erasedata-finished-deferred': lambda d: erasedata_finished_deferred(d,
          'claim-finish': claim_finish, 'owner-finalize': owner_finalize,
          'metadata-start': metadata_start, 'metadata-restart': metadata_restart,
          'stale-counter': stale_counter,
-         'unsafe-async-path': unsafe_async_path, 'erase-guard-preflight': erase_guard_preflight}
+         'unsafe-async-path': unsafe_async_path, 'erase-guard-preflight': erase_guard_preflight,
+         # One verified session directory per pass (session_path.h).
+         'pass-external-writer': pass_external_writer, 'pass-rpc-boundary': pass_rpc_boundary,
+         'pass-iteration-boundary': pass_iteration_boundary,
+         'session-replaced-mid-load': lambda d: session_changed_mid_load(d, 'session'),
+         'ancestor-replaced-mid-load': lambda d: session_changed_mid_load(d, 'ancestor'),
+         'ancestor-widened-mid-load': lambda d: session_changed_mid_load(d, 'ancestor-widened'),
+         'session-widened-mid-load': lambda d: session_changed_mid_load(d, 'session-widened'),
+         'sidecar-widened-mid-load': lambda d: session_changed_mid_load(d, 'sidecar-widened'),
+         'ancestor-symlinked-mid-load': lambda d: session_changed_mid_load(d, 'ancestor-symlinked'),
+         'planted-state-mid-load': lambda d: session_changed_mid_load(d, 'planted'),
+         'rr-same-pass': lambda d: rr_same_pass(d, False),
+         'rr-same-pass-created': lambda d: rr_same_pass(d, True)}
 CASES.update({'rename-publication': rename_fallback, 'rename-einval': rename_fallback,
               'rename-enosys': rename_fallback, 'rename-eopnotsupp': rename_fallback,
               'uncaptured-remove': uncaptured_remove,
@@ -3739,6 +4033,351 @@ CASES.update({'resume-failure-visible': resume_failure_visible,
 CASES.update({'resume-reentry-resume': lambda daemon: resume_failure_hook_reentry(daemon, '((d.resume))'),
               'resume-reentry-update': lambda daemon: resume_failure_hook_reentry(daemon, '((scheduler.simple.update))'),
               'resume-reentry-stop-start': lambda daemon: resume_failure_hook_reentry(daemon, '{(d.stop),(d.start)}')})
+
+
+# Fork start-up hashing (doc/manual/startup-hashing.md): time-budgeted walks, the resume save
+# a quick check skips, the startup-load record and libtorrent keeping a quick check's files open.
+def payload_torrent(daemon, name, contents, bitfield=None, mtimes=None, announce=None):
+    # Real payload with fastResume-shaped resume data, so the load passes a quick check: by default
+    # the bitfield counts every piece. A path in mtimes was written by the caller, inside the container.
+    root = daemon.directory / 'dl' / name
+    paths = list(contents)
+    mtimes = dict(mtimes or {})
+    for path in paths:
+        if path not in mtimes:
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(contents[path])
+            mtimes[path] = int((root / path).stat().st_mtime)
+    data = b''.join(contents[path] for path in paths)
+    info = {'name': name, 'piece length': 16384,
+            'pieces': b''.join(hashlib.sha1(data[o:o + 16384]).digest() for o in range(0, len(data), 16384)),
+            'files': [{'length': len(contents[path]), 'path': path.split('/')} for path in paths]}
+    files = [{'priority': 1, 'mtime': mtimes[path]} for path in paths]
+    bitfield = len(info['pieces']) // 20 if bitfield is None else bitfield
+    hash_ = hashlib.sha1(encode(info)).hexdigest().upper()
+    daemon.call('load.raw_start', '', xmlrpc.client.Binary(encode(
+        {'info': info, 'libtorrent_resume': {'bitfield': bitfield, 'files': files}, **({'announce': announce} if announce else {})})))
+    daemon.wait(lambda: daemon.call('d.hash', hash_) == hash_ and daemon.call('d.is_active', hash_) == 1,
+                'started ' + name)
+    return hash_
+
+
+def startup_records(daemon):
+    text = (daemon.directory / 'native.log').read_text(errors='replace')
+    return [line[line.index('startup-load:'):] for line in text.splitlines() if 'startup-load:' in line]
+
+
+def restart_clean(daemon, *lines):
+    daemon.stop()
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write(''.join(line + '\n' for line in lines))
+    daemon.start()
+    daemon.wait(lambda: startup_records(daemon), 'startup-load record')
+
+
+def startup_load_record(daemon):
+    # One record per process, also for an empty session, and none for a later start. libtorrent
+    # keeps the files of the quick checks open on start: one open per payload file.
+    daemon.wait(lambda: startup_records(daemon), 'record of the empty session')
+    assert startup_records(daemon)[0].endswith('downloads=0 slices=0 total_ms=0 files_opened=0 files_closed=0'), \
+        startup_records(daemon)
+    hashes = [payload_torrent(daemon, 'record-%d' % i, {'a/f0': b'a' * 1000, 'b/f1': b'b' * 2000, 'f2': b'c' * 3000})
+              for i in range(3)]
+    restart_clean(daemon)
+    record = startup_records(daemon)
+    assert len(record) == 1 and ' slice_ms=100 slice_yield=0 skip_unchanged_save=1 downloads=3 slices=1 ' in ' ' + record[0] \
+        and record[0].endswith(' files_opened=9 files_closed=0'), record
+    assert [daemon.call('d.is_active', hash_) for hash_ in hashes] == [1, 1, 1]
+    daemon.call('d.stop', hashes[0])
+    daemon.call('d.close', hashes[0])
+    daemon.call('d.start', hashes[0])
+    daemon.wait(lambda: daemon.call('d.is_active', hashes[0]) == 1, 'later start')
+    time.sleep(.5)
+    assert startup_records(daemon) == record, startup_records(daemon)
+
+
+def startup_mtime_resume(daemon):
+    # A file whose mtime changed while its download was closed takes a full check, and hash_done()
+    # saves its progress even though the download passed a quick check at boot. The next start is a
+    # quick check only.
+    hash_ = payload_torrent(daemon, 'mtime', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    restart_clean(daemon, 'log.add_output="storage_events","native"', 'log.add_output="resume_data","native"')
+    daemon.call('d.stop', hash_)
+    daemon.call('d.close', hash_)
+    path = daemon.directory / 'dl' / 'mtime' / 'f1'
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 100))
+    daemon.call('d.start', hash_)
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1, 'start after a full check')
+    log = (daemon.directory / 'native.log').read_text()
+    checked = log.rindex('hash_torrent : completed')
+    assert 'quick:0' in log[log.rindex('hash_torrent : start'):checked], log[-2000:]
+    assert 'resume_save : file[1]' in log[checked:log.index('download : starting', checked)], log[checked:]
+    restart_clean(daemon)
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1, 'start after the restart')
+    checks = [line for line in (daemon.directory / 'native.log').read_text().splitlines() if 'hash_torrent : start' in line]
+    assert checks and all('quick:1' in line for line in checks), checks
+
+
+def startup_skip_switch(daemon):
+    # skip_unchanged_save=1 skips resume_save_progress() after a quick check that changed
+    # nothing; 0 saves as upstream does.
+    payload_torrent(daemon, 'skip', {'f0': b'a' * 1000, 'f1': b'b' * 2000})
+    saves = lambda: (daemon.directory / 'native.log').read_text().count('resume_save : file[')
+    restart_clean(daemon, 'log.add_output="resume_data","native"')
+    assert saves() == 0, saves()
+    restart_clean(daemon, 'pieces.hash.skip_unchanged_save.set=0')
+    assert saves() == 2, saves()
+    assert ' skip_unchanged_save=0 ' in startup_records(daemon)[0], startup_records(daemon)
+
+
+def startup_slices(daemon, yield_):
+    # Each open takes longer than the 100 ms budget, so every walk opens one download. With
+    # slice_yield=0 the load runs in one scheduler pass and no RPC answer sees it half done;
+    # with 1 the RPC answers between walks do.
+    hashes = [payload_torrent(daemon, 'slice-%d' % i, {'f0': bytes([65 + i]) * 1000}) for i in range(6)]
+    daemon.stop()
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('method.set_key=event.download.opened,slow,"execute.throw=sleep,0.15"\n')
+        rc.write('pieces.hash.slice_yield.set=%d\n' % yield_)
+    daemon.start()
+    seen = []
+    while not startup_records(daemon):
+        rows = daemon.call('d.multicall2', '', 'main', 'd.is_active=')
+        seen.append(sum(row[0] for row in rows) if len(rows) == len(hashes) else None)
+    partial = [count for count in seen if count is not None and count < len(hashes)]
+    assert bool(partial) == bool(yield_), seen
+    record = startup_records(daemon)[0]
+    assert ' downloads=6 slices=6 ' in record and int(record.split('total_ms=')[1].split()[0]) >= 900, record
+
+
+def startup_slices_guard(daemon):
+    # The budget ends a walk only after it quick-checked a download: when the first download of the
+    # walk goes to a full check and its open spends the budget, the walk still opens and starts the
+    # quick-checked downloads behind it in the same pass, before that full check ends.
+    big = bytes(64 << 20)
+    for i in range(4):
+        payload_torrent(daemon, 'guard-%d' % i, {'f0': bytes([65 + i]) * 1000, 'f1': big})
+    restart_clean(daemon)
+    first = daemon.call('d.multicall2', '', 'main', 'd.name=')[0][0]
+    daemon.stop()
+    path = daemon.directory / 'dl' / first / 'f1'
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 100))
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('method.set_key=event.download.opened,slow,"execute.throw=sleep,0.15"\n')
+    daemon.start()
+    rows = daemon.call('d.multicall2', '', 'main', 'd.name=', 'd.is_active=', 'd.is_hash_checking=')
+    assert [row[1:] for row in rows if row[0] == first] == [[0, 1]], rows
+    assert all(row[1] == 1 for row in rows if row[0] != first), rows
+
+
+def startup_record_shutdown(daemon):
+    # A shutdown that begins between yielded walks ends the load early: no record claims it. A held
+    # stopped announce keeps the daemon running through the scheduler passes after the shutdown.
+    compile_fixture(daemon, 'stopped-tracker.cc', 'stopped-tracker')
+    hashes = [payload_torrent(daemon, 'shutdown-%d' % i, {'f0': bytes([65 + i]) * 1000}, announce='http://127.0.0.1:45581/announce')
+              for i in range(16)]
+    daemon.stop()
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('execute.nothrow.bg={/data/stopped-tracker,45581,/data/tracker.ready,/data/tracker-stopped}\n')
+        rc.write('method.set_key=event.download.opened,slow,"execute.throw=sleep,0.15"\n')
+        rc.write('pieces.hash.slice_yield.set=1\n')
+    daemon.start()
+    announced = lambda: any(daemon.call('t.multicall', h, '', 't.success_counter=')[0][0] > 0
+                            for h in hashes if daemon.call('d.is_active', h) == 1)
+    daemon.wait(lambda: announced() and sum(row[0] for row in daemon.call('d.multicall2', '', 'main', 'd.is_open=')) < 16,
+                'an accepted announce during the yielded walks')
+    daemon.call('system.shutdown.normal')
+    daemon.wait(lambda: (daemon.directory / 'tracker-stopped').exists(), 'held stopped announce')
+    time.sleep(.5)
+    assert docker('inspect', '-f', '{{.State.Running}}', daemon.name).stdout.strip() == 'true'
+    assert not startup_records(daemon), startup_records(daemon)
+
+
+def startup_symlink_low_disk(daemon):
+    # The files a quick check opened stay open on start, and their directory links are still
+    # rebuilt: an incomplete download whose subdirectory links to a nearly full file system is
+    # closed by close_low_diskspace.
+    docker('rm', '-f', daemon.name)
+    daemon.options = ['--tmpfs', '/small:size=1m,mode=1777']
+    daemon.start()
+    mtime = docker('exec', daemon.name, 'sh', '-c',
+                   'mkdir /small/s && head -c 4000 /dev/zero | tr "\\0" b > /small/s/f1 && stat -c %Y /small/s/f1').stdout
+    root = daemon.directory / 'dl' / 'symlink'
+    root.mkdir(parents=True)
+    (root / 's').symlink_to('/small/s')
+    hash_ = payload_torrent(daemon, 'symlink', {'a/f0': b'a' * 4000, 's/f1': b'b' * 4000}, bitfield=0,
+                            mtimes={'s/f1': int(mtime)})
+    daemon.call('close_low_diskspace', '', 10 << 20)
+    daemon.wait(lambda: daemon.call('d.is_open', hash_) == 0, 'low diskspace close')
+    assert daemon.call('d.message', hash_) == 'Low diskspace.', daemon.call('d.message', hash_)
+
+
+def payload_fds(daemon, name):
+    listing = docker('exec', daemon.name, 'ls', '-l', '/proc/1/fd').stdout
+    return sorted(line.split(' -> ', 1)[1] for line in listing.splitlines() if ' -> /data/dl/' + name + '/' in line)
+
+
+def replace_file(daemon, name, path):
+    target = daemon.directory / 'dl' / name / path
+    (target.parent / (target.name + '.new')).write_bytes(target.read_bytes())
+    os.rename(target.parent / (target.name + '.new'), target)
+
+
+def keep_outcome(daemon, hash_, name):
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1 or daemon.call('d.message', hash_) != '', 'start of ' + name)
+    return daemon.call('d.is_active', hash_), daemon.call('d.message', hash_), payload_fds(daemon, name)
+
+
+def startup_keep_deferred_start(daemon):
+    # A completed download whose file is gone at boot passes its quick check and hash_done() stops
+    # it. The data comes back, another file is replaced, and the user starts it: the start reopens
+    # every file by path rather than keeping the descriptors of the boot walk.
+    hash_ = payload_torrent(daemon, 'deferred', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    daemon.stop()
+    root = daemon.directory / 'dl' / 'deferred'
+    os.rename(root / 'f1', root / 'f1.away')
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.message', hash_).startswith('Download registered as completed'), 'stop by hash_done')
+    assert daemon.call('d.is_open', hash_) == 1 and payload_fds(daemon, 'deferred') == ['/data/dl/deferred/f0'], \
+        payload_fds(daemon, 'deferred')
+    os.rename(root / 'f1.away', root / 'f1')
+    replace_file(daemon, 'deferred', 'f0')
+    daemon.call('d.start', hash_)
+    active, message, fds = keep_outcome(daemon, hash_, 'deferred')
+    assert (active, fds) == (1, ['/data/dl/deferred/f0', '/data/dl/deferred/f1']), (active, message, fds)
+
+
+def startup_keep_opened_before(daemon, replace):
+    # A download opened by d.open before its walk: the start after its quick check reopens the files
+    # by path. A deleted file makes it refuse visibly; a file replaced with the same mtime is opened
+    # anew instead of on the descriptor d.open took.
+    hash_ = payload_torrent(daemon, 'opened', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    path = daemon.directory / 'dl' / 'opened' / 'f1'
+    daemon.call('d.stop', hash_)
+    daemon.call('d.close', hash_)
+    daemon.call('d.open', hash_)
+    if replace:
+        times = (path.stat().st_atime, path.stat().st_mtime)
+        replace_file(daemon, 'opened', 'f1')
+        os.utime(path, times)
+    else:
+        os.unlink(path)
+    daemon.call('d.start', hash_)
+    active, message, fds = keep_outcome(daemon, hash_, 'opened')
+    if replace:
+        assert (active, fds) == (1, ['/data/dl/opened/f0', '/data/dl/opened/f1']), (active, message, fds)
+    else:
+        assert active == 0 and message.startswith('Could not resume download: Could not open file'), (active, message, fds)
+        assert not path.exists()
+
+
+def startup_keep_added(daemon):
+    # A torrent added over complete data takes a full check and starts; a file deleted later is not
+    # recreated: after a restart the download stops as registered completed, and the user's start
+    # refuses visibly, as upstream does.
+    data = b'a' * 20000 + b'b' * 20000
+    info = {'name': 'added', 'piece length': 16384,
+            'pieces': b''.join(hashlib.sha1(data[o:o + 16384]).digest() for o in range(0, len(data), 16384)),
+            'files': [{'length': 20000, 'path': ['f0']}, {'length': 20000, 'path': ['f1']}]}
+    hash_ = hashlib.sha1(encode(info)).hexdigest().upper()
+    root = daemon.directory / 'dl' / 'added'
+    root.mkdir(parents=True)
+    (root / 'f0').write_bytes(data[:20000])
+    (root / 'f1').write_bytes(data[20000:])
+    daemon.call('load.raw_start', '', xmlrpc.client.Binary(encode({'info': info})))
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1, 'start after the full check')
+    os.unlink(root / 'f1')
+    daemon.call('session.save')
+    daemon.stop()
+    daemon.start()
+    daemon.wait(lambda: daemon.call('d.message', hash_).startswith('Download registered as completed'), 'stop by hash_done')
+    daemon.call('d.start', hash_)
+    active, message, fds = keep_outcome(daemon, hash_, 'added')
+    assert active == 0 and message.startswith('Could not resume download: Could not open file'), (active, message, fds)
+    assert not (root / 'f1').exists()
+
+
+def startup_keep_stop_start(daemon):
+    # d.stop leaves the files open; a deleted file makes the next start refuse, and after its return a
+    # replaced file is opened by path.
+    hash_ = payload_torrent(daemon, 'stopstart', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    root = daemon.directory / 'dl' / 'stopstart'
+    daemon.call('d.stop', hash_)
+    os.rename(root / 'f1', root / 'f1.away')
+    daemon.call('d.start', hash_)
+    active, message, fds = keep_outcome(daemon, hash_, 'stopstart')
+    assert active == 0 and message.startswith('Could not resume download: Could not open file'), (active, message, fds)
+    daemon.call('d.stop', hash_)
+    os.rename(root / 'f1.away', root / 'f1')
+    replace_file(daemon, 'stopstart', 'f0')
+    daemon.call('d.start', hash_)
+    daemon.wait(lambda: daemon.call('d.is_active', hash_) == 1, 'start after the return')
+    assert payload_fds(daemon, 'stopstart') == ['/data/dl/stopstart/f0', '/data/dl/stopstart/f1'], payload_fds(daemon, 'stopstart')
+
+
+def startup_keep_full_check(daemon):
+    # A file deleted after the boot walk opened it, while its download goes to a full check, is not
+    # kept open on start: the start refuses visibly.
+    hash_ = payload_torrent(daemon, 'full', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    daemon.stop()
+    path = daemon.directory / 'dl' / 'full' / 'f0'
+    os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 100))
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('method.set_key=event.download.opened,gone,"execute.throw=rm,/data/dl/full/f1"\n')
+    daemon.start()
+    active, message, fds = keep_outcome(daemon, hash_, 'full')
+    assert active == 0 and message.startswith('Could not resume download: Could not open file'), (active, message, fds)
+
+
+def startup_keep_check_hash(daemon):
+    # d.check_hash on a started download restarts it with the stored default flags after a full
+    # check; those never ask libtorrent to keep the files, so the start opens a file deleted during
+    # the check anew by path instead of writing to the deleted one.
+    hash_ = payload_torrent(daemon, 'rehash', {'f0': b'a' * 20000, 'f1': b'b' * 20000})
+    daemon.call('method.set_key', '', 'event.download.opened', 'gone', 'execute.throw=rm,/data/dl/rehash/f1')
+    daemon.call('d.check_hash', hash_)
+    active, message, fds = keep_outcome(daemon, hash_, 'rehash')
+    assert (active, fds) == (1, ['/data/dl/rehash/f0', '/data/dl/rehash/f1']), (active, message, fds)
+
+
+def startup_slices_yield_full(daemon):
+    # With slice_yield=1 the budget also ends a walk that opened downloads whose quick checks failed
+    # (data newer than its resume data), so RPC is answered between their opens.
+    hashes = [payload_torrent(daemon, 'full-%d' % i, {'f0': bytes([65 + i]) * 1000}) for i in range(6)]
+    daemon.stop()
+    for i in range(6):
+        path = daemon.directory / 'dl' / ('full-%d' % i) / 'f0'
+        os.utime(path, (path.stat().st_atime, path.stat().st_mtime + 100))
+    with open(daemon.directory / 'test.rc', 'a') as rc:
+        rc.write('method.set_key=event.download.opened,slow,"execute.throw=sleep,0.15"\n')
+        rc.write('pieces.hash.slice_yield.set=1\n')
+    daemon.start()
+    seen = []
+    while not startup_records(daemon):
+        rows = daemon.call('d.multicall2', '', 'main', 'd.is_open=')
+        seen.append(sum(row[0] for row in rows) if len(rows) == len(hashes) else None)
+    assert [count for count in seen if count is not None and count < len(hashes)], seen
+    record = startup_records(daemon)[0]
+    assert ' downloads=6 slices=6 ' in record, record
+    daemon.wait(lambda: all(daemon.call('d.is_active', hash_) == 1 for hash_ in hashes), 'starts after the full checks')
+
+
+CASES.update({'startup-load-record': startup_load_record,
+              'startup-mtime-resume': startup_mtime_resume,
+              'startup-skip-switch': startup_skip_switch,
+              'startup-slices-same-pass': lambda daemon: startup_slices(daemon, 0),
+              'startup-slices-yield': lambda daemon: startup_slices(daemon, 1),
+              'startup-slices-guard': startup_slices_guard,
+              'startup-record-shutdown': startup_record_shutdown,
+              'startup-symlink-low-disk': startup_symlink_low_disk,
+              'startup-keep-deferred-start': startup_keep_deferred_start,
+              'startup-keep-opened-deleted': lambda daemon: startup_keep_opened_before(daemon, False),
+              'startup-keep-opened-replaced': lambda daemon: startup_keep_opened_before(daemon, True),
+              'startup-keep-added': startup_keep_added,
+              'startup-keep-stop-start': startup_keep_stop_start,
+              'startup-keep-full-check': startup_keep_full_check,
+              'startup-keep-check-hash': startup_keep_check_hash,
+              'startup-slices-yield-full': startup_slices_yield_full})
 assert set(CUTS) <= set(CASES), set(CUTS) - set(CASES)
 
 

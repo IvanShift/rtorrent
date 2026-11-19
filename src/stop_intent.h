@@ -26,18 +26,24 @@
 
 namespace stop_intent {
 using Fd = core::SessionPathFd;
+inline constexpr const char* intent_directory = ".rutorrent-stop-intents";
 
-inline int open_directory(const std::string& session, bool create) {
-  Fd parent(core::open_trusted_session_directory(session));
+inline std::string intent_path(const std::string& session, const std::string& name) {
+  return core::session_path_child(session, std::string(intent_directory) + "/" + name);
+}
+
+// Opens and attests the intent directory below the open session directory
+// `parent`: -1 when it is missing and not created; `identity` gets its stat.
+inline int open_directory_at(int parent, const std::string& session, bool create,
+                             struct stat* identity = nullptr) {
   struct stat st{};
-  constexpr const char* name = ".rutorrent-stop-intents";
-  const std::string path = core::session_path_child(session, name);
-  if (create && ::mkdirat(parent.get(), name, 0700) == 0) {
-    if (::fsync(parent.get()) != 0) throw std::runtime_error("cannot sync intent directory entry: " + path + ": " + std::strerror(errno));
+  const std::string path = core::session_path_child(session, intent_directory);
+  if (create && ::mkdirat(parent, intent_directory, 0700) == 0) {
+    if (::fsync(parent) != 0) throw std::runtime_error("cannot sync intent directory entry: " + path + ": " + std::strerror(errno));
   } else if (create && errno != EEXIST) {
     throw std::runtime_error("cannot create intent directory: " + path + ": " + std::strerror(errno));
   }
-  const int dir = ::openat(parent.get(), name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  const int dir = ::openat(parent, intent_directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (dir < 0 && !create && errno == ENOENT) return -1;
   if (dir < 0) throw std::runtime_error("cannot open stop intent directory: " + path + ": " + std::strerror(errno));
   if (::fstat(dir, &st) != 0) {
@@ -45,14 +51,29 @@ inline int open_directory(const std::string& session, bool create) {
     ::close(dir);
     throw std::runtime_error("cannot inspect stop intent directory: " + path + ": " + std::strerror(error));
   }
-  if (!S_ISDIR(st.st_mode) ||
-      st.st_uid != ::geteuid() || (st.st_mode & 0777) != 0700) {
+  if (!core::private_sidecar_directory(st)) {
     ::close(dir);
     throw std::runtime_error("unsafe stop intent directory ownership or mode: " + path + " " +
         core::session_path_metadata(st) +
         "; require uid=" + std::to_string(::geteuid()) + " mode=0700 (setgid is allowed)");
   }
+  if (identity) *identity = st;
   return dir;
+}
+
+// The writable gateway: a descriptor of its own, the directory created when asked.
+inline int open_directory(const std::string& session, bool create) {
+  if (create) core::session_sidecar_created(intent_directory);
+  Fd parent(core::open_trusted_session_directory(session));
+  return open_directory_at(parent.get(), session, create);
+}
+
+// The read-only gateway: never creates the directory; on the main thread it
+// returns the session directory pass's descriptor.
+inline core::SidecarDirectory read_directory(const std::string& session) {
+  return core::read_session_sidecar(session, intent_directory, [&session](int parent, struct stat* identity) {
+    return open_directory_at(parent, session, false, identity);
+  });
 }
 
 inline uint64_t read_counter(int fd, const std::string& path) {
@@ -94,10 +115,10 @@ inline uint64_t counter(const std::string& session, const std::string& hash, boo
   if (session.empty() && !increment) return 0;
   if (session.empty() || !valid_hash(hash))
     throw std::runtime_error("invalid session path or hash");
-  const int directory = open_directory(session, increment);
-  if (directory < 0) return 0;
-  Fd dir(directory);
-  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + hash);
+  const auto dir = increment ? core::SidecarDirectory(open_directory(session, true), true) :
+      read_directory(session);
+  if (dir.get() < 0) return 0;
+  const std::string path = intent_path(session, hash);
   const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno != ENOENT)
     throw std::runtime_error("cannot open stop intent journal: " + path + ": " + std::strerror(errno));
@@ -130,7 +151,7 @@ inline void erase_counter(const std::string& session, const std::string& hash) {
   const int directory = open_directory(session, false);
   if (directory < 0) return;
   Fd dir(directory);
-  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + hash);
+  const std::string path = intent_path(session, hash);
   const int file = ::openat(dir.get(), hash.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno == ENOENT) return;
   if (file < 0) throw std::runtime_error("cannot open stop intent journal: " + path + ": " + std::strerror(errno));
@@ -254,11 +275,10 @@ inline Lease read_lease(const std::string& session, const std::string& hash) {
   if (session.empty()) return {}; // No lease can exist without a session directory.
   if (hash.size() != 40 || hash.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
     throw std::runtime_error("invalid session path or hash");
-  const int directory = open_directory(session, false);
-  if (directory < 0) return {};
-  Fd dir(directory);
+  const auto dir = read_directory(session);
+  if (dir.get() < 0) return {};
   const std::string filename = hash + ".claim";
-  const std::string path = core::session_path_child(session, ".rutorrent-stop-intents/" + filename);
+  const std::string path = intent_path(session, filename);
   int file = ::openat(dir.get(), filename.c_str(), O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
   if (file < 0 && errno == ENOENT) return {};
   if (file < 0) throw std::runtime_error("cannot open stop claim file: " + path + ": " + std::strerror(errno));
